@@ -24,7 +24,8 @@ The `mas` library is a powerful and flexible framework designed for creating and
 
 The `mas` library empowers developers to create robust, flexible, and intelligent systems while minimizing the complexity of setup and orchestration. Whether you are a beginner experimenting with multi-agent architectures or an expert building large-scale AI-driven workflows, the `mas` library adapts to your needs.
 
-
+### Currently in alpha
+This library has not yet been extensively tested and is currently under development. Please **do not use it in production yet**, but feel free to test it and post your issues here, or email me at mneuronico@gmail.com to collaborate or know more about this project.
 
 ---
 
