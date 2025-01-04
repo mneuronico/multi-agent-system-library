@@ -881,3 +881,8 @@ The input syntax allows the developer to have a remarkable amount of control and
 ## Error Handling
 
 The library is designed for robust operation, handling various errors gracefully. If an agent fails to produce a response, it will return a `default_output`. If the tool or process fails, the system will return the `default_output`, or an empty dict if no `default_output` was specified. Errors in configuration files or function references are logged for debugging.
+
+
+## Currently Under Development
+
+This is an alpha version of the `mas` library. It has not yet been tested extensively and likely contains many bugs and undesired behavior. Its use on production is **NOT RECOMMENDED**.
