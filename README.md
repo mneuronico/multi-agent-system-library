@@ -672,6 +672,9 @@ manager = AgentSystemManager(config_json="<config_file_name>.json").run("Hey, ho
 
 This builds the system from a JSON configuration file specified using the `config_json` parameter, creates all components if the configuration is valid and runs an automation (either a specified one or a default linear automation) with the provided user input (or starting with no input if none is provided).
 
+### Defining Functions
+Functions for `Tool` and `Process` components must be defined in the Python file specified using the `functions_file` option (or the default `fns.py`). All tools and processes must have their custom function defined in this file. Conditional functions, on_update and on_complete must be defined in this file as well. When using the library only programatically and not using function syntax (i.e. `"fn:"`) it is possible to define functions elsewhere and use them as callables directly, but it is better practice to still define them in the `functions_file`, import it and use it.
+
 ### Running a Chat Loop
 
 The `run` method can be used in a loop to implement a simple interactive chat system. This is ideal for continuously processing user inputs and generating responses from the system.
@@ -733,8 +736,38 @@ def on_complete_function(messages, manager):
 
 In this function, you could possibly send this message to your own database, to a messaging app or to a custom user interface.
 
-### Defining Functions
-Functions for `Tool` and `Process` components must be defined in the Python file specified using the `functions_file` option (or the default `fns.py`). All tools and processes must have their custom function defined in this file. Conditional functions, on_update and on_complete must be defined in this file as well. When using the library only programatically and not using function syntax (i.e. `"fn:"`) it is possible to define functions elsewhere and use them as callables directly, but it is better practice to still define them in the `functions_file`, import it and use it.
+### Telegram Integration
+
+The `mas` library allows the developer to integrate any system with Telegram seamlessly to allow users to interact with the system through the messaging app without requiring the developer to define custom async logic and event loops. This is possible through the `start_telegram_bot` method:
+
+```python
+manager.start_telegram_bot(telegram_token, # token must be provided
+component_name = "my_automation", # optional, defaults to default or latest automation
+verbose = False, # defaults to False
+on_complete = None, # defaults to sending latest message to user
+on_update = None, # defaults to no operation
+on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.", # defaults to this message
+on_clear_msg = "Message history deleted." # defaults to this message
+)
+```
+
+-   **`telegram_token`**: The token given by Telegram's `BotFather` after successful bot creation through the Telegram platform. This lets the library connect with a specific bot to send and receive messages.
+-   **`component_name`**: Optional string defining which component should be executed when receiving a user message. If not set, this defaults to the latest or default automation defined, just like `manager.run()`.
+-   **`verbose`**: Optional boolean, defines whether the system will run in verbose mode or not (defaults to False).
+-   **`on_complete`**: Optional callable, function that will be called when completing execution after a specific user message.
+-   **`on_update`**: Optional callable, function that will be called every time a component finishes execution.
+-   **`on_start_msg`**: Optional string defining what the bot will send to the user when receiving '/start' commnad.
+-   **`on_clear_msg`**: Optional string defining what the bot will send to the user when receiving '/clear' command.
+
+After defining the system through JSON and writing the necessary functions in the `functions_file`, it's possible to run a full Telegram bot with this minimal code example:
+
+```python
+manager = AgentSystemManager(config_json="config.json") 
+token = "<YOUR_TELEGRAM_TOKEN>"
+manager.start_telegram_bot(token)
+```
+
+Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can either return a string (which will be sent to the correct user by the system) or `None` to send nothing.
 
 
 ## Input String Parsing

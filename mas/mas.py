@@ -11,6 +11,9 @@ from pydantic import BaseModel
 import pickle
 import importlib.util
 import google.generativeai as genai
+import asyncio
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 
 class Component:
@@ -2415,6 +2418,112 @@ class AgentSystemManager:
         cur.execute("DELETE FROM message_history")
         conn.commit()
         #print(f"Message history cleared for user ID: {self._current_user_id}")
+
+    def start_telegram_bot(self, telegram_token, component_name = None, verbose = False,
+              on_complete = None, on_update = None,
+              on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.",
+              on_clear_msg = "Message history deleted."):
+
+        on_update = on_update or self.on_update
+        on_complete = on_complete or self.on_complete
+
+        def on_complete_fn(messages, manager, on_complete_params):
+
+            if on_complete is not None:
+                response = on_complete(messages, manager, on_complete_params)
+            else:
+                last_message = messages[-1]
+                response = last_message["message"]["response"] = last_message["message"]["response"]
+
+            if response is None:
+                return
+
+            update = on_complete_params["update"]
+
+            # We'll define a small coroutine that does the actual sending:
+            async def do_reply():
+                await update.message.reply_text(response)
+
+            loop = on_complete_params["event_loop"]
+
+            # Next, we schedule do_reply() onto that loop:
+            def callback():
+                asyncio.create_task(do_reply())
+
+            loop.call_soon_threadsafe(callback)
+
+        def on_update_fn(messages, manager, on_update_params):
+
+            if on_update is not None:
+                response = on_update(messages, manager, on_update_params)
+            else:
+                response = None
+            
+            if response is None:
+                return
+            
+            update = on_update_params["update"]
+
+            # We'll define a small coroutine that does the actual sending:
+            async def do_reply():
+                await update.message.reply_text(response)
+
+            loop = on_update_params["event_loop"]
+
+            # Next, we schedule do_reply() onto that loop:
+            def callback():
+                asyncio.create_task(do_reply())
+
+            loop.call_soon_threadsafe(callback)
+
+        # Define async handlers
+        async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            # Use await for async operations like reply_text
+            await update.message.reply_text(on_start_msg)
+
+        async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            self.clear_message_history(update.message.chat.id)
+            await update.message.reply_text(on_clear_msg)
+
+        async def get_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            params = {}
+            params["update"] = update
+            params["event_loop"] = asyncio.get_running_loop()
+
+            chat_id = update.message.chat.id
+
+            if verbose:
+                print(f"[Manager] Received message from user {chat_id}. Executing...")
+
+            def run_manager_thread():
+                self.run(
+                    component_name = component_name,
+                    input=update.message.text, 
+                    user_id=chat_id,
+                    verbose=verbose,
+                    blocking=True,
+                    on_update=on_update_fn,
+                    on_update_params=params,
+                    on_complete = on_complete_fn,
+                    on_complete_params=params
+                )
+
+            thread = threading.Thread(target=run_manager_thread, daemon=True)
+            thread.start()
+        
+        application = Application.builder().token(telegram_token).build()
+
+        # Add command and message handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("clear", clear))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_response))
+
+        # Run the bot
+        if verbose:
+            print("[Manager] Bot running...")
+
+        application.run_polling()
+
 
 class Parser:
     """
