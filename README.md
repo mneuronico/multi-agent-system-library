@@ -532,9 +532,10 @@ output = manager.run(
         }
    ],
    blocking=True, # Optional -> defaults to True
-   on_complete=None, # Optional -> defaults to None
-   on_update=None # Optional -> defaults to None
-
+   on_complete=None, # Optional -> defaults to defined in system build
+   on_update=None, # Optional -> defaults to defined in system build
+   on_update_params = {"to_use_in_update": value},
+   on_complete_params = {"to_use_in_complete": value}
 )
 print(output)
 ```
@@ -553,6 +554,8 @@ print(output)
 -   **`blocking`**: Boolean that specifies whether manager.run() should block execution thread until completed or run on an independent thread and return immediately.
 -   **`on_complete`**: Callable executed when manager.run() completes, overrides function set when defining the system. Useful for using as callback when blocking=False. 
 -   **`on_update`**: Similar to on_complete but runs everytime a component is finished running, useful for automations.
+-   **`on_complete_params`**: Dictionary containing values that can be accessed inside on_complete.
+-   **`on_update_params`**: Dictionary containing values that can be accessed inside on_update.
 
 ### Running the System in Non-Blocking Mode
 
@@ -572,13 +575,13 @@ print(result)  # Processed output after the component finishes execution
 In non-blocking mode, the `run` method starts the execution in a separate thread and returns immediately. You can use the `on_update` and `on_complete` callbacks to handle progress and final results.
 
 ```python
-def on_update(messages):
+def on_update(messages, manager, on_update_params):
     if messages:
         latest_message = messages[-1]
         if latest_message.get("source") == "specific_role":
             print("[Update] Latest Message from specific_role:", latest_message["message"])
 
-def on_complete(messages):
+def on_complete(messages, manager, on_complete_params):
     print("[Complete] Final message:", messages[-1] if messages else "No messages.")
 
 manager.run(
@@ -592,12 +595,13 @@ manager.run(
 
 Note how you can filter messages by role in the callback methods, so you can perform different actions depending on which component has just been executed.
 
+Both methods must include in their definition the `messages` and `manager` arguments in that order, as they will always be provided when these methods are called by the manager. They can both optionally include the `on_update_params` and `on_complete_params` respectively, although they must be provided as arguments to the `manager.run()` function if they are defined in the callback methods.
+
 #### Best Practices
 
 1. **Use Blocking for Simplicity**: Use blocking mode for simple workflows where immediate results are required.
 2. **Enable Real-Time Feedback with `on_update`**: Use `on_update` for tasks that require progress tracking or real-time updates.
 3. **Handle Completion with `on_complete`**: Always implement an `on_complete` callback for non-blocking tasks to ensure final results are processed.
-
 
 ### Showing History
 
@@ -611,6 +615,7 @@ manager.show_history()  # Show history of current user
 ### Retrieving Messages: `get_messages`
 
 The `get_messages` method retrieves a structured history of all messages for a specific user, useful for analyzing interactions or displaying chat history.
+
 
 #### Method Signature
 
@@ -632,6 +637,13 @@ A **list** of dictionaries, each representing a message with the following keys:
 - **`type`**: Component type (`"agent"`, `"tool"`, `"process"`, `"user"`, etc.).
 - **`model`**: Model used, in the format `"<provider>:<model-name>"`.
 
+### Deleting User History `clear_message_history`
+
+If you need to clear the message history for a user, the `manager` offers a simple method to delete the database associated to a specific user.
+
+```python
+manager.clear_message_history(user_id) # if not provided, it will use the current user_id
+```
 
 ### Clearing Cache
 

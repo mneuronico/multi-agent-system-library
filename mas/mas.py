@@ -1182,7 +1182,7 @@ class Automation(Component):
     def to_string(self) -> str:
         return f"Name: {self.name}\nSequence: {self.sequence}\n"
 
-    def run(self, verbose: bool = False, on_update: Optional[Callable] = None) -> Dict:
+    def run(self, verbose: bool = False, on_update: Optional[Callable] = None, on_update_params: Optional[Dict] = None) -> Dict:
         if verbose:
             print(f"[Automation:{self.name}] .run() => executing sequence: {self.sequence}")
 
@@ -1190,13 +1190,13 @@ class Automation(Component):
         current_output = {}
 
         for step in self.sequence:
-            current_output = self._execute_step(step, current_output, db_conn, verbose, on_update)
+            current_output = self._execute_step(step, current_output, db_conn, verbose, on_update, on_update_params)
 
         if verbose:
             print(f"[Automation:{self.name}] => Execution completed.")
         return current_output
 
-    def _execute_step(self, step, current_output, db_conn, verbose, on_update = None):
+    def _execute_step(self, step, current_output, db_conn, verbose, on_update = None, on_update_params = None):
         """
         Execute a single step, which can be a component name (string) or a control flow dictionary.
         """
@@ -1227,7 +1227,7 @@ class Automation(Component):
             if isinstance(comp, Automation):
                 step_output = comp.run(
                     verbose=verbose,
-                    on_update=lambda messages: on_update(messages) if on_update else None  # Pass on_update callback to nested automation
+                    on_update=lambda messages, manager=None: on_update(messages, manager) if on_update else None  # Pass on_update callback to nested automation
                 )
             else:
                 step_output = comp.run(
@@ -1240,8 +1240,10 @@ class Automation(Component):
             self.manager._save_component_output(db_conn, comp, step_output, verbose)
 
             if on_update:
-                on_update(self.manager.get_messages(self.manager._current_user_id))
-
+                if on_update_params:
+                    on_update(self.manager.get_messages(self.manager._current_user_id), self.manager, on_update_params)
+                else:
+                    on_update(self.manager.get_messages(self.manager._current_user_id), self.manager)
             return step_output
 
         elif isinstance(step, dict):
@@ -1256,7 +1258,7 @@ class Automation(Component):
 
                 next_steps = step["if_true"] if condition_met else step["if_false"]
                 for branch_step in next_steps:
-                    current_output = self._execute_step(branch_step, current_output, db_conn, verbose, on_update)
+                    current_output = self._execute_step(branch_step, current_output, db_conn, verbose, on_update, on_update_params)
 
             elif control_flow_type == "while":
                 run_first_pass = step.get("run_first_pass", True)
@@ -1271,7 +1273,7 @@ class Automation(Component):
                         if verbose:
                             print(f"[Automation:{self.name}] => executing while loop body.")
                         for nested_step in body:
-                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update)
+                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
 
                         if (isinstance(end_condition, bool) and end_condition) or \
                         (isinstance(end_condition, (str, dict)) and self._evaluate_condition(end_condition, current_output)):
@@ -1294,7 +1296,7 @@ class Automation(Component):
                     if verbose:
                         print(f"[Automation:{self.name}] => executing for loop iteration {iteration + 1}/{iterations}.")
                     for nested_step in body:
-                        current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update)
+                        current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
 
             else:
                 raise ValueError(f"Unsupported control flow type: {control_flow_type}")
@@ -2074,7 +2076,8 @@ class AgentSystemManager:
             target_input: Optional[str],
             target_index: Optional[int],
             target_custom: Optional[list],
-            on_update: Optional[Callable]
+            on_update: Optional[Callable],
+            on_update_params: Optional[Dict] = None
         ) -> Dict:
 
         db_conn = self._get_user_db()
@@ -2128,10 +2131,18 @@ class AgentSystemManager:
         if isinstance(comp, Automation):
             if verbose:
                 print(f"[Manager] Running Automation: {component_name or comp.name}")
-            output_dict = comp.run(
-                verbose=verbose,
-                on_update=lambda messages: on_update(messages) if on_update else None
-            )
+            
+            if on_update_params:
+                output_dict = comp.run(
+                    verbose=verbose,
+                    on_update_params = on_update_params,
+                    on_update=lambda messages, manager, on_update_params: on_update(messages, manager, on_update_params) if on_update else None
+                )
+            else:
+                output_dict = comp.run(
+                    verbose=verbose,
+                    on_update=lambda messages, manager: on_update(messages, manager) if on_update else None
+                )
         else:
             # Agents, Tools, and Processes accept input targeting arguments
             if verbose:
@@ -2144,7 +2155,10 @@ class AgentSystemManager:
                 target_custom=target_custom
             )
             if on_update:
-                on_update(self.get_messages(user_id))
+                if on_update_params:
+                    on_update(self.get_messages(user_id), self, on_update_params)
+                else:
+                    on_update(self.get_messages(user_id), self)
 
         self._save_component_output(db_conn, comp, output_dict, verbose=verbose)
         return output_dict
@@ -2162,7 +2176,9 @@ class AgentSystemManager:
         target_custom: Optional[list] = None,
         blocking: bool = True,
         on_update: Optional[Callable] = None,
-        on_complete: Optional[Callable] = None
+        on_complete: Optional[Callable] = None,
+        on_update_params: Optional[Dict] = None,
+        on_complete_params: Optional[Dict] = None
     ) -> Dict:
         """
         - If user_id is given, we switch to that DB. If none, we use/create the current user.
@@ -2175,20 +2191,26 @@ class AgentSystemManager:
         def task():
             try:
                 self._run_internal(
-                    component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update
+                    component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params
                 )
                 if on_complete:
-                    on_complete(self.get_messages(user_id))
+                    if on_complete_params:
+                        on_complete(self.get_messages(user_id), self, on_complete_params)
+                    else:
+                        on_complete(self.get_messages(user_id), self)
             except Exception as e:
                 if verbose:
                     print(f"[Manager] Non-blocking execution error: {e}")
 
         if blocking:
             result = self._run_internal(
-                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update
+                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params
             )
             if on_complete:
-                on_complete(self.get_messages(user_id))
+                if on_complete_params:
+                    on_complete(self.get_messages(user_id), self, on_complete_params)
+                else:
+                    on_complete(self.get_messages(user_id), self)
             return result
         else:
             thread = threading.Thread(target=task)
@@ -2374,7 +2396,25 @@ class AgentSystemManager:
             return condition
         else:
             raise ValueError(f"Unsupported condition type: {condition}")
-        
+    
+    def clear_message_history(self, user_id: Optional[str] = None):
+        """
+        Clears the message history for the specified user.
+        If no user_id is provided, it clears the history for the current user.
+        If no user_id is set or passed, it does nothing.
+        """
+        if user_id is not None:
+            self.set_current_user(user_id)
+
+        if not self._current_user_id:
+            #print("No user ID provided or set. Message history not cleared.")
+            return
+
+        conn = self._get_user_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM message_history")
+        conn.commit()
+        #print(f"Message history cleared for user ID: {self._current_user_id}")
 
 class Parser:
     """
