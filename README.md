@@ -166,8 +166,8 @@ The `AgentSystemManager` manages your system’s components, user histories, and
     ```
 -   **`general_system_description`**: A description appended to the system prompt of each agent.
 -   **`functions_file`**: The name of a Python file where function definitions must be located. This file must exist in the base directory.
--   **`on_update`**: Function to be executed each time an individual component is finished running. The function must receive a list of messages as the only argument. Useful for doing things like updating an independent database or sending messages to user during an automation.
--   **`on_complete`**: Function to be executed when `manager.run`() reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both will be executed), but it's different for automations, since it will only be ran at the end of the automation. The function must receive a list of messages as the only argument. Useful for doing things like sending the last message to the user after a complex automation workflow.
+-   **`on_update`**: Function to be executed each time an individual component is finished running. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like updating an independent database or sending messages to user during an automation.
+-   **`on_complete`**: Function to be executed when `manager.run`() reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both will be executed), but it's different for automations, since it will only be ran at the end of the automation. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like sending the last message to the user after a complex automation workflow.
 
 `on_update` and `on_complete` can be defined as callables directly, or they can be strings referring to the name of the function to used, located in the `functions_file`. To accomplish this, _function syntax_ must be used, by starting the string with _fn:_, for example:
 
@@ -724,7 +724,7 @@ Note that in this case it is important to define an `on_complete` function, sinc
 ```python
 # fns.py
 
-def on_complete_function(messages):
+def on_complete_function(messages, manager):
     # Print the content of the latest message
     if messages:
         latest_message = messages[-1]
