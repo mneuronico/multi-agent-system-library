@@ -767,7 +767,31 @@ token = "<YOUR_TELEGRAM_TOKEN>"
 manager.start_telegram_bot(token)
 ```
 
-Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can either return a string (which will be sent to the correct user by the system) or `None` to send nothing.
+Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can return a string (which will be sent to the correct user by the system), `None` to send nothing, or a dict for more advanced response patterns, as described below.
+
+#### Advanced Response Patterns
+
+For more advanced use cases, `on_complete` and `on_update` can also return a dictionary to define various types of responses to be sent to the user. The system supports the following keys:
+
+-   **`text`**: A plain text message to be sent to the user.
+-   **`markdown`**: A MarkdownV2-formatted message.
+-   **`image`**: A URL or file representing an image to be sent.
+-   **`audio`**: A URL or file representing an audio file to be sent.
+-   **`voice_note`**: A URL or file representing a voice note to be sent.
+-   **`document`**: A URL or file representing a document to be sent.
+
+The keys are processed in the order they appear in the dictionary, allowing the developer to define the sequence in which data is sent. For example:
+
+```python
+def my_on_complete(messages, manager, on_complete_params):
+    return {
+        "text": "Here's your data:",
+        "image": "https://example.com/image.jpg",
+        "document": "https://example.com/document.pdf"
+    }
+```
+
+This will first send the text message, followed by the image, and then the document. This feature ensures flexibility while maintaining simplicity for the developer.
 
 
 ## Input String Parsing
