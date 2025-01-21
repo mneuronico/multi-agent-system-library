@@ -14,7 +14,7 @@ import google.generativeai as genai
 import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
+import re
 
 class Component:
     def __init__(self, name: str):
@@ -1285,28 +1285,95 @@ class Automation(Component):
                             print(f"[Automation:{self.name}] => while loop iteration complete.")
 
             elif control_flow_type == "for":
-                iterations = step.get("iterations")
-                if isinstance(iterations, str):
-                    try:
-                        iterations = int(iterations)
-                    except:
-                        iterations = 0
-                if not isinstance(iterations, int) or iterations < 0:
-                    raise ValueError("For loop 'iterations' must be a non-negative integer or a valid output field.")
+                items_spec = step.get("items")
+                if verbose:
+                    print(f"[Automation:{self.name}] Processing FOR loop with items: {items_spec}")
+
+                # Resolve items specification
+                items_data = self._resolve_items_spec(items_spec, db_conn, verbose)
+
+                elements = self._generate_elements_from_items(items_data, verbose)
                 body = step.get("body", [])
 
-                for iteration in range(iterations):
+                for idx, element in enumerate(elements):
                     if verbose:
-                        print(f"[Automation:{self.name}] => executing for loop iteration {iteration + 1}/{iterations}.")
+                        print(f"[Automation:{self.name}] FOR loop iteration {idx+1}/{len(elements)}")
+                    
+                    # Create iterator message
+                    iterator_msg = {
+                        "item_number": idx,
+                        "item": element
+                    }
+                    self.manager._save_message(db_conn, "iterator", iterator_msg, "iterator")
+
+                    # Execute loop body
                     for nested_step in body:
-                        current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
+                        current_output = self._execute_step(
+                            nested_step, current_output, db_conn, 
+                            verbose, on_update, on_update_params
+                        )
+
 
             else:
                 raise ValueError(f"Unsupported control flow type: {control_flow_type}")
 
         return current_output
 
+    def _resolve_items_spec(self, items_spec, db_conn, verbose):
+        """Resolve items specification to concrete data with parser logic"""
+        # Handle numeric cases first
+        if isinstance(items_spec, (int, float)):
+            return int(items_spec)
+        
+        if isinstance(items_spec, list) and all(isinstance(x, (int, float)) for x in items_spec):
+            return items_spec
+        
+        # Handle string specifications with parser
+        if isinstance(items_spec, str):
+            parsed = self.manager.parser.parse_input_string(items_spec)
+            resolved_data = self._gather_data_for_parser_result(parsed, db_conn)
+            
+            # Enforce single message selection
+            if isinstance(resolved_data, list):
+                if len(resolved_data) > 1:
+                    raise ValueError(f"[Automation] FOR loop items spec '{items_spec}' resolved to multiple messages")
+                resolved_data = resolved_data[0] if resolved_data else None
+            
+            if verbose:
+                print(f"[Automation:{self.name}] Resolved items spec '{items_spec}' to: {resolved_data}")
+            return resolved_data
+        
+        return items_spec
 
+    def _generate_elements_from_items(self, items_data, verbose):
+        """Convert resolved items data into iterable elements with type-specific handling"""
+        if items_data is None:
+            return []
+        
+        # Handle numeric ranges
+        if isinstance(items_data, (int, float)):
+            return list(range(int(items_data)))
+        
+        # Handle list-based ranges or generic lists
+        if isinstance(items_data, list):
+            if len(items_data) in (2, 3) and all(isinstance(x, (int, float)) for x in items_data):
+                # Numeric range case
+                params = [int(x) for x in items_data]
+                return list(range(*params))
+            # Generic list case
+            return items_data
+        
+        # Handle dictionary cases
+        if isinstance(items_data, dict):
+            # If single field, use its value
+            if len(items_data) == 1:
+                return self._generate_elements_from_items(next(iter(items_data.values())), verbose)
+            
+            # Convert dict to list of key-value pairs
+            return [{"key": k, "value": v} for k, v in items_data.items()]
+        
+        # Wrap single items in list
+        return [items_data]
 
     def _evaluate_condition(self, condition, current_output) -> bool:
         """
@@ -2095,7 +2162,7 @@ class AgentSystemManager:
         # Store user-provided input (if any) in the DB
         if input is not None:
             if isinstance(input, dict):
-                store_role = role if role else "developer"
+                store_role = role if role else "internal"
                 self._save_message(db_conn, store_role, input, store_role)
                 if verbose:
                     print(f"[Manager] Saved dict input under role='{store_role}'. => {input}")
@@ -2371,11 +2438,13 @@ class AgentSystemManager:
                     step["start_condition"] = self._resolve_condition(step.get("start_condition", step.get("condition", step["run_first_pass"])))
                     step["end_condition"] = self._resolve_condition(step.get("end_condition", step.get("condition")))
                     step["body"] = self._resolve_automation_sequence(step.get("body", []))
+                    
                 elif control_flow_type == "for":
-                    # Validate mandatory fields for for
-                    if "iterations" not in step or "body" not in step:
-                        raise ValueError("For must have 'iterations' and 'body'.")
-                    step["iterations"] = step.get("iterations")
+                    if "items" not in step or "body" not in step:
+                        raise ValueError("For must have 'items' and 'body'.")
+                    
+                    # Resolve items specification using existing parser logic
+                    step["items"] = step["items"]
                     step["body"] = self._resolve_automation_sequence(step.get("body", []))
                 else:
                     raise ValueError(f"Unsupported control flow type: {control_flow_type}")
@@ -2419,6 +2488,13 @@ class AgentSystemManager:
         conn.commit()
         #print(f"Message history cleared for user ID: {self._current_user_id}")
 
+    def escape_markdown(text: str) -> str:
+        """
+        Escapes special characters in Markdown v1.
+        """
+        pattern = r'([_*\[\]\(\)~`>#\+\-=|{}\.!\\])'
+        return re.sub(pattern, r'\\\1', text)
+    
     def start_telegram_bot(self, telegram_token, component_name = None, verbose = False,
               on_complete = None, on_update = None,
               on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.",
@@ -2427,28 +2503,42 @@ class AgentSystemManager:
         on_update = on_update or self.on_update
         on_complete = on_complete or self.on_complete
 
+        async def send_telegram_response(update, response):
+            if isinstance(response, str):
+                await update.message.reply_text(response)
+            elif isinstance(response, dict):
+                for key, value in response.items():
+                    if key == "text":
+                        await update.message.reply_text(value)
+                    elif key == "markdown":
+                        value = self.escape_markdown(value)
+                        await update.message.reply_text(value, parse_mode="MarkdownV2")
+                    elif key == "image":
+                        await update.message.reply_photo(value)
+                    elif key == "audio":
+                        await update.message.reply_audio(value)
+                    elif key == "voice_note":
+                        await update.message.reply_voice(value)
+                    elif key == "document":
+                        await update.message.reply_document(value)
+
+
         def on_complete_fn(messages, manager, on_complete_params):
 
             if on_complete is not None:
                 response = on_complete(messages, manager, on_complete_params)
             else:
                 last_message = messages[-1]
-                response = last_message["message"]["response"] = last_message["message"]["response"]
+                response = last_message.get("message", {}).get("response")
 
             if response is None:
                 return
 
             update = on_complete_params["update"]
-
-            # We'll define a small coroutine that does the actual sending:
-            async def do_reply():
-                await update.message.reply_text(response)
-
             loop = on_complete_params["event_loop"]
 
-            # Next, we schedule do_reply() onto that loop:
             def callback():
-                asyncio.create_task(do_reply())
+                asyncio.create_task(send_telegram_response(update, response))
 
             loop.call_soon_threadsafe(callback)
 
@@ -2463,16 +2553,10 @@ class AgentSystemManager:
                 return
             
             update = on_update_params["update"]
-
-            # We'll define a small coroutine that does the actual sending:
-            async def do_reply():
-                await update.message.reply_text(response)
-
             loop = on_update_params["event_loop"]
 
-            # Next, we schedule do_reply() onto that loop:
             def callback():
-                asyncio.create_task(do_reply())
+                asyncio.create_task(send_telegram_response(update, response))
 
             loop.call_soon_threadsafe(callback)
 

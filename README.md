@@ -410,8 +410,15 @@ automation_name = manager.create_automation(
             -   `end_condition`: A boolean or a string to evaluate as boolean, or a dict.
             -   `body`:  A list of steps to execute in each iteration.
         -   For `"for"`:
-            -   `iterations`: A positive integer specifying how many times to iterate or a string that evaluates to an integer. if string is not a numeric field it defaults to `0`.
-            -   `body`: A list of steps to execute in each iteration.
+            -   `items`: Required. Defines what to iterate over. Each time a loop starts, the current item will be added to the message history, under the role of "iterator", wrapped in a dictionary with two fields ("item_number" as the cycle number and "item" as the current item). This field can be:
+                - `numeric range`: A single integer n is taken to be the range [0, n). An array of two numeric elements [a, b] is taken to be the range [a, b). An array of three numeric elements [a, b, c] is taken to be a range from a to b in steps of c.
+                - `component reference`: Using `mas input syntax` (see below) you can iterate through data produced by a previous component. The input defined here can be of the following types:
+                    - `single message`: If the message contains more than one field, the iterator will execute one step per field, wrapping it in a dict with fields "key" and "value", with the key and value of the current dictionary item. If the message contains only one field, the iterator will try to resolve that field as one of the other types.
+                    - `single number or list of two or three numbers`: This type of field is resolved to a numeric range.
+                    - `list of arbitrary length and types`: The iterator executes one step per element.
+                    - `dictionary`: Treats it the same way as a single message, which is itself a dictionary.
+                A component reference can never refer to more than one message, as this is ill-defined for item iteration and will result in an exception.
+            -   `body`: A list of steps (components or control-flow elements) to execute in each iteration.
 
 Defining an automation in the config JSON file is as simple as including it in the list of components, just like any other component:
 
