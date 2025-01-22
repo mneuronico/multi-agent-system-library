@@ -59,13 +59,14 @@ Let’s create a minimal configuration to get started with a single agent.
 
 ### Preparing API Keys
 
-Ensure you have an `api_keys.json` file in the base directory. Currently, only "openai", "groq" and "google" are supported as providers:
+Ensure you have an `api_keys.json` file in the base directory. Currently, only "openai", "groq", "google" and "deepseek" are supported as providers:
 
 ```json
 {
     "openai": "sk-your-openai-api-key",
     "groq": "your-groq-key",
-    "google": "your-google-key"
+    "google": "your-google-key",
+    "deepseek": "your-deepseek-key"
 }
 ```
 
@@ -238,7 +239,7 @@ agent_name = manager.create_agent(
             {"provider": "groq", "model": "llama-3.1-8b-instant"}
         ]
     ```
-    Supported providers so far are: `"openai"`, `"google"`, and `"groq"`. Ensure the corresponding `api_key` is available in `api_keys.json`.
+    Supported providers so far are: `"openai"`, `"google"`, `"groq"` and `"deepseek"`. Ensure the corresponding `api_key` is available in `api_keys.json`.
 -   **`default_output`**: The output to use when all the models fail, should match the `required_outputs`.
 -   **`positive_filter`**: A list of `roles` to be included in the context of the agent (all other roles will be ignored if this is defined).
 -   **`negative_filter`**:  A list of `roles` to be excluded from the context.

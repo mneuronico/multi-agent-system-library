@@ -125,7 +125,13 @@ class Agent(Component):
                         model_name=model_name,
                         conversation=conversation,
                         api_key=api_key,
-                        base_url=None,
+                        verbose=verbose
+                    )
+                elif provider == "deepseek":
+                    response_str = self._call_deepseek_api(
+                        model_name=model_name,
+                        conversation=conversation,
+                        api_key=api_key,
                         verbose=verbose
                     )
                 elif provider == "google":
@@ -460,12 +466,8 @@ class Agent(Component):
         model_name: str,
         conversation: List[Dict[str, Any]],
         api_key: str,
-        base_url: Optional[str],
         verbose: bool
     ) -> str:
-        """
-        For OpenAI & Google (which works with OpenAI API as well)
-        """
         schema_for_response = self._build_json_schema()
 
         # Transform system => developer (required for openAI)
@@ -479,9 +481,9 @@ class Agent(Component):
                 new_messages.append({"role": role, "content": content})
 
         if verbose:
-            print(f"[Agent:{self.name}] _call_openai_api => model={model_name}, base_url={base_url}")
+            print(f"[Agent:{self.name}] _call_openai_api => model={model_name}")
 
-        client = OpenAI(api_key=api_key, base_url=base_url)
+        client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model=model_name,
             messages=new_messages,
@@ -489,6 +491,40 @@ class Agent(Component):
                 "type": "json_schema",
                 "json_schema": schema_for_response
             }
+        )
+        return response.choices[0].message.content
+    
+    def _call_deepseek_api(
+        self,
+        model_name: str,
+        conversation: List[Dict[str, Any]],
+        api_key: str,
+        verbose: bool
+    ) -> str:
+        """
+        For DeepSeek (which works with OpenAI API as well)
+        """
+
+        base_url = "https://api.deepseek.com"
+
+        # Transform system => developer (required for openAI)
+        new_messages = []
+        for msg in conversation:
+            role = msg["role"]
+            content = msg["content"]
+            if role == "system":
+                new_messages.append({"role": "system", "content": content})
+            else:
+                new_messages.append({"role": role, "content": content})
+
+        if verbose:
+            print(f"[Agent:{self.name}] _call_deepseek_api => model={model_name}")
+
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=new_messages,
+            response_format={'type': 'json_object'}
         )
         return response.choices[0].message.content
     
