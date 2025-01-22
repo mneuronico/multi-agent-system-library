@@ -523,8 +523,8 @@ class Agent(Component):
         client = OpenAI(api_key=api_key, base_url=base_url)
         response = client.chat.completions.create(
             model=model_name,
-            messages=new_messages,
-            response_format={'type': 'json_object'}
+            messages=new_messages#,
+            #response_format={'type': 'json_object'} # this sometimes fails, according to deepseek docs
         )
         return response.choices[0].message.content
     
