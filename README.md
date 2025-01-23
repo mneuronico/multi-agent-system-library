@@ -167,6 +167,7 @@ The `AgentSystemManager` manages your system’s components, user histories, and
     ```
 -   **`general_system_description`**: A description appended to the system prompt of each agent.
 -   **`functions_file`**: The name of a Python file where function definitions must be located. This file must exist in the base directory.
+-   **`default_models`**: A list of models to use when executing agents, for agents that don't define specific models. Each element of the list should be a dictionary with two fields, `provider` (like 'groq' or 'openai') and `model` (the specific model name). These models will be tried in order, and failure of a model will trigger a call to the next one in the chain.
 -   **`on_update`**: Function to be executed each time an individual component is finished running. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like updating an independent database or sending messages to user during an automation.
 -   **`on_complete`**: Function to be executed when `manager.run`() reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both will be executed), but it's different for automations, since it will only be ran at the end of the automation. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like sending the last message to the user after a complex automation workflow.
 
@@ -183,6 +184,10 @@ You can accomplish the same thing when defining the system from a JSON file:
     "api_keys_path": "api_keys.json",
     "general_system_description": "This is a description for the overall system.",
     "functions_file": "my_fns_file.py",
+    "default_models": [
+            {"provider": "deepseek", "model": "deepseek-chat"},
+            {"provider": "groq", "model": "llama-3.3-70b-versatile"}
+        ]
     "on_update": "fn:on_update_function", 
     "on_complete": "fn:on_complete_function"
   },
@@ -212,9 +217,9 @@ agent_name = manager.create_agent(
         "query": "The query to search for",
          "items": {"description": "Items to show", "type": "string"}
     },
-    models=[  # Default: [{"provider": "groq", "model": "llama-3.1-8b-instant"}]
-        {"provider": "openai", "model": "gpt-4-turbo-preview"},
-        {"provider": "groq", "model": "llama-3.1-8b-instant"}
+    models=[  # Defaults to system's default_models, which, if not defined, defaults to: [{"provider": "groq", "model": "llama-3.1-8b-instant"}]
+        {"provider": "openai", "model": "gpt-4o"},
+        {"provider": "groq", "model": "llama-3.3-70b-versatile"}
     ],
     default_output={"query": "default query", "items": "default items."}, # Default: {"response": "No valid response."}
     positive_filter=["user", "tool-mytool"], # Default: None
@@ -271,8 +276,8 @@ You can create agents when defining the system from a JSON file by including the
         }
       },
       "models": [
-        {"provider": "openai", "model": "gpt-4-turbo-preview"},
-        {"provider": "groq",  "model": "llama-3.1-8b-instant"}
+        {"provider": "openai", "model": "gpt-4o"},
+        {"provider": "groq",  "model": "llama-3.3-70b-versatile"}
       ],
       "default_output": {
         "query": "default query",

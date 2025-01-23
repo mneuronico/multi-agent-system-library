@@ -1687,6 +1687,7 @@ class AgentSystemManager:
         api_keys_path: str = os.getcwd() + "/api_keys.json",
         general_system_description: str = "This is a multi agent system.",
         functions_file: str = "fns.py",
+        default_models: List[Dict[str, str]] = [{"provider": "groq", "model": "llama-3.1-8b-instant"}],
         on_update: Optional[Callable] = None,
         on_complete: Optional[Callable] = None
     ):
@@ -1703,6 +1704,8 @@ class AgentSystemManager:
         self.automations: Dict[str, Automation] = {}
 
         self.parser = Parser()
+
+        self.default_models = default_models
         
         if config_json and config_json.endswith(".json"):
             try:
@@ -2061,7 +2064,7 @@ class AgentSystemManager:
         name: Optional[str] = None,
         system: str = "You are a helpful assistant",
         required_outputs: Union[Dict[str, Any], str] = {"response": "Text to send to user."},
-        models: List[Dict[str, str]] = [{"provider": "groq", "model": "llama-3.1-8b-instant"}],
+        models: List[Dict[str, str]] = None,
         default_output: Optional[Dict[str, Any]] = {"response": "No valid response."},
         positive_filter: Optional[List[str]] = None,
         negative_filter: Optional[List[str]] = None
@@ -2072,6 +2075,9 @@ class AgentSystemManager:
     
         if name in self.agents:
             raise ValueError(f"[Manager] Agent '{name}' already exists.")
+
+        if models is None:
+            models = self.default_models.copy()
     
         # Convert string required_outputs to {response: <string>}
         if isinstance(required_outputs, str):
@@ -2401,7 +2407,7 @@ class AgentSystemManager:
         self.api_keys_path = general_params.get("api_keys_path", os.path.join(self.base_directory, "api_keys.json"))
         self.general_system_description = general_params.get("general_system_description", "This is a multi-agent system.")
         self.functions_file = general_params.get("functions_file", "fns.py")
-
+        self.default_models = general_params.get("default_models", self.default_models)
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
 
@@ -2438,7 +2444,7 @@ class AgentSystemManager:
                 name=name,
                 system=component.get("system", "You are a helpful assistant."),
                 required_outputs=component.get("required_outputs", {"response": "Text to send to user."}),
-                models=component.get("models", [{"provider": "groq", "model": "llama-3.1-8b-instant"}]),
+                models=component.get("models"),
                 default_output=component.get("default_output", {"response": "No valid response."}),
                 positive_filter=component.get("positive_filter", None),
                 negative_filter=component.get("negative_filter", None)
