@@ -420,6 +420,13 @@ automation_name = manager.create_automation(
                     - `dictionary`: Treats it the same way as a single message, which is itself a dictionary.
                 A component reference can never refer to more than one message, as this is ill-defined for item iteration and will result in an exception.
             -   `body`: A list of steps (components or control-flow elements) to execute in each iteration.
+        -   For `"switch"`:
+            -   `value`: The comparison value source, can be:
+                - Literal value (string/number/boolean)
+                - MAS input syntax reference (e.g. `":my_agent?[field]"`), which must resolve to a single value to use in the switch statement.
+            -   `cases`: Ordered list of potential matches, each containing:
+                - `case`: Comparison value (use "default" for catch-all)
+                - `body`: Steps to execute on match
 
 Defining an automation in the config JSON file is as simple as including it in the list of components, just like any other component:
 

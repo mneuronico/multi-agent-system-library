@@ -1349,11 +1349,78 @@ class Automation(Component):
                             verbose, on_update, on_update_params
                         )
 
+            elif control_flow_type == "switch":
+                switch_value = self._resolve_switch_value(step["value"], db_conn, verbose)
+                executed = False
+                
+                for case in step.get("cases", []):
+                    case_value = case.get("case")
+                    case_body = case.get("body", [])
+                    
+                    if case_value == "default":
+                        continue  # Process default last
+                        
+                    if self._case_matches(switch_value, case_value, verbose):
+                        if verbose:
+                            print(f"[Automation:{self.name}] Switch matched case: {case_value}")
+                        for nested_step in case_body:
+                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
+                        executed = True
+                        break
+                
+                # Process default case if no matches
+                if not executed:
+                    for case in step.get("cases", []):
+                        if case.get("case") == "default":
+                            if verbose:
+                                print(f"[Automation:{self.name}] Executing default case")
+                            for nested_step in case.get("body", []):
+                                current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
+                            break
 
             else:
                 raise ValueError(f"Unsupported control flow type: {control_flow_type}")
 
         return current_output
+
+    def _resolve_switch_value(self, value_spec, db_conn, verbose):
+        """Resolve switch value using parser logic"""
+        if isinstance(value_spec, str) and not value_spec.startswith(":"):
+            # Direct field reference from last message
+            last_msg = self.manager._get_all_messages(db_conn)[-1][1]
+            try:
+                data = json.loads(last_msg)
+                return data.get(value_spec)
+            except:
+                return last_msg
+        
+        parsed = self.manager.parser.parse_input_string(value_spec)
+        resolved = self._gather_data_for_parser_result(parsed, db_conn)
+        
+        if isinstance(resolved, dict):
+            if len(resolved) == 1:
+                return next(iter(resolved.values()))
+            raise ValueError(f"Switch value resolved to multi-field dict: {resolved.keys()}")
+        
+        if isinstance(resolved, list):
+            if len(resolved) == 1:
+                return resolved[0]
+            raise ValueError(f"Switch value resolved to multiple messages: {len(resolved)}")
+        
+        return resolved
+
+    def _case_matches(self, switch_value, case_value, verbose):
+        """Compare values with type coercion for numbers"""
+        try:
+            # Numeric equivalence check
+            if isinstance(switch_value, (int, float)) and isinstance(case_value, (int, float)):
+                return float(switch_value) == float(case_value)
+            # Strict equality for other types
+            return switch_value == case_value
+        except Exception as e:
+            if verbose:
+                print(f"[Automation] Case comparison error: {e}")
+            return False
 
     def _resolve_items_spec(self, items_spec, db_conn, verbose):
         """Resolve items specification to concrete data with parser logic"""
@@ -2482,6 +2549,24 @@ class AgentSystemManager:
                     # Resolve items specification using existing parser logic
                     step["items"] = step["items"]
                     step["body"] = self._resolve_automation_sequence(step.get("body", []))
+
+                elif control_flow_type == "switch":
+                    # Validate required fields
+                    if "value" not in step or "cases" not in step:
+                        raise ValueError("Switch must have 'value' and 'cases'")
+                    
+                    # Validate cases structure
+                    for case in step["cases"]:
+                        if "case" not in case or "body" not in case:
+                            raise ValueError("Each switch case must have 'case' and 'body'")
+                    
+                    # Resolve remains as-is since processing happens at runtime
+                    step["value"] = step["value"]
+                    step["cases"] = [{
+                        "case": case["case"],
+                        "body": self._resolve_automation_sequence(case.get("body", []))
+                    } for case in step["cases"]]
+
                 else:
                     raise ValueError(f"Unsupported control flow type: {control_flow_type}")
                 resolved_sequence.append(step)
