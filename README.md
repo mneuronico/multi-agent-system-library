@@ -40,9 +40,9 @@ Installing `mas` from GitHub is easy and straightforward.
 
 ### Prerequisites
 
--Python 3.7+
--Git
--API keys for services you plan to use (OpenAI, Groq, etc)
+-   Python 3.7+
+-   [Git](https://git-scm.com/downloads)
+-   API keys for services you plan to use (OpenAI, Groq, etc)
 
 ### Install from GitHub
 
