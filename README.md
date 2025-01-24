@@ -36,6 +36,22 @@ Welcome to the `mas` library! This guide will help you get started with setting 
 
 ---
 
+## Installation
+
+Installing `mas` from GitHub is easy and straightforward.
+
+### Prerequisites
+
+-Python 3.7+
+-Git
+-API keys for services you plan to use (OpenAI, Groq, etc)
+
+### Install from GitHub
+
+```bash
+pip install git+https://github.com/mneuronico/multi-agent-system-library
+```
+
 ## Step 1: Create a Minimal JSON Configuration
 
 Let’s create a minimal configuration to get started with a single agent.
