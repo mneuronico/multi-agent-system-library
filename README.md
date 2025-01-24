@@ -47,7 +47,7 @@ Installing `mas` from GitHub is easy and straightforward.
 ### Install from GitHub
 
 ```bash
-pip install git+https://github.com/mneuronico/multi-agent-system-library
+pip install --upgrade git+https://github.com/mneuronico/multi-agent-system-library
 ```
 
 ## Step 1: Create a Minimal JSON Configuration
