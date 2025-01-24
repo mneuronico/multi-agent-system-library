@@ -7,10 +7,10 @@ import threading
 from typing import Optional, List, Dict, Callable, Any, Union
 from openai import OpenAI
 from groq import Groq
-from pydantic import BaseModel
 import pickle
 import importlib.util
 import google.generativeai as genai
+from anthropic import Anthropic
 import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -143,6 +143,13 @@ class Agent(Component):
                     )
                 elif provider == "groq":
                     response_str = self._call_groq_api(
+                        model_name=model_name,
+                        conversation=conversation,
+                        api_key=api_key,
+                        verbose=verbose
+                    )
+                elif provider == "anthropic":
+                    response_str = self._call_anthropic_api(
                         model_name=model_name,
                         conversation=conversation,
                         api_key=api_key,
@@ -579,6 +586,33 @@ class Agent(Component):
 
         # Google returns text directly, we need to wrap in a json
         return response.text
+
+    def _call_anthropic_api(
+        self,
+        model_name: str,
+        conversation: List[Dict[str, Any]],
+        api_key: str,
+        verbose: bool
+    ) -> str:
+        if verbose:
+            print(f"[Agent:{self.name}] _call_anthropic_api => model={model_name}")
+
+        # Extract system messages (anywhere in conversation)
+        system_messages = [msg for msg in conversation if msg['role'] == 'system']
+        system_prompt = system_messages[0]['content'] if system_messages else None
+        
+        # Filter out system messages and keep original order
+        messages = [msg for msg in conversation if msg['role'] != 'system']
+        
+        client = Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=model_name,
+            messages=messages,
+            system=system_prompt
+        )
+        
+        return response.content[0].text
+
 
     def _call_groq_api(
         self,
