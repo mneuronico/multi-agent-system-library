@@ -234,7 +234,8 @@ agent_name = manager.create_agent(
     ],
     default_output={"query": "default query", "items": "default items."}, # Default: {"response": "No valid response."}
     positive_filter=["user", "tool-mytool"], # Default: None
-    negative_filter=["bot-otheragent"]  # Default: None
+    negative_filter=["bot-otheragent"],  # Default: None
+    model_params={"temperature": 1.0, "max_tokens": 4096}
 )
 ```
 
@@ -265,6 +266,7 @@ agent_name = manager.create_agent(
     -   `tool`: selects messages from all roles from the tool type.
     -   `process`: selects messages from all roles from the process type.
     -   Exact role names (e.g., `myagent`)
+-   **`model_params`**: Dictionary including params for advanced LLM configuration. Supported params right now are `temperature`, `max_tokens` and `top_p`. Not defining these will use default configuration for each provider.
 
 
 You can create agents when defining the system from a JSON file by including them in the component list:
@@ -295,7 +297,11 @@ You can create agents when defining the system from a JSON file by including the
         "items": "default items."
       },
       "positive_filter": ["user", "mytool"],
-      "negative_filter": ["otheragent"]
+      "negative_filter": ["otheragent"],
+      "model_params": {
+        "temperature": 1.0,
+        "max_tokens": 4096
+      }
     }
   ]
 }

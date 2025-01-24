@@ -10,6 +10,7 @@ from groq import Groq
 import pickle
 import importlib.util
 import google.generativeai as genai
+from google.generativeai import types
 from anthropic import Anthropic
 import asyncio
 from telegram import Update
@@ -43,7 +44,8 @@ class Agent(Component):
         positive_filter: Optional[List[str]] = None,
         negative_filter: Optional[List[str]] = None,
         api_keys: Optional[Dict[str, str]] = None,
-        general_system_description: str = ""
+        general_system_description: str = "",
+        model_params: Optional[Dict[str, Any]] = None
     ):
         super().__init__(name)
         self.system_prompt = system_prompt
@@ -59,6 +61,7 @@ class Agent(Component):
         self.negative_filter = negative_filter
         self.api_keys = api_keys or {}
         self.general_system_description = general_system_description
+        self.model_params = model_params or {}
 
     def to_string(self) -> str:
         return (
@@ -467,6 +470,7 @@ class Agent(Component):
                     except json.JSONDecodeError:
                         continue  # Keep shrinking the window
         return None  # No valid JSON found
+    
 
     def _call_openai_api(
         self,
@@ -476,6 +480,14 @@ class Agent(Component):
         verbose: bool
     ) -> str:
         schema_for_response = self._build_json_schema()
+        
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_tokens": self.model_params.get("max_tokens"),
+            "top_p": self.model_params.get("top_p")
+        }
+        # Filter out None values
+        params = {k: v for k, v in params.items() if v is not None}
 
         # Transform system => developer (required for openAI)
         new_messages = []
@@ -488,7 +500,7 @@ class Agent(Component):
                 new_messages.append({"role": role, "content": content})
 
         if verbose:
-            print(f"[Agent:{self.name}] _call_openai_api => model={model_name}")
+            print(f"[Agent:{self.name}] _call_openai_api => model={model_name} (params = {params})")
 
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
@@ -497,7 +509,8 @@ class Agent(Component):
             response_format={
                 "type": "json_schema",
                 "json_schema": schema_for_response
-            }
+            },
+            **params
         )
         return response.choices[0].message.content
     
@@ -514,6 +527,14 @@ class Agent(Component):
 
         base_url = "https://api.deepseek.com"
 
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_tokens": self.model_params.get("max_tokens"),
+            "top_p": self.model_params.get("top_p")
+        }
+        # Filter out None values
+        params = {k: v for k, v in params.items() if v is not None}
+
         # Transform system => developer (required for openAI)
         new_messages = []
         for msg in conversation:
@@ -525,12 +546,13 @@ class Agent(Component):
                 new_messages.append({"role": role, "content": content})
 
         if verbose:
-            print(f"[Agent:{self.name}] _call_deepseek_api => model={model_name}")
+            print(f"[Agent:{self.name}] _call_deepseek_api => model={model_name} (params = {params})")
 
         client = OpenAI(api_key=api_key, base_url=base_url)
         response = client.chat.completions.create(
             model=model_name,
-            messages=new_messages#,
+            messages=new_messages,
+            **params
             #response_format={'type': 'json_object'} # this sometimes fails, according to deepseek docs
         )
         return response.choices[0].message.content
@@ -545,8 +567,16 @@ class Agent(Component):
         """
         Calls the Google Gemini API to get a response.
         """
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_output_tokens": self.model_params.get("max_tokens"),
+            "top_p": self.model_params.get("top_p")
+        }
+        # Filter out None values
+        params = {k: v for k, v in params.items() if v is not None}
+        
         if verbose:
-            print(f"[Agent:{self.name}] _call_google_api => model={model_name}")
+            print(f"[Agent:{self.name}] _call_google_api => model={model_name} (params = {params})")
         
         genai.configure(api_key=api_key)
 
@@ -568,7 +598,8 @@ class Agent(Component):
 
         model = genai.GenerativeModel(
             model_name=model_name,
-            system_instruction=system_instruction if system_instruction else None
+            system_instruction=system_instruction if system_instruction else None,
+            generation_config=types.GenerationConfig(**params)
         )
 
         chat = model.start_chat(history=history)
@@ -581,9 +612,6 @@ class Agent(Component):
                 print(f"[Agent:{self.name}] No last user message for Google Gemini API.")
             return json.dumps(self.default_output)
 
-        if verbose:
-            print(f"[Agent:{self.name}] _call_google_api response => {response.text}")
-
         # Google returns text directly, we need to wrap in a json
         return response.text
 
@@ -594,8 +622,17 @@ class Agent(Component):
         api_key: str,
         verbose: bool
     ) -> str:
+        
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_tokens": self.model_params.get("max_tokens", 4096),
+            "top_p": self.model_params.get("top_p")
+        }
+        # Filter out None values
+        params = {k: v for k, v in params.items() if v is not None}
+
         if verbose:
-            print(f"[Agent:{self.name}] _call_anthropic_api => model={model_name}")
+            print(f"[Agent:{self.name}] _call_anthropic_api => model={model_name} (params = {params})")
 
         # Extract system messages (anywhere in conversation)
         system_messages = [msg for msg in conversation if msg['role'] == 'system']
@@ -608,7 +645,8 @@ class Agent(Component):
         response = client.messages.create(
             model=model_name,
             messages=messages,
-            system=system_prompt
+            system=system_prompt,
+            **params
         )
         
         return response.content[0].text
@@ -621,8 +659,16 @@ class Agent(Component):
         api_key: str,
         verbose: bool
     ) -> str:
+        
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_completion_tokens": self.model_params.get("max_tokens"),
+            "top_p": self.model_params.get("top_p")
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+
         if verbose:
-            print(f"[Agent:{self.name}] _call_groq_api => model={model_name}")
+            print(f"[Agent:{self.name}] _call_groq_api => model={model_name} (params = {params})")
 
         groq_client = Groq(api_key=api_key)
 
@@ -630,7 +676,8 @@ class Agent(Component):
             messages=conversation,
             model=model_name,
             stream=False,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            **params
         )
         return chat_completion.choices[0].message.content
 
@@ -2141,7 +2188,8 @@ class AgentSystemManager:
         models: List[Dict[str, str]] = None,
         default_output: Optional[Dict[str, Any]] = {"response": "No valid response."},
         positive_filter: Optional[List[str]] = None,
-        negative_filter: Optional[List[str]] = None
+        negative_filter: Optional[List[str]] = None,
+        model_params: Optional[Dict[str, Any]] = None
     ):
         # Automatically assign name if not provided
         if name is None:
@@ -2174,7 +2222,8 @@ class AgentSystemManager:
             positive_filter=positive_filter,
             negative_filter=negative_filter,
             api_keys=self.api_keys,
-            general_system_description=self.general_system_description
+            general_system_description=self.general_system_description,
+            model_params=model_params
         )
         agent.manager = self
         self.agents[name] = agent
@@ -2516,6 +2565,8 @@ class AgentSystemManager:
             raise ValueError("Component must have a 'type' and a 'name'.")
 
         if component_type == "agent":
+            model_params = component.get("model_params", None)
+
             agent_name = self.create_agent(
                 name=name,
                 system=component.get("system", "You are a helpful assistant."),
@@ -2523,7 +2574,8 @@ class AgentSystemManager:
                 models=component.get("models"),
                 default_output=component.get("default_output", {"response": "No valid response."}),
                 positive_filter=component.get("positive_filter", None),
-                negative_filter=component.get("negative_filter", None)
+                negative_filter=component.get("negative_filter", None),
+                model_params=model_params
             )
 
             # Store the link information to be processed later
