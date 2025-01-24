@@ -1,0 +1,15 @@
+{
+    "general_parameters": {
+        "general_system_description": "A simple query system."
+    },
+    "components": [
+        {
+        "type": "agent",
+        "name": "simple_agent",
+        "system": "You are a basic assistant for answering questions.",
+        "required_outputs": {
+            "response": "A text response to be sent to the user."
+        }
+        }
+    ]
+}

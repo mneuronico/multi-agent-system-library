@@ -1,0 +1,7 @@
+{
+    "openai": "your-openai-key",
+    "groq": "your-groq-key",
+    "google": "your-google-key",
+    "anthropic": "your-anthropic-key",
+    "deepseek": "your-deepseek-key"
+}
