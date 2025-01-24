@@ -5,17 +5,13 @@ import traceback
 import uuid
 import threading
 from typing import Optional, List, Dict, Callable, Any, Union
-from openai import OpenAI
-from groq import Groq
 import pickle
 import importlib.util
-import google.generativeai as genai
-from google.generativeai import types
-from anthropic import Anthropic
 import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import re
+import requests
 
 class Component:
     def __init__(self, name: str):
@@ -502,17 +498,28 @@ class Agent(Component):
         if verbose:
             print(f"[Agent:{self.name}] _call_openai_api => model={model_name} (params = {params})")
 
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=new_messages,
-            response_format={
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model_name,
+            "messages": new_messages,
+            "response_format": {
                 "type": "json_schema",
                 "json_schema": schema_for_response
             },
             **params
+        }
+
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=data
         )
-        return response.choices[0].message.content
+        response.raise_for_status()
+
+        return response.json()["choices"][0]["message"]["content"]
     
     def _call_deepseek_api(
         self,
@@ -521,11 +528,6 @@ class Agent(Component):
         api_key: str,
         verbose: bool
     ) -> str:
-        """
-        For DeepSeek (which works with OpenAI API as well)
-        """
-
-        base_url = "https://api.deepseek.com"
 
         params = {
             "temperature": self.model_params.get("temperature"),
@@ -535,27 +537,33 @@ class Agent(Component):
         # Filter out None values
         params = {k: v for k, v in params.items() if v is not None}
 
-        # Transform system => developer (required for openAI)
         new_messages = []
         for msg in conversation:
             role = msg["role"]
             content = msg["content"]
-            if role == "system":
-                new_messages.append({"role": "system", "content": content})
-            else:
-                new_messages.append({"role": role, "content": content})
+            new_messages.append({"role": role, "content": content})
 
         if verbose:
             print(f"[Agent:{self.name}] _call_deepseek_api => model={model_name} (params = {params})")
-
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=new_messages,
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model_name,
+            "messages": new_messages,
             **params
-            #response_format={'type': 'json_object'} # this sometimes fails, according to deepseek docs
+        }
+
+        response = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers=headers,
+            json=data
         )
-        return response.choices[0].message.content
+        response.raise_for_status()
+
+        return response.json()["choices"][0]["message"]["content"]
     
     def _call_google_api(
         self,
@@ -574,46 +582,38 @@ class Agent(Component):
         }
         # Filter out None values
         params = {k: v for k, v in params.items() if v is not None}
-        
+
+        system_instruction = None
+        contents = []
+        for msg in conversation:
+            if msg["role"] == "system":
+                system_instruction = msg["content"]
+            else:
+                role = "user" if msg["role"] == "user" else "model"
+                contents.append({
+                    "role": role,
+                    "parts": [{"text": msg["content"]}]
+                })
+
         if verbose:
             print(f"[Agent:{self.name}] _call_google_api => model={model_name} (params = {params})")
         
-        genai.configure(api_key=api_key)
+        data = {
+            "contents": contents,
+            "generationConfig": params
+        }
+        if system_instruction:
+            data["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
-        # Separate system instructions and build history (excluding last user message)
-        system_instruction = None
-        history = []
-        last_message_content = None
-
-        for i, msg in enumerate(conversation):
-            if msg["role"] == "system":
-                system_instruction = msg["content"]
-            elif msg["role"] == "assistant":
-                history.append({"role": "model", "parts": msg["content"]})
-            elif msg["role"] == "user":
-                if i == len(conversation) - 1:
-                    last_message_content = msg["content"]
-                else:
-                    history.append({"role": "user", "parts": msg["content"]})
-
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system_instruction if system_instruction else None,
-            generation_config=types.GenerationConfig(**params)
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json=data
         )
-
-        chat = model.start_chat(history=history)
+        response.raise_for_status()
+        response_json = response.json()
         
-        # Check if a last user message exists for sending
-        if last_message_content:
-            response = chat.send_message(last_message_content)
-        else:
-            if verbose:
-                print(f"[Agent:{self.name}] No last user message for Google Gemini API.")
-            return json.dumps(self.default_output)
-
-        # Google returns text directly, we need to wrap in a json
-        return response.text
+        return response_json["candidates"][0]["content"]["parts"][0]["text"]
 
     def _call_anthropic_api(
         self,
@@ -631,26 +631,33 @@ class Agent(Component):
         # Filter out None values
         params = {k: v for k, v in params.items() if v is not None}
 
-        if verbose:
-            print(f"[Agent:{self.name}] _call_anthropic_api => model={model_name} (params = {params})")
-
         # Extract system messages (anywhere in conversation)
         system_messages = [msg for msg in conversation if msg['role'] == 'system']
         system_prompt = system_messages[0]['content'] if system_messages else None
-        
-        # Filter out system messages and keep original order
         messages = [msg for msg in conversation if msg['role'] != 'system']
-        
-        client = Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=model_name,
-            messages=messages,
-            system=system_prompt,
-            **params
-        )
-        
-        return response.content[0].text
 
+        if verbose:
+            print(f"[Agent:{self.name}] _call_anthropic_api => model={model_name} (params = {params})")
+        
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        data = {
+            "model": model_name,
+            "messages": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
+            "system": system_prompt,
+            **params
+        }
+        
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=data
+        )
+        response.raise_for_status()
+        return response.json()["content"][0]["text"]
 
     def _call_groq_api(
         self,
@@ -670,16 +677,25 @@ class Agent(Component):
         if verbose:
             print(f"[Agent:{self.name}] _call_groq_api => model={model_name} (params = {params})")
 
-        groq_client = Groq(api_key=api_key)
-
-        chat_completion = groq_client.chat.completions.create(
-            messages=conversation,
-            model=model_name,
-            stream=False,
-            response_format={"type": "json_object"},
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model_name,
+            "messages": conversation,
+            "response_format": {"type": "json_object"},
             **params
+        }
+
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=data
         )
-        return chat_completion.choices[0].message.content
+        response.raise_for_status()
+
+        return response.json()["choices"][0]["message"]["content"]
 
 
 class Tool(Component):
