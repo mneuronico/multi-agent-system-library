@@ -149,6 +149,11 @@ manager = AgentSystemManager(
     api_keys_path="api_keys.json",  # Default is api_keys.json
     general_system_description="This is a description for the overall system.", # Default: "This is a multi agent system."
     functions_file="my_fns_file.py", # Default: "fns.py"
+    default_models=[{"provider": "groq", "model": "llama-3.1-8b-instant"}],
+    imports=[
+        "common_tools.json",  # Import all components from file
+        "external_agents.json->research_agent+analysis_tool"  # Import specific components
+    ],
     on_update=on_update, # Default: none
     on_complete=on_complete # Default: none
 )
@@ -168,6 +173,7 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 -   **`general_system_description`**: A description appended to the system prompt of each agent.
 -   **`functions_file`**: The name of a Python file where function definitions must be located. This file must exist in the base directory.
 -   **`default_models`**: A list of models to use when executing agents, for agents that don't define specific models. Each element of the list should be a dictionary with two fields, `provider` (like 'groq' or 'openai') and `model` (the specific model name). These models will be tried in order, and failure of a model will trigger a call to the next one in the chain.
+-   **`imports`**: List of component import specifications. Each entry can be either `"<your_json>.json"` to import all components from that file, or `"<your_json>.json"->component1+component2` to import specific components from that file.
 -   **`on_update`**: Function to be executed each time an individual component is finished running. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like updating an independent database or sending messages to user during an automation.
 -   **`on_complete`**: Function to be executed when `manager.run`() reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both will be executed), but it's different for automations, since it will only be ran at the end of the automation. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like sending the last message to the user after a complex automation workflow.
 
@@ -187,11 +193,15 @@ You can accomplish the same thing when defining the system from a JSON file:
     "default_models": [
             {"provider": "deepseek", "model": "deepseek-chat"},
             {"provider": "groq", "model": "llama-3.3-70b-versatile"}
-        ]
+        ],
+    "imports": [
+        "common_tools.json",
+        "external_agents.json->research_agent+analysis_tool"
+    ],
     "on_update": "fn:on_update_function", 
     "on_complete": "fn:on_complete_function"
   },
-  "components": ...
+  "components": [...]
 }
 ```
 
@@ -472,6 +482,48 @@ Defining an automation in the config JSON file is as simple as including it in t
 ```
 
 Note that these examples use the `mas input syntax`, which will be explained below.
+
+### Component Imports
+
+The system supports importing components from external JSON files to enable modular architecture and component reuse. This works for both system-wide components and automation-specific references. It also works both when defining the system programmatically and from a JSON file. These JSON files must contain a `"components"` field, which must be a list of components.
+
+#### General Import Syntax
+
+Specify imports using these formats in the `imports` parameter:
+
+```python
+imports=[
+    # Import all components from a file in the base directory
+    "common_tools.json",
+    
+    # Import specific components from a file
+    "external_agents.json->research_agent+analysis_tool",
+
+    # Import components from a file outside the base directory
+    "path/to/your/file.json"
+]
+```
+
+#### Automation-Specific Imports
+
+In automation sequences, directly reference external components using inline syntax:
+
+```python
+{
+    "type": "automation",
+    "name": "complex_flow",
+    "sequence": [
+        "external.json->research_agent",
+        "local_component",
+        "path/to/your/other_file.json->some_tool"
+    ]
+}
+```
+
+When importing a component directly in an automation step, the string must be resolved to a single component.
+
+Component names must be unique across all imports and local components. Duplicate names will throw an error.
+
 
 ### Linking Components
 

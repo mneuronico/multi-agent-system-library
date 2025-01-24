@@ -666,8 +666,6 @@ class Tool(Component):
         # Call the tool function
         try:
             result = self.function(*func_args)
-            if not isinstance(result, (list, tuple)):
-                result = (result,)
 
             if len(result) != len(self.outputs):
                 raise ValueError(
@@ -675,13 +673,9 @@ class Tool(Component):
                     f"but {len(self.outputs)} expected."
                 )
 
-            result_dict = {}
-            for (out_name, val) in zip(self.outputs, result):
-                result_dict[out_name] = val
-
             if verbose:
-                print(f"[Tool:{self.name}] => {result_dict}")
-            return result_dict
+                print(f"[Tool:{self.name}] => {result}")
+            return result
 
         except Exception as e:
             if verbose:
@@ -1683,6 +1677,7 @@ class AgentSystemManager:
     def __init__(
         self,
         config_json: str = None,
+        imports: List[str] = None,
         base_directory: str = os.getcwd(),
         api_keys_path: str = os.getcwd() + "/api_keys.json",
         general_system_description: str = "This is a multi agent system.",
@@ -1706,6 +1701,8 @@ class AgentSystemManager:
         self.parser = Parser()
 
         self.default_models = default_models
+        self.imports = imports or []
+        self._processed_imports = set()
         
         if config_json and config_json.endswith(".json"):
             try:
@@ -1723,10 +1720,53 @@ class AgentSystemManager:
         self.api_keys: Dict[str, str] = {}
         self._load_api_keys()
 
+        self._process_imports()
+
         self._last_known_update = None
 
         self.history_folder = os.path.join(self.base_directory, "history")
         os.makedirs(self.history_folder, exist_ok=True)
+
+    def _process_imports(self):
+        for import_str in self.imports:
+            self._process_single_import(import_str)
+
+    def _process_single_import(self, import_str: str):
+        if import_str in self._processed_imports:
+            return
+        self._processed_imports.add(import_str)
+
+        # Parse import string
+        if "->" in import_str:
+            file_part, components_part = import_str.split("->", 1)
+            components = components_part.split("+")
+        else:
+            file_part = import_str
+            components = None
+
+        # Resolve file path
+        if os.path.isabs(file_part.strip()):
+            json_path = file_part.strip()
+        else:
+            json_path = os.path.join(self.base_directory, file_part.strip())
+        
+        # Load external config
+        with open(json_path, "r") as f:
+            external_config = json.load(f)
+            
+        # Process components
+        for comp_def in external_config.get("components", []):
+            comp_name = comp_def.get("name")
+            if components is None or comp_name in components:
+                if self._component_exists(comp_name):
+                    raise ValueError(f"Component {comp_name} already exists when importing from {import_str}")
+                self._create_component_from_json(comp_def)
+
+    def _component_exists(self, name: str) -> bool:
+        return any(
+            name in getattr(self, registry)
+            for registry in ['agents', 'tools', 'processes', 'automations']
+        )
 
     def _resolve_callable(self, func):
         if isinstance(func, str) and func.startswith("fn:"):
@@ -2411,6 +2451,8 @@ class AgentSystemManager:
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
 
+        self.imports = general_params.get("imports", [])
+
         self._load_api_keys()
 
         components = system_definition.get("components", [])
@@ -2524,7 +2566,18 @@ class AgentSystemManager:
         resolved_sequence = []
 
         for step in sequence:
-            if isinstance(step, str):
+            if isinstance(step, str) and "->" in step:
+                if ":" in step:
+                    import_ref, target_params = step.split(":", 1)
+                else:
+                    import_ref = step
+                    target_params = ""
+
+                self._process_single_import(import_ref)
+                component_name = import_ref.split("->")[-1].strip()
+                resolved_step = f"{component_name}:{target_params}" if target_params else component_name
+                resolved_sequence.append(resolved_step)
+            elif isinstance(step, str):
                 resolved_sequence.append(step)
             elif isinstance(step, dict):
                 control_flow_type = step.get("control_flow_type")
