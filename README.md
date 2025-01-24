@@ -34,8 +34,6 @@ This library has not yet been extensively tested and is currently under developm
 
 Welcome to the `mas` library! This guide will help you get started with setting up and running your first multi-agent system using a simple configuration.
 
----
-
 ## Installation
 
 Installing `mas` from GitHub is easy and straightforward.
