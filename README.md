@@ -59,7 +59,7 @@ Let’s create a minimal configuration to get started with a single agent.
 ```json
 {
     "general_parameters": {
-        "api_keys_path": "api_keys.json"
+        "api_keys_path": ".env"
     },
     "components": [
         {
@@ -73,17 +73,33 @@ Let’s create a minimal configuration to get started with a single agent.
 
 ### Preparing API Keys
 
-Ensure you have an `api_keys.json` file in the base directory. Currently, the supported providers are "openai", "groq", "google", "anthropic" and "deepseek".
+Ensure you have a file containing your API keys. Only the ones that you use need to be included. This file can either be a `.env` file or a `json` file. By default (if not provided with an explicit `api_keys_path` parameter), the manager will look for `.env` in the base directory. If it does not find it, it will look for `api_keys.json`. If it does not find that either, it will assume no API keys have been loaded, and you will not be able to use LLM integration.
+
+Currently, the supported providers are "openai", "groq", "google", "anthropic" and "deepseek". To define a `.env` file, you can do something like:
+
+```dotenv
+OPENAI_API_KEY=your_openai_key
+GROQ_API_KEY=your_groq_key
+GOOGLE_API_KEY=your_google_key
+ANTHROPIC_API_KEY=your_anthropic_key
+DEEPSEEK_API_KEY=your_deepseek_key
+```
+
+Provider names can be defined as `<PROVIDER>-API-KEY`, or just `PROVIDER` (the names are handled as case-insensitive).
+
+To use a `json` file to define API keys, you can do something like:
 
 ```json
 {
-    "openai": "sk-your-openai-api-key",
+    "openai": "your-openai-key",
     "groq": "your-groq-key",
     "google": "your-google-key",
     "anthropic": "your-anthropic-key",
     "deepseek": "your-deepseek-key"
 }
 ```
+
+Using a `.env` file is recommended. The `api_keys_path` parameter can refer to a file or directory inside the `base_directory`, or to an absolute path.
 
 ---
 
@@ -161,7 +177,7 @@ from mas import AgentSystemManager
 
 manager = AgentSystemManager(
     base_directory="path/to/your/base_dir",  # Default is the current working directory.
-    api_keys_path="api_keys.json",  # Default is api_keys.json
+    api_keys_path="path/to/your/api_keys.env",  # Default is .env
     general_system_description="This is a description for the overall system.", # Default: "This is a multi agent system."
     functions_file="my_fns_file.py", # Default: "fns.py"
     default_models=[{"provider": "groq", "model": "llama-3.1-8b-instant"}],
@@ -177,14 +193,7 @@ manager = AgentSystemManager(
 The `AgentSystemManager` manages your system’s components, user histories, and general settings.
 
 -   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
--   **`api_keys_path`**: The name of a JSON file containing API keys for various LLM providers, which must be in the `base_directory`. Example:
-
-    ```json
-    {
-        "openai": "sk-...",
-        "groq": "groq-..."
-    }
-    ```
+-   **`api_keys_path`**: File or path to a `.env` or `json` file containing API keys for various LLM providers.
 -   **`general_system_description`**: A description appended to the system prompt of each agent.
 -   **`functions_file`**: The name of a Python file where function definitions must be located. This file must exist in the base directory.
 -   **`default_models`**: A list of models to use when executing agents, for agents that don't define specific models. Each element of the list should be a dictionary with two fields, `provider` (like 'groq' or 'openai') and `model` (the specific model name). These models will be tried in order, and failure of a model will trigger a call to the next one in the chain.
@@ -202,7 +211,7 @@ You can accomplish the same thing when defining the system from a JSON file:
 {
   "general_parameters": {
     "base_directory": "/path/to/your/base_dir",
-    "api_keys_path": "api_keys.json",
+    "api_keys_path": "/path/to/your/api_keys.env",
     "general_system_description": "This is a description for the overall system.",
     "functions_file": "my_fns_file.py",
     "default_models": [
@@ -270,7 +279,7 @@ agent_name = manager.create_agent(
             {"provider": "groq", "model": "llama-3.1-8b-instant"}
         ]
     ```
-    Supported providers so far are: `"openai"`, `"google"`, `"groq"`, `"anthropic"`, and `"deepseek"`. Ensure the corresponding `api_key` is available in `api_keys.json`.
+    Supported providers so far are: `"openai"`, `"google"`, `"groq"`, `"anthropic"`, and `"deepseek"`. Ensure the corresponding `api_key` is available in your API key file.
 -   **`default_output`**: The output to use when all the models fail, should match the `required_outputs`.
 -   **`positive_filter`**: A list of `roles` to be included in the context of the agent (all other roles will be ignored if this is defined).
 -   **`negative_filter`**:  A list of `roles` to be excluded from the context.
@@ -794,7 +803,6 @@ To run the chat loop, a valid configuration JSON file is required, such as:
 {
   "general_parameters": {
     "base_directory": "/path/to/your/base_dir",
-    "api_keys_path": "api_keys.json",
     "general_system_description": "This is a description for the overall system.",
     "functions_file": "fns.py",
     "on_complete": "fn:on_complete_function"

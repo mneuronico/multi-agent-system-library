@@ -6,6 +6,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         "python-telegram-bot",
-        "requests"
+        "requests",
+        "python-dotenv"
     ],
 )

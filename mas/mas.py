@@ -12,6 +12,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import re
 import requests
+from dotenv import load_dotenv
 
 class Component:
     def __init__(self, name: str):
@@ -1776,7 +1777,7 @@ class AgentSystemManager:
         config_json: str = None,
         imports: List[str] = None,
         base_directory: str = os.getcwd(),
-        api_keys_path: str = os.getcwd() + "/api_keys.json",
+        api_keys_path: Optional[str] = None,
         general_system_description: str = "This is a multi agent system.",
         functions_file: str = "fns.py",
         default_models: List[Dict[str, str]] = [{"provider": "groq", "model": "llama-3.1-8b-instant"}],
@@ -1808,12 +1809,12 @@ class AgentSystemManager:
                 print(f"System build failed: {e}")
         else:
             self.base_directory = base_directory
-            self.api_keys_path = api_keys_path
             self.general_system_description = general_system_description
             self.functions_file = functions_file
             self.on_update = self._resolve_callable(on_update)
             self.on_complete = self._resolve_callable(on_complete)
-
+            self._resolve_api_keys_path(api_keys_path)
+            
         self.api_keys: Dict[str, str] = {}
         self._load_api_keys()
 
@@ -1823,6 +1824,23 @@ class AgentSystemManager:
 
         self.history_folder = os.path.join(self.base_directory, "history")
         os.makedirs(self.history_folder, exist_ok=True)
+
+    def _resolve_api_keys_path(self, api_keys_path):
+        if api_keys_path is None:
+            env_path = os.path.join(self.base_directory, ".env")
+            json_path = os.path.join(self.base_directory, "api_keys.json")
+            
+            if os.path.exists(env_path):
+                self.api_keys_path = env_path
+            elif os.path.exists(json_path):
+                self.api_keys_path = json_path
+            else:
+                self.api_keys_path = None
+        else:
+            if os.path.isabs(api_keys_path):
+                self.api_keys_path = api_keys_path
+            else:
+                self.api_keys_path = os.path.join(self.base_directory, api_keys_path)
 
     def _process_imports(self):
         for import_str in self.imports:
@@ -1910,8 +1928,22 @@ class AgentSystemManager:
         if not os.path.exists(self.api_keys_path):
             self.api_keys = {}
             return
-        with open(self.api_keys_path, "r", encoding="utf-8") as f:
-            self.api_keys = json.load(f)
+        
+        if self.api_keys_path.endswith('.json'):
+            with open(self.api_keys_path, "r", encoding="utf-8") as f:
+                self.api_keys = json.load(f)
+        elif self.api_keys_path.endswith('.env'):
+            load_dotenv(self.api_keys_path, override=True)
+            
+            self.api_keys = {}
+            for env_var in os.environ:
+                if env_var.endswith('_API_KEY'):
+                    provider = env_var[:-8].lower()  # Remove '_API_KEY' suffix
+                else:
+                    provider = env_var.lower()
+                self.api_keys[provider] = os.environ[env_var]
+        else:
+            raise ValueError(f"Unsupported API keys format: {self.api_keys_path}")
 
     def _get_db_path_for_user(self, user_id: str) -> str:
         return os.path.join(self.history_folder, f"{user_id}.sqlite")
@@ -2543,15 +2575,14 @@ class AgentSystemManager:
 
         general_params = system_definition.get("general_parameters", {})
         self.base_directory = general_params.get("base_directory", os.getcwd())
-        self.api_keys_path = general_params.get("api_keys_path", os.path.join(self.base_directory, "api_keys.json"))
         self.general_system_description = general_params.get("general_system_description", "This is a multi-agent system.")
         self.functions_file = general_params.get("functions_file", "fns.py")
         self.default_models = general_params.get("default_models", self.default_models)
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
-
         self.imports = general_params.get("imports", [])
-
+        
+        self._resolve_api_keys_path(general_params.get("api_keys_path"))
         self._load_api_keys()
 
         components = system_definition.get("components", [])
