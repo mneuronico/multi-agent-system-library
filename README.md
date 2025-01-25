@@ -91,7 +91,7 @@ ANTHROPIC_API_KEY=your_anthropic_key
 DEEPSEEK_API_KEY=your_deepseek_key
 ```
 
-Provider names can be defined as `<PROVIDER>-API-KEY`, or just `PROVIDER` (the names are handled as case-insensitive).
+Provider names can be defined as `<PROVIDER>-API-KEY`, `<PROVIDER>`, `<PROVIDER>-KEY`, `<PROVIDER>_KEY`, and other similar variations (the names are handled as case-insensitive).
 
 To use a `json` file to define API keys, you can do something like:
 
@@ -336,7 +336,7 @@ You can create agents when defining the system from a JSON file by including the
 #### Tools
 
 ```python
-def my_tool_function(query):
+def my_tool_function(query): # it can also be my_tool_function(manager, query) if the manager object is needed inside the function
     # Make a call to an API based on the query
     return {"items": ["item1", "item2"]}
 
@@ -353,7 +353,7 @@ tool_name = manager.create_tool(
 -   **`name`**:  The name of the tool.
 -   **`inputs`**:  A dictionary describing the input parameters for the `function` using descriptions and names.
 -   **`outputs`**:  A dictionary describing the output parameters of the `function` using descriptions and names.
--   **`function`**: A callable (function) that performs the task of the tool. This function receives as many arguments as needed, which must be defined in the same order as the dictionary that will be used as input for this tool (the dictionary from the latest message is used by default, but more complex inputs can be defined as explained below).
+-   **`function`**: A callable (function) that performs the task of the tool. This function receives as many arguments as needed, which must be defined in the same order as the dictionary that will be used as input for this tool (the dictionary from the latest message is used by default, but more complex inputs can be defined as explained below). This function can also optionally receive the `manager` as its first argument, in which case `"manager"` should be the first parameter in the function definition, followed by all parameters in the input dictionary.
 -  **`default_output`**: Output to use if there's an error during the function call, or an exception has been raised by the function.
 
 Tools can be included in the component list of the config JSON file just like agents:
@@ -384,7 +384,7 @@ Tools can be included in the component list of the config JSON file just like ag
 #### Processes
 
 ```python
-def my_process_function(message_list):
+def my_process_function(manager, messages): # in this case, both manager and messages are optional
     # do anything and return any values that need saving in a dict
     return {"content": "some content from local file"}
 
@@ -395,7 +395,7 @@ process_name = manager.create_process(
 ```
 
 -   **`name`**: The name of the process.
--   **`function`**: A callable (function) that performs data transformations, data loading, etc. This function receives as argument a list of messages, each of which is a dictionary with two fields ("source", with the source role, and "message" with the actual content) and it should return a dictionary.
+-   **`function`**: A callable (function) that performs data transformations, data loading, etc. This function can receive as argument the `manager` object itself (the parameter must be called `"manager"`) and/or a list of messages (must be named `"messages"`). Each message is a dictionary with two fields ("source", with the source role, and "message" with the actual content). The function must return a dictionary, which will be saved in the message history. Both input parameters are optional: you can define process functions which only receive either the `manager` object, or only the `messages` list, or neither. The function call is invariant to the order of the parameters.
 
 You can also define processes in the config JSON file:
 
@@ -751,6 +751,14 @@ If you need to clear the message history for a user, the `manager` offers a simp
 manager.clear_message_history(user_id) # if not provided, it will use the current user_id
 ```
 
+### Retrieving API keys with `get_keys`
+
+By default, the API keys file is used to store LLM provider keys, as well as the Bot Token for Telegram integration. However, you can also add any other key or sensitive string that you want to that file, and the manager will save it internally under the name you provide for it. Then, if you need to access it (for example, inside a `Tool` or `Process` function, to access an external API, database or anything else), you can use:
+
+```python
+manager.get_keys("<your-key-name>")
+```
+
 ### Clearing Cache
 
 The `mas` library detects when a tool or a process returns a dictionary with values that are not compatible with JSON serializing. In those cases, those values are saved as pickle objects and then loaded when needed for tools or processes (not for agents, as they can only process text input). Files stay loaded in memory for faster retrieval unless explicitely cleared:
@@ -846,7 +854,7 @@ In this function, you could possibly send this message to your own database, to 
 The `mas` library allows the developer to integrate any system with Telegram seamlessly to allow users to interact with the system through the messaging app without requiring the developer to define custom async logic and event loops. This is possible through the `start_telegram_bot` method:
 
 ```python
-manager.start_telegram_bot(telegram_token, # token must be provided
+manager.start_telegram_bot(telegram_token = None, # if not provided, the manager looks for it in its API keys
 component_name = "my_automation", # optional, defaults to default or latest automation
 verbose = False, # defaults to False
 on_complete = None, # defaults to sending latest message to user
@@ -856,7 +864,7 @@ on_clear_msg = "Message history deleted." # defaults to this message
 )
 ```
 
--   **`telegram_token`**: The token given by Telegram's `BotFather` after successful bot creation through the Telegram platform. This lets the library connect with a specific bot to send and receive messages.
+-   **`telegram_token`**: The token given by Telegram's `BotFather` after successful bot creation through the Telegram platform. This lets the library connect with a specific bot to send and receive messages. If this is not provided in the function call, the manager will look for `telegram_token` in its API keys. If it's not there, it will throw an error.
 -   **`component_name`**: Optional string defining which component should be executed when receiving a user message. If not set, this defaults to the latest or default automation defined, just like `manager.run()`.
 -   **`verbose`**: Optional boolean, defines whether the system will run in verbose mode or not (defaults to False).
 -   **`on_complete`**: Optional callable, function that will be called when completing execution after a specific user message.

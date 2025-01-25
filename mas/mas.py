@@ -41,7 +41,6 @@ class Agent(Component):
         default_output: Optional[Dict[str, Any]] = None,
         positive_filter: Optional[List[str]] = None,
         negative_filter: Optional[List[str]] = None,
-        api_keys: Optional[Dict[str, str]] = None,
         general_system_description: str = "",
         model_params: Optional[Dict[str, Any]] = None
     ):
@@ -57,7 +56,6 @@ class Agent(Component):
         self.default_output = default_output or {"response": "No valid response."}
         self.positive_filter = positive_filter
         self.negative_filter = negative_filter
-        self.api_keys = api_keys or {}
         self.general_system_description = general_system_description
         self.model_params = model_params or {}
 
@@ -113,7 +111,7 @@ class Agent(Component):
         for model_info in self.models:
             provider = model_info["provider"].lower()
             model_name = model_info["model"]
-            api_key = self.api_keys.get(provider)
+            api_key = self.manager.get_key(provider)
 
             if not api_key:
                 if verbose:
@@ -1052,16 +1050,21 @@ class Process(Component):
         sig = inspect.signature(function)
         params = list(sig.parameters.values())
         
-        # Look for "manager" parameter in first position
-        self.expects_manager = False
-        if len(params) > 0:
-            self.expects_manager = params[0].name == "manager"
+        # Track expected parameters
+        self.expected_params = []
+        valid_params = {"manager", "messages"}
+        
+        for param in params:
+            if param.name not in valid_params:
+                raise ValueError(
+                    f"Process '{name}' has invalid parameter '{param.name}' - "
+                    f"only {valid_params} are allowed"
+                )
+            self.expected_params.append(param.name)
 
-        # Validate parameter count (1 or 2 parameters)
-        if len(params) not in (1, 2) or (len(params) == 2 and params[0].name != "manager"):
+        if len(params) > 2:
             raise ValueError(
-                f"Process '{name}' function must have parameters: "
-                f"(manager?, input_data) but has {[p.name for p in params]}"
+                f"Process '{name}' can have maximum 2 parameters, got {len(params)}"
             )
 
     def to_string(self) -> str:
@@ -1108,10 +1111,14 @@ class Process(Component):
 
         # 5) Call the function
         try:
-            if self.expects_manager:
-                output = self.function(self.manager, final_input)
-            else:
-                output = self.function(final_input)
+            args = []
+            for param_name in self.expected_params:
+                if param_name == "manager":
+                    args.append(self.manager)
+                elif param_name == "messages":
+                    args.append(final_input)
+
+            output = self.function(*args)
                 
             if not isinstance(output, dict):
                 raise ValueError("[Process] function must return a dict.")
@@ -1978,11 +1985,7 @@ class AgentSystemManager:
             
             self.api_keys = {}
             for env_var in os.environ:
-                if env_var.endswith('_API_KEY'):
-                    provider = env_var[:-8].lower()  # Remove '_API_KEY' suffix
-                else:
-                    provider = env_var.lower()
-                self.api_keys[provider] = os.environ[env_var]
+                self.api_keys[env_var] = os.environ[env_var]
         else:
             raise ValueError(f"Unsupported API keys format: {self.api_keys_path}")
 
@@ -2310,7 +2313,6 @@ class AgentSystemManager:
             default_output=default_output or {"response": "No valid response."},
             positive_filter=positive_filter,
             negative_filter=negative_filter,
-            api_keys=self.api_keys,
             general_system_description=self.general_system_description,
             model_params=model_params
         )
@@ -2850,10 +2852,24 @@ class AgentSystemManager:
         return re.sub(pattern, r'\\\1', text)
     
     def get_key(self, name: str) -> Optional[str]:
-        lower_name = name.lower()
-        for key, value in self.api_keys.items():
-            if key.lower() == lower_name:
-                return value
+        name = name.lower()
+
+        variations = [
+            name,  # Try exact match first
+            f"{name}_api_key",
+            f"{name}-api-key",
+            f"{name}_key",
+            f"{name}-key",
+            f"{name}key",
+        ]
+        
+        # Check each variation case-insensitively
+        for var in variations:
+            var_lower = var.lower()
+            for key in self.api_keys:
+                if key.lower() == var_lower:
+                    return self.api_keys[key]
+        
         return None
     
     def start_telegram_bot(self, telegram_token=None, component_name = None, verbose = False,
