@@ -13,6 +13,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import re
 import requests
 from dotenv import load_dotenv
+import inspect
 
 class Component:
     def __init__(self, name: str):
@@ -709,11 +710,29 @@ class Tool(Component):
         function: Callable,
         default_output: Optional[Dict[str, Any]] = None
     ):
+
         super().__init__(name)
         self.inputs = inputs
         self.outputs = outputs
         self.function = function
         self.default_output = default_output or {}
+
+        # Check if function expects manager
+        sig = inspect.signature(function)
+        params = list(sig.parameters.values())
+        
+        # Look for "manager" parameter in first position
+        self.expects_manager = False
+        if len(params) > 0:
+            self.expects_manager = params[0].name == "manager"
+
+        # Validate parameter count (either inputs or inputs+1 if has manager)
+        expected_params = len(inputs) + (1 if self.expects_manager else 0)
+        if len(params) != expected_params:
+            raise ValueError(
+                f"Tool '{name}' function requires {expected_params} parameters "
+                f"(manager? + inputs), but has {len(params)}"
+            )
 
     def to_string(self) -> str:
         return (
@@ -754,8 +773,10 @@ class Tool(Component):
             else:
                 input_dict = self._resolve_tool_or_process_input(db_conn, target_input, target_index, target_fields, target_custom, verbose)
 
-        # Now validate that input_dict has the keys for self.inputs
         func_args = []
+        if self.expects_manager:
+            func_args.append(self.manager)
+            
         for arg_name in self.inputs:
             if arg_name not in input_dict:
                 raise ValueError(f"[Tool:{self.name}] Missing required input: {arg_name}")
@@ -1027,6 +1048,22 @@ class Process(Component):
         super().__init__(name)
         self.function = function
 
+        # Check if function expects manager
+        sig = inspect.signature(function)
+        params = list(sig.parameters.values())
+        
+        # Look for "manager" parameter in first position
+        self.expects_manager = False
+        if len(params) > 0:
+            self.expects_manager = params[0].name == "manager"
+
+        # Validate parameter count (1 or 2 parameters)
+        if len(params) not in (1, 2) or (len(params) == 2 and params[0].name != "manager"):
+            raise ValueError(
+                f"Process '{name}' function must have parameters: "
+                f"(manager?, input_data) but has {[p.name for p in params]}"
+            )
+
     def to_string(self) -> str:
         return f"Name: {self.name}"
 
@@ -1071,7 +1108,11 @@ class Process(Component):
 
         # 5) Call the function
         try:
-            output = self.function(final_input)
+            if self.expects_manager:
+                output = self.function(self.manager, final_input)
+            else:
+                output = self.function(final_input)
+                
             if not isinstance(output, dict):
                 raise ValueError("[Process] function must return a dict.")
             if verbose:
@@ -2808,10 +2849,24 @@ class AgentSystemManager:
         pattern = r'([_*\[\]\(\)~`>#\+\-=|{}\.!\\])'
         return re.sub(pattern, r'\\\1', text)
     
-    def start_telegram_bot(self, telegram_token, component_name = None, verbose = False,
+    def get_key(self, name: str) -> Optional[str]:
+        lower_name = name.lower()
+        for key, value in self.api_keys.items():
+            if key.lower() == lower_name:
+                return value
+        return None
+    
+    def start_telegram_bot(self, telegram_token=None, component_name = None, verbose = False,
               on_complete = None, on_update = None,
               on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.",
               on_clear_msg = "Message history deleted."):
+
+        # Get Telegram token from API keys if not provided
+        if telegram_token is None:
+            telegram_token = self.get_key("telegram_token")
+        
+        if not telegram_token:
+            raise ValueError("Telegram token required. Provide as argument or in API keys as 'TELEGRAM_TOKEN'")
 
         on_update = on_update or self.on_update
         on_complete = on_complete or self.on_complete
