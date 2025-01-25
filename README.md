@@ -1,3 +1,5 @@
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 # The Multi-Agent System (MAS) Library
 
 The `mas` library is a powerful and flexible framework designed for creating and managing multi-agent systems. Whether you need a simple chatbot, a sophisticated automation workflow, or a fully integrated AI-driven ecosystem, the `mas` library provides the tools you need to build, scale, and maintain your system with ease.
@@ -23,6 +25,10 @@ The `mas` library is a powerful and flexible framework designed for creating and
 - **Focus on Logic**: Offload low-level details of message management, task sequencing, and system orchestration to the library so you can concentrate on your application's goals.
 
 The `mas` library empowers developers to create robust, flexible, and intelligent systems while minimizing the complexity of setup and orchestration. Whether you are a beginner experimenting with multi-agent architectures or an expert building large-scale AI-driven workflows, the `mas` library adapts to your needs.
+
+### License
+
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for full details.
 
 ### Currently in alpha
 This library has not yet been extensively tested and is currently under development. Please **do not use it in production yet**, but feel free to test it and post your issues here, or email me at mneuronico@gmail.com to collaborate or know more about this project.
