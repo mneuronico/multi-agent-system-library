@@ -1144,7 +1144,7 @@ Sometimes, you want a single decision-making agent to determine one of several a
     }
   ]
 }
-```json
+```
 
 #### Loops and Verifiers
 
