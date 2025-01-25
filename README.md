@@ -169,9 +169,7 @@ Each `user_id` has its own isolated message history.
 
 ### Roles
 
-Each component is assigned a unique `role` when its output is stored in the database. Roles can simply be the name of the component, but there are some special terms:
--   `user`: Messages directly from a user (when calling `run` with `input` string).
--   `internal`: Messages not readable by agents but still present in the database (commonly when calling `run` with an `input` dict).
+Each component is assigned a unique `role` when its output is stored in the database. Roles can simply be the name of the component, or they can also be `user` (messages directly from a user, when calling `run` with `input` string), `internal` (messages added by the developer, when calling `run` with `input` dict) or any other custom role defined by the developer when calling `manager.run()`.
 
 
 ## The Agent System Manager
