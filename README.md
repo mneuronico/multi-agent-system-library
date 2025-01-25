@@ -231,7 +231,7 @@ You can accomplish the same thing when defining the system from a JSON file:
     "on_update": "fn:on_update_function", 
     "on_complete": "fn:on_complete_function"
   },
-  "components": [...]
+  "components": []
 }
 ```
 
@@ -302,9 +302,6 @@ You can create agents when defining the system from a JSON file by including the
 
 ```json
 {
-  "general_parameters": {
-    // ...
-  },
   "components": [
     {
       "type": "agent",
@@ -590,7 +587,8 @@ The simplest way to link an agent and a tool via JSON is to use the "links" sect
     }
   ],
   "links": {
-    "myagent": "mytool" // or you could do "mytool: myagent" to link the tool as input to the agent
+    "my_tool_using_agent": "my_tool",
+    "my_tool_input_for_agent": "my_agent"
   }
 }
 ```
@@ -822,7 +820,7 @@ To run the chat loop, a valid configuration JSON file is required, such as:
         "response": "Text to send to the user."
       },
       "models": [
-        {"provider": "openai", "model": "gpt-4-turbo"}
+        {"provider": "openai", "model": "gpt-4o"}
       ]
     }
   ]
@@ -1054,10 +1052,214 @@ Conditionals can also be defined as dictionaries with `"input"` and `"value"` ke
 
 The input syntax allows the developer to have a remarkable amount of control and flexibility over what is received as input by each component or conditional inside an automation, while keeping the JSON notation concise when working with simple workflows that can rely on reasonable default behaviors.
 
-
 ## Error Handling
 
 The library is designed for robust operation, handling various errors gracefully. If an agent fails to produce a response, it will return a `default_output`. If the tool or process fails, the system will return the `default_output`, or an empty dict if no `default_output` was specified. Errors in configuration files or function references are logged for debugging.
+
+## Design Patterns and Recommendations
+
+The `mas` library is designed to be flexible and versatile, and you can use it to fit your own specific needs and requirements. However, certain patterns are commonly repeated and are worth mentioning here for beginners who are learning to build multi agent systems effectively.
+
+### Model Recommendations
+
+-  **`groq: llama-3.1-8b-instant`**: Free to use and extremely fast when ran in groq's hardware. It works relatively well for very simple tasks, usually good for testing during development. Not good for production as it makes too many mistakes and rate limits are not permissive enough.
+-  **`groq: llama-3.3-70b-versatile`**: Free to use and quite fast, as well as intelligent enough for relatively complex tasks. Good for testing complex workflows during development. Not good for production as rate limits are too low.
+-  **`deepseek: deepseek-chat`**: Very cheap, fast and intelligent enough for most tasks. Good for production, especially for agents that don't require complex reasoning.
+-  **`deepseek: deepseek-reasoner`**: State-of-the-art reasoning, cheaper than commonly used models, such as gpt-4o. Thinking time can take seconds or even minutes, but results are usually robust for high-complexity tasks.
+-  **`google: gemini-2.0-flash-exp`**: Free to use as of January 2025, good for its 1M token context window and its speed, quite good at reasoning as well.
+-  **`openai: gpt-4o`**: Usually taken as the default model for its reasonably good speed, intelligence and robustness. However, it's quite expensive compared to models such as deepseek's `deepseek-chat` or `deepseek-reasoner`.
+-  **`openai: o1`**: State-of-the-art reasoning, but the most expensive model by far in this list, and not necessarily better than `deepseek-reasoner` in most cases.
+
+### Design Patterns
+
+Multi-agent systems can usually be thought of as workflows where you can combine decision-making nodes which allow for branching and looping, tool-use nodes which allow for interaction with internal or external information, data-processing nodes which load, transform or export information to usable formats, and user-interaction nodes which allow the system to send outputs to the user.
+
+#### Decision-making Agents
+
+Very commonly, you'll want to decide whether to follow different workflows depending on what the user is asking for. Decision-making agents are perfect for this use case.
+
+```json
+{
+  "components": [
+    {
+      "type": "agent",
+      "name": "decider",
+      "system": "Determine if user request requires an API call or not.",
+      "required_outputs": {
+        "is_api_needed": "Boolean, determines whether an API call is needed or not."
+      },
+      "default_output": {
+        "is_api_needed": false
+      }
+    },
+    {
+      "type": "automation",
+      "sequence": [
+        "decider",
+        {
+          "control_flow_type": "branch",
+          "condition": "is_api_needed",
+          "if_true": ["api_using_agent", "api_tool"],
+          "if_false": []
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### Action Switching
+
+Sometimes, you want a single decision-making agent to determine one of several actions to take later. Here's where switching on an action can be useful.
+
+```json
+{
+  "components": [
+    {
+      "type": "agent",
+      "name": "selector",
+      "system": "Determine if the user is asking for weather information, for news information, or just making conversation.",
+      "required_outputs": {
+        "action": "Action to take given user message. Either 'weather', 'news', or 'other'."
+        },
+      "default_output": {
+        "action": "other"
+      }
+    },
+    {
+      "type": "automation",
+      "sequence": [
+        "selector",
+        {
+          "control_flow_type": "switch",
+          "value": "action",
+          "cases": [
+            {"case": "weather", "body": ["tool_using_agent", "weather_tool"]},
+            {"case": "news", "body": ["other_tool_using_agent", "news_tool"]},
+            {"case": "other", "body": []}
+          ]
+        },
+        "conversation_agent"
+      ]
+    }
+  ]
+}
+```json
+
+#### Loops and Verifiers
+
+When you're implementing a complex workflow, it's usually good practice to check whether the result accomplishes the task, or if more work is required. This can sometimes be done programmatically by using processes (e.g. did the API call work or did it return an error?) but other times an intelligent node is needed to analyze the result and decide whether the workflow can end or if we need to try again. This can be done by combining a loop and a verifier agent.
+
+```json
+{
+  "components": [
+    {
+      "type": "agent",
+      "name": "verifier",
+      "system": "Determine if the result from the system is sufficient to fulfill the user's request. If you decide it is not, more work will be done.",
+      "required_outputs": {
+        "is_result_sufficient": "Boolean, system responds to user if true, system keeps working if false."
+        },
+      "default_output": {
+        "is_result_sufficient": true
+      }
+    },
+    {
+      "type": "automation",
+      "sequence": [
+        {
+          "control_flow_type": "while",
+          "end_condition": ":verifier?-1?[is_result_sufficient]",
+          "body": [
+            "some_workflow_steps",
+            "verifier"
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### First Responders and Final Responders
+
+Long workflows can take time, especially when they involve calls to reasoning agents or interactions with external APIs. In these cases, it's good practice to inform the user a process will be taking place by using a first responder agent. Even when this is not the case, almost all chat-based workflows will include a final responder, or conversation agent, which will talk to the user based on available information. Both of these responder-type agents can be handled in the `on_update` function.
+
+```json
+{
+  "components": [
+    {
+      "type": "agent",
+      "name": "first_responder",
+      "system": "Inform the user you will do a search for information and will have results shortly.",
+    },
+    {
+      "type": "agent",
+      "name": "final_responder",
+      "system": "Respond to the user message given available information.",
+    },
+    {
+      "type": "automation",
+      "sequence": [
+        "first_responder",
+        "some_process_steps",
+        "final_responder"
+      ]
+    }
+  ]
+}
+```
+
+```python
+  def on_update_function(messages, manager):
+      last_message = messages[-1]
+      if last_message["source"] == "first_responder" or last_message["source"] == "final_responder":
+          response = last_message["message"]["response"]
+
+          # do something with the response, or return it if you're working with telegram integration
+          # for this example, we'll assume we're running a terminal-based chat app and print it
+
+          print(response)
+```
+
+#### Message History Filtering
+
+Agents get the full conversation history by default. This is usually unnecessary, especially when using nodes such as decision-making agents or verifiers, which produce outputs that are required for the workflow but often don't need to be seen by other agents. It's important to manage input filtering carefully to save on input token usage when calling LLM providers. This has a profound impact on the multi-agent system cost, as well as its overall effectiveness.
+
+```json
+{
+  "components": [
+    {
+      "type": "automation",
+      "sequence": [
+        "decider:user?-1",
+        "some_steps_in_between",
+        "final_responder:(user, final_responder)"
+      ]
+    }
+  ]
+}
+```
+
+Notice how the decider agent may only need, in this example, the last user message, while the final responder may only need user and responder messages, and can ignore decider and intermediate steps. This will usually be more complex and will depend on your specific use case.
+
+Similarly, it's usually good practice to add range filtering to take only the last n messages from the conversation history. This is crucial when building chat-based systems where users can interact with them indefinitely, increasing input token usage without limit if not handled carefully by the developer.
+
+```json
+{
+  "components": [
+    {
+      "type": "automation",
+      "sequence": [
+        "some_steps",
+      ]
+        "final_responder:(user?-20~, final_responder?-20~)"
+    }
+  ]
+}
+```
+
+In this case, the final responder is looking at the last 20 messages from the user and from itself, thereby restricting maximum conversation length. More complex workflows would involve a memory bot which is triggered when the conversation exceeds a certain length, summarizes part of it or all of it, and allows for the `final_responder` agent to always know what happened previously even if it does not have direct access to all messsages.
 
 
 ## Currently Under Development
