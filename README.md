@@ -803,7 +803,7 @@ manager = AgentSystemManager(config_json="<config_file_name>.json").run("Hey, ho
 This builds the system from a JSON configuration file specified using the `config_json` parameter, creates all components if the configuration is valid and runs an automation (either a specified one or a default linear automation) with the provided user input (or starting with no input if none is provided).
 
 ### Defining Functions
-Functions for `Tool` and `Process` components must be defined in the Python file specified using the `functions_file` option (or the default `fns.py`). All tools and processes must have their custom function defined in this file. Conditional functions, on_update and on_complete must be defined in this file as well. When using the library only programatically and not using function syntax (i.e. `"fn:"`) it is possible to define functions elsewhere and use them as callables directly, but it is better practice to still define them in the `functions_file`, import it and use it.
+Functions for `Tool` and `Process` components must be defined in any of the Python files included in the `functions` parameter (or the default `fns.py`). They can also be referenced directly from any other `.py` file as explained earlier. When using the library only programatically and not using function syntax (i.e. `"fn:"`) it is possible to define functions elsewhere and use them as callables directly.
 
 ### Running a Chat Loop
 
@@ -832,7 +832,7 @@ To run the chat loop, a valid configuration JSON file is required, such as:
   "general_parameters": {
     "base_directory": "/path/to/your/base_dir",
     "general_system_description": "This is a description for the overall system.",
-    "functions_file": "fns.py",
+    "functions": "fns.py",
     "on_complete": "fn:on_complete_function"
   },
   "components": [
@@ -888,7 +888,7 @@ on_clear_msg = "Message history deleted." # defaults to this message
 -   **`on_start_msg`**: Optional string defining what the bot will send to the user when receiving '/start' commnad.
 -   **`on_clear_msg`**: Optional string defining what the bot will send to the user when receiving '/clear' command.
 
-After defining the system through JSON and writing the necessary functions in the `functions_file`, it's possible to run a full Telegram bot with this minimal code example:
+After defining the system through JSON and writing the necessary functions, it's possible to run a full Telegram bot with this minimal code example:
 
 ```python
 manager = AgentSystemManager(config_json="config.json") 
