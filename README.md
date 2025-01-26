@@ -164,6 +164,7 @@ All interactions between components are recorded in a database, providing contex
 -   The `model` that was called, if `type` is 'agent' (in the format 'provider:model_alias').
 -   A `role` that indicates the component that produced the message.
 -   The `content` of the message, which is typically a dictionary as given by the corresponding component.
+-   The `timestamp` indicating when the message was added to the conversation history, in the specified timezone (defaults to `UTC`).
 
 Each `user_id` has its own isolated message history.
 
@@ -190,7 +191,9 @@ manager = AgentSystemManager(
         "external_agents.json->research_agent+analysis_tool"  # Import specific components
     ],
     on_update=on_update, # Default: none
-    on_complete=on_complete # Default: none
+    on_complete=on_complete, # Default: none
+    include_timestamp=False, # Default is False
+    timezone="UTC" # Default is UTC
 )
 ```
 
@@ -204,6 +207,8 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 -   **`imports`**: List of component import specifications. Each entry can be either `"<your_json>.json"` to import all components from that file, or `"<your_json>.json"->component1+component2` to import specific components from that file.
 -   **`on_update`**: Function to be executed each time an individual component is finished running. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like updating an independent database or sending messages to user during an automation.
 -   **`on_complete`**: Function to be executed when `manager.run`() reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both will be executed), but it's different for automations, since it will only be ran at the end of the automation. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like sending the last message to the user after a complex automation workflow.
+-   **`include_timestamp`**: Whether the agents receive the `timestamp` for each message in the conversation history. False by default. This is overriden by the `include_timestamp` parameter associated with each agent, if specified. 
+-   **`timezone`**: String defining what timezone should the `timestamp` information be saved in. Defaults to `UTC`.
 
 `on_update` and `on_complete` can be defined as callables directly, or they can be strings referring to the name of the function to used, located in the `functions_file`. To accomplish this, _function syntax_ must be used, by starting the string with _fn:_, for example:
 
@@ -227,7 +232,9 @@ You can accomplish the same thing when defining the system from a JSON file:
         "external_agents.json->research_agent+analysis_tool"
     ],
     "on_update": "fn:on_update_function", 
-    "on_complete": "fn:on_complete_function"
+    "on_complete": "fn:on_complete_function",
+    "include_timestamp": true,
+    "timezone": "America/Argentina/Buenos_Aires"
   },
   "components": []
 }
@@ -262,6 +269,7 @@ agent_name = manager.create_agent(
     default_output={"query": "default query", "items": "default items."}, # Default: {"response": "No valid response."}
     positive_filter=["user", "tool-mytool"], # Default: None
     negative_filter=["bot-otheragent"],  # Default: None
+    include_timestamp=False # Default: False
     model_params={"temperature": 1.0, "max_tokens": 4096}
 )
 ```
@@ -293,6 +301,7 @@ agent_name = manager.create_agent(
     -   `tool`: selects messages from all roles from the tool type.
     -   `process`: selects messages from all roles from the process type.
     -   Exact role names (e.g., `myagent`)
+-   **`include_timestamp`**:  Whether this agent should receive `timestamp` information for each message. Defaults to whatever was defined for the manager if not specified, which itself defaults to False.
 -   **`model_params`**: Dictionary including params for advanced LLM configuration. Supported params right now are `temperature`, `max_tokens` and `top_p`. Not defining these will use default configuration for each provider.
 
 
@@ -322,6 +331,7 @@ You can create agents when defining the system from a JSON file by including the
       },
       "positive_filter": ["user", "mytool"],
       "negative_filter": ["otheragent"],
+      "include_timestamp": true,
       "model_params": {
         "temperature": 1.0,
         "max_tokens": 4096
@@ -393,7 +403,7 @@ process_name = manager.create_process(
 ```
 
 -   **`name`**: The name of the process.
--   **`function`**: A callable (function) that performs data transformations, data loading, etc. This function can receive as argument the `manager` object itself (the parameter must be called `"manager"`) and/or a list of messages (must be named `"messages"`). Each message is a dictionary with two fields ("source", with the source role, and "message" with the actual content). The function must return a dictionary, which will be saved in the message history. Both input parameters are optional: you can define process functions which only receive either the `manager` object, or only the `messages` list, or neither. The function call is invariant to the order of the parameters.
+-   **`function`**: A callable (function) that performs data transformations, data loading, etc. This function can receive as argument the `manager` object itself (the parameter must be called `"manager"`) and/or a list of messages (must be named `"messages"`). Each message is a dictionary with two fields ("source", with the source role, and "message" with the actual content, which itself contains `"source"`, `"message"`, `"msg_number"`, `"type"` and `"timestamp"`). The function must return a dictionary, which will be saved in the message history. Both input parameters are optional: you can define process functions which only receive either the `manager` object, or only the `messages` list, or neither. The function call is invariant to the order of the parameters.
 
 You can also define processes in the config JSON file:
 
@@ -740,6 +750,7 @@ A **list** of dictionaries, each representing a message with the following keys:
 - **`msg_number`**: Sequential message number in the conversation.
 - **`type`**: Component type (`"agent"`, `"tool"`, `"process"`, `"user"`, etc.).
 - **`model`**: Model used, in the format `"<provider>:<model-name>"`.
+- **`timestamp`**: Timestamp indicating when the message was saved to history, in the specified timezone.
 
 ### Deleting User History `clear_message_history`
 

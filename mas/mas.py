@@ -14,6 +14,8 @@ import re
 import requests
 from dotenv import load_dotenv
 import inspect
+import datetime
+from zoneinfo import ZoneInfo
 
 class Component:
     def __init__(self, name: str):
@@ -42,7 +44,8 @@ class Agent(Component):
         positive_filter: Optional[List[str]] = None,
         negative_filter: Optional[List[str]] = None,
         general_system_description: str = "",
-        model_params: Optional[Dict[str, Any]] = None
+        model_params: Optional[Dict[str, Any]] = None,
+        include_timestamp: bool = False
     ):
         super().__init__(name)
         self.system_prompt = system_prompt
@@ -58,6 +61,7 @@ class Agent(Component):
         self.negative_filter = negative_filter
         self.general_system_description = general_system_description
         self.model_params = model_params or {}
+        self.include_timestamp = include_timestamp
 
     def to_string(self) -> str:
         return (
@@ -183,8 +187,8 @@ class Agent(Component):
             if parsed["component_or_param"]:
                 comp_name = parsed["component_or_param"]
                 chosen = [
-                    (r, c, n, t) 
-                    for (r, c, n, t) in filtered_msgs 
+                    (r, c, n, t, ts) 
+                    for (r, c, n, t, ts) in filtered_msgs 
                     if r == comp_name
                 ]
                 conversation = self._transform_to_conversation(chosen)
@@ -208,17 +212,14 @@ class Agent(Component):
 
 
     def _collect_msg_snippets_for_agent(self, source_item: dict, filtered_msgs: List[tuple]) -> List[tuple]:
-        """
-        Return a list of (role, content, msg_number, msg_type) from the relevant subset, honoring index if specified.
-        """
         comp_name = source_item["component"]
         index = source_item["index"]
 
         if comp_name:
 
             subset = [
-                (r, c, n, t) 
-                for (r, c, n, t) in filtered_msgs 
+                (r, c, n, t, ts) 
+                for (r, c, n, t, ts) in filtered_msgs 
                 if r == comp_name
             ]
         else:
@@ -261,12 +262,8 @@ class Agent(Component):
 
 
     def _transform_to_conversation(self, msg_tuples: List[tuple], fields: Optional[list] = None, include_message_number: Optional[bool] = False) -> List[Dict[str, str]]:
-        """
-        Convert a list of (role, content, msg_number, msg_type) into conversation format.
-        Wrap messages from other roles with {"source": <role>, "message": <content>} except for the agent's own messages.
-        """
         conversation = []
-        for (role, content, msg_number, msg_type) in msg_tuples:
+        for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
             try:
                 data = json.loads(content)
             except:
@@ -279,17 +276,37 @@ class Agent(Component):
                 data_str = json.dumps(data, indent=2)
             else:
                 data_str = str(data)
-            
-            if role == self.name:
-                conversation.append({"role": "assistant", "content": data_str, "msg_number": msg_number})
-            else:
-                conversation.append({"role": "user", "content": f'{{"source": "{msg_type}: {role}", "message": "{data_str}"}}', "msg_number": msg_number})
+
+            compound_str = f'{{"source": "{msg_type}: {role}", "message": "{data_str}"}}'
+
+            if self.include_timestamp:
+                try:
+                    dt = datetime.fromisoformat(timestamp)
+                    formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    formatted_ts = timestamp
+
+                compound_str = compound_str + f', timestamp: {formatted_ts}'
+
+            message = {
+                "role": "assistant" if role == self.name else "user",
+                "content": data_str if role == self.name else compound_str,
+                "msg_number": msg_number
+            }
+                
+            conversation.append(message)
 
         # Sort by msg_number to preserve chronological order
         conversation.sort(key=lambda e: e["msg_number"])
 
+        print(conversation)
+
         if not include_message_number:
-            conversation = [{"role": e["role"], "content": e["content"]} for e in conversation]
+            conversation = [{
+                "role": e["role"],
+                "content": e["content"]
+            } for e in conversation]
+        
         return conversation
 
 
@@ -309,8 +326,8 @@ class Agent(Component):
 
                 # Filter by component
                 subset = [
-                    (r, c, n, t) 
-                    for (r, c, n, t) in filtered_msgs 
+                    (r, c, n, t, ts) 
+                    for (r, c, n, t, ts) in filtered_msgs 
                     if r == comp_name
                 ]
 
@@ -332,7 +349,7 @@ class Agent(Component):
     def _handle_fields(self, msg_tuples, fields):
         conversation = []
 
-        for (role, content, msg_number, msg_type) in msg_tuples:
+        for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
             try:
                 data = json.loads(content)
             except:
@@ -341,7 +358,7 @@ class Agent(Component):
             if isinstance(data, dict) and fields:
                 data = self._extract_fields_from_data(data, fields)
 
-            conversation.append((role, data, msg_number, msg_type))
+            conversation.append((role, data, msg_number, msg_type, timestamp))
 
         return conversation
 
@@ -361,8 +378,8 @@ class Agent(Component):
         subset = []
         if target_input:
             subset = [
-                (r, c, n, t) 
-                for (r, c, n, t) in filtered_msgs 
+                (r, c, n, t, ts) 
+                for (r, c, n, t, ts) in filtered_msgs 
                 if r == target_input
             ]
         else:
@@ -417,14 +434,14 @@ class Agent(Component):
             return (r == fltr)
 
         filtered = []
-        for (role, content, msg_number, msg_type) in messages:
+        for (role, content, msg_number, msg_type, timestamp) in messages:
             if self.positive_filter:
                 if not any(matches_filter(role, pf, msg_type) for pf in self.positive_filter):
                     continue
             if self.negative_filter:
                 if any(matches_filter(role, nf, msg_type) for nf in self.negative_filter):
                     continue
-            filtered.append((role, content, msg_number, msg_type))
+            filtered.append((role, content, msg_number, msg_type, timestamp))
 
         return filtered
 
@@ -832,8 +849,8 @@ class Tool(Component):
             subset = all_messages[:]
         else:
             subset = [
-                (r, c, n, t) 
-                for (r, c, n, t) in all_messages 
+                (r, c, n, t, ts) 
+                for (r, c, n, t, ts) in all_messages 
                 if r == target_input
             ]
 
@@ -844,11 +861,11 @@ class Tool(Component):
 
         if target_index is None:
             # default to latest for tools
-            role, content, msg_number, msg_type = subset[-1]
+            role, content, msg_number, msg_type, timestamp = subset[-1]
         else:
             if len(subset) < abs(target_index):
                 raise IndexError(f"Requested index={target_index} but only {len(subset)} messages found.")
-            role, content, msg_number, msg_type = subset[target_index]
+            role, content, msg_number, msg_type, timestamp = subset[target_index]
 
         try:
             data = json.loads(content)
@@ -885,14 +902,14 @@ class Tool(Component):
                     
                     messages = self.manager._get_all_messages(db_conn)
                     subset = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in messages 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in messages 
                         if r == parsed['component_or_param']
                     ]
 
 
                     if subset:
-                        role, content, msg_number, msg_type = subset[-1]
+                        role, content, msg_number, msg_type, timestamp = subset[-1]
                         try:
                             data = json.loads(content)
                             data = self.manager._load_files_in_dict(data)
@@ -933,8 +950,8 @@ class Tool(Component):
         if comp_name:
 
             subset = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in all_messages 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in all_messages 
                         if r == comp_name
                     ]
 
@@ -951,7 +968,7 @@ class Tool(Component):
         if len(subset) < abs(index):
             return {}
 
-        role, content, msg_number, msg_type = subset[index]
+        role, content, msg_number, msg_type, timestamp = subset[index]
         try:
             data = json.loads(content)
             data = self.manager._load_files_in_dict(data)
@@ -996,8 +1013,8 @@ class Tool(Component):
             fields = item.get("fields", None)
 
             subset = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in all_messages 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in all_messages 
                         if r == comp_name
                     ]
 
@@ -1015,7 +1032,7 @@ class Tool(Component):
             else:
                 raise IndexError(f"Index={index} must be an integer for Tools.")
                 
-            for (role, content, msg_number, msg_type) in chosen:
+            for (role, content, msg_number, msg_type, timestamp) in chosen:
                 try:
                     data = json.loads(content)
                     data = self.manager._load_files_in_dict(data)
@@ -1143,8 +1160,8 @@ class Process(Component):
                 comp_name = parsed["component_or_param"]
 
                 subset = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in all_msgs 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in all_msgs 
                         if r == comp_name
                     ]
                 
@@ -1177,8 +1194,8 @@ class Process(Component):
 
         if comp_name:
             subset = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in all_msgs 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in all_msgs 
                         if r == comp_name
                     ]
         else:
@@ -1190,11 +1207,11 @@ class Process(Component):
         chosen = self._handle_index(index, subset)
 
         final = []
-        for (role, content, msg_num, msg_type) in chosen:
+        for (role, content, msg_num, msg_type, timestamp) in chosen:
             data = self._safe_json_load(content)
             if isinstance(data, dict) and fields:
                 data = {f: data[f] for f in fields if f in data}
-            final.append((role, data, msg_num, msg_type))
+            final.append((role, data, msg_num, msg_type, timestamp))
 
         return final
 
@@ -1238,14 +1255,15 @@ class Process(Component):
         sorted_msgs = sorted(msg_tuples, key=lambda x: x[2])
 
         output = []
-        for (role, data, msg_num, msg_type) in sorted_msgs:
+        for (role, data, msg_num, msg_type, timestamp) in sorted_msgs:
             data = self.manager._load_files_in_dict(data)
 
             output.append({
                 "source": role,
                 "message": data,
                 "msg_number": msg_num,
-                "type": msg_type
+                "type": msg_type,
+                "timestamp": timestamp
             })
 
         # If you do NOT want "msg_number" in the final structure, remove it:
@@ -1275,8 +1293,8 @@ class Process(Component):
             fields = item.get("fields", None)
 
             subset = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in all_msgs 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in all_msgs 
                         if r == comp_name
                     ]
 
@@ -1288,11 +1306,11 @@ class Process(Component):
             chosen = self._handle_index(idx, subset)
 
             final = []
-            for (role, content, msg_num, msg_type) in chosen:
+            for (role, content, msg_num, msg_type, timestamp) in chosen:
                 data = self._safe_json_load(content)
                 if isinstance(data, dict) and fields:
                     data = {f: data[f] for f in fields if f in data}
-                final.append((role, data, msg_num, msg_type))
+                final.append((role, data, msg_num, msg_type, timestamp))
 
             combined.extend(final)
 
@@ -1318,8 +1336,8 @@ class Process(Component):
             chosen = [all_msgs[-1]]
         else:
             subset = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in all_msgs 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in all_msgs 
                         if r == target_input
                     ]
 
@@ -1684,13 +1702,13 @@ class Automation(Component):
                     messages = self.manager._get_all_messages(db_conn)
 
                     filtered = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in messages 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in messages 
                         if r == parsed["component_or_param"]
                     ]
 
                     if filtered:
-                        role, content, msg_number, msg_type = filtered[-1]
+                        role, content, msg_number, msg_type, timestamp = filtered[-1]
                         try:
                             data = json.loads(content)
                             data = self.manager._load_files_in_dict(data)
@@ -1702,7 +1720,7 @@ class Automation(Component):
                 else:
                     # It's just a param name or string => interpret it as a param from the last message
                     subset = self.manager._get_all_messages(db_conn)
-                    role, content, msg_number, msg_type = subset[-1]
+                    role, content, msg_number, msg_type, timestamp = subset[-1]
                     data = json.loads(content)
 
                     return data[parsed["component_or_param"]]
@@ -1738,8 +1756,8 @@ class Automation(Component):
 
         if comp_name:
             subset = [
-                        (r, c, n, t) 
-                        for (r, c, n, t) in all_messages 
+                        (r, c, n, t, ts) 
+                        for (r, c, n, t, ts) in all_messages 
                         if r == comp_name
                     ]
         else:
@@ -1752,7 +1770,7 @@ class Automation(Component):
         if len(subset) < abs(index_to_use):
             return None
 
-        role, content, msg_number, msg_type = subset[index_to_use]
+        role, content, msg_number, msg_type, timestamp = subset[index_to_use]
 
         try:
             data = json.loads(content)
@@ -1830,7 +1848,9 @@ class AgentSystemManager:
         functions_file: str = "fns.py",
         default_models: List[Dict[str, str]] = [{"provider": "groq", "model": "llama-3.1-8b-instant"}],
         on_update: Optional[Callable] = None,
-        on_complete: Optional[Callable] = None
+        on_complete: Optional[Callable] = None,
+        include_timestamp: bool = False,
+        timezone: str = "UTC"
     ):
 
         self._current_user_id: Optional[str] = None
@@ -1849,6 +1869,9 @@ class AgentSystemManager:
         self.default_models = default_models
         self.imports = imports or []
         self._processed_imports = set()
+
+        self.include_timestamp = include_timestamp
+        self.timezone = timezone
         
         if config_json and config_json.endswith(".json"):
             try:
@@ -1862,6 +1885,12 @@ class AgentSystemManager:
             self.on_update = self._resolve_callable(on_update)
             self.on_complete = self._resolve_callable(on_complete)
             self._resolve_api_keys_path(api_keys_path)
+
+        try:
+            self.timezone = ZoneInfo(self.timezone)
+        except Exception as e:
+            print(f"Invalid timezone {self.timezone}, defaulting to UTC. Error: {e}")
+            self.timezone = ZoneInfo("UTC")
             
         self.api_keys: Dict[str, str] = {}
         self._load_api_keys()
@@ -2046,6 +2075,8 @@ class AgentSystemManager:
         return max_num + 1
 
     def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict], type = "user", model: Optional[str] = None):
+        timestamp = datetime.datetime.now(self.timezone).isoformat()
+
         if isinstance(content, dict):
             # Convert dict -> JSON, persisting non-JSON objects to files
             content_str = self._dict_to_json_with_file_persistence(content, self._current_user_id)
@@ -2056,10 +2087,10 @@ class AgentSystemManager:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO message_history (msg_number, role, content, type, model)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO message_history (msg_number, role, content, type, model, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (msg_number, role, content_str, type, model)
+            (msg_number, role, content_str, type, model, timestamp)
         )
         conn.commit()
 
@@ -2174,9 +2205,9 @@ class AgentSystemManager:
         cur = conn.cursor()
 
         if include_model:
-            cur.execute("SELECT role, content, msg_number, type, model FROM message_history ORDER BY msg_number ASC")
+            cur.execute("SELECT role, content, msg_number, type, model, timestamp FROM message_history ORDER BY msg_number ASC")
         else:
-            cur.execute("SELECT role, content, msg_number, type FROM message_history ORDER BY msg_number ASC")
+            cur.execute("SELECT role, content, msg_number, type, timestamp FROM message_history ORDER BY msg_number ASC")
         return cur.fetchall()
 
     def show_history(self, user_id: Optional[str] = None, message_char_limit: int = 2000):
@@ -2186,7 +2217,7 @@ class AgentSystemManager:
         conn = self._get_user_db()
         rows = self._get_all_messages(conn, include_model = True)
         print(f"=== Message History for user [{self._current_user_id}] ===")
-        for i, (role, content, msg_number, msg_type, model) in enumerate(rows, start=1):
+        for i, (role, content, msg_number, msg_type, model, timestamp) in enumerate(rows, start=1):
             model_str = f" ({model})" if model else ""
             role_str = f"{msg_number}. {msg_type} - {role}{model_str}" if role != "user" else f"{msg_number}. {role}{model_str}"
             if len(content) > message_char_limit:
@@ -2202,7 +2233,7 @@ class AgentSystemManager:
         rows = self._get_all_messages(conn, include_model=True)
 
         messages = []
-        for role, content, msg_number, msg_type, model in rows:
+        for role, content, msg_number, msg_type, model, timestamp in rows:
             try:
                 content_data = json.loads(content)
             except json.JSONDecodeError:
@@ -2213,7 +2244,8 @@ class AgentSystemManager:
                 "message": content_data,
                 "msg_number": msg_number,
                 "type": msg_type,
-                "model": model
+                "model": model,
+                "timestamp": timestamp
             })
 
         return messages
@@ -2281,7 +2313,8 @@ class AgentSystemManager:
         default_output: Optional[Dict[str, Any]] = {"response": "No valid response."},
         positive_filter: Optional[List[str]] = None,
         negative_filter: Optional[List[str]] = None,
-        model_params: Optional[Dict[str, Any]] = None
+        model_params: Optional[Dict[str, Any]] = None,
+        include_timestamp: Optional[bool] = None
     ):
         # Automatically assign name if not provided
         if name is None:
@@ -2314,8 +2347,10 @@ class AgentSystemManager:
             positive_filter=positive_filter,
             negative_filter=negative_filter,
             general_system_description=self.general_system_description,
-            model_params=model_params
+            model_params=model_params,
+            include_timestamp=include_timestamp if include_timestamp is not None else self.include_timestamp
         )
+
         agent.manager = self
         self.agents[name] = agent
         self._component_order.append(name)
@@ -2617,6 +2652,7 @@ class AgentSystemManager:
             system_definition = json.load(f)
 
         general_params = system_definition.get("general_parameters", {})
+
         self.base_directory = general_params.get("base_directory", os.getcwd())
         self.general_system_description = general_params.get("general_system_description", "This is a multi-agent system.")
         self.functions_file = general_params.get("functions_file", "fns.py")
@@ -2624,6 +2660,8 @@ class AgentSystemManager:
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
         self.imports = general_params.get("imports", [])
+        self.include_timestamp = general_params.get("include_timestamp", False)
+        self.timezone = general_params.get("timezone", 'UTC')
         
         self._resolve_api_keys_path(general_params.get("api_keys_path"))
         self._load_api_keys()
@@ -2655,17 +2693,16 @@ class AgentSystemManager:
             raise ValueError("Component must have a 'type' and a 'name'.")
 
         if component_type == "agent":
-            model_params = component.get("model_params", None)
-
             agent_name = self.create_agent(
                 name=name,
                 system=component.get("system", "You are a helpful assistant."),
                 required_outputs=component.get("required_outputs", {"response": "Text to send to user."}),
                 models=component.get("models"),
                 default_output=component.get("default_output", {"response": "No valid response."}),
-                positive_filter=component.get("positive_filter", None),
-                negative_filter=component.get("negative_filter", None),
-                model_params=model_params
+                positive_filter=component.get("positive_filter"),
+                negative_filter=component.get("negative_filter"),
+                include_timestamp=component.get("include_timestamp"),
+                model_params=component.get("model_params")
             )
 
             # Store the link information to be processed later
