@@ -173,6 +173,32 @@ Each `user_id` has its own isolated message history.
 Each component is assigned a unique `role` when its output is stored in the database. Roles can simply be the name of the component, or they can also be `user` (messages directly from a user, when calling `run` with `input` string), `internal` (messages added by the developer, when calling `run` with `input` dict) or any other custom role defined by the developer when calling `manager.run()`.
 
 
+### Default File Structure
+
+To create a system, it is recommended to build a file structure in your `base_directory` like the one shown below:
+
+```text
+base_directory/
+├── main.py
+├── .env
+├── fns.py
+└── config.json
+```
+
+Key files:
+
+-  `main.py`: Python file where you will import the library and use it. This file is never recognized by the library, it is used to create and manage the system.
+-  `.env`: Default location for API keys. `api_keys.json` will also be recognized by the system by default.
+-  `fns.py`: Default location for function definitions (tools/processes/others).
+-  `config.json`: JSON file where the `manager` and all `components` are specified. This is optional, as the library can be handled programmatically instead. However, JSON configuration is strongly recommended for most use cases.
+
+You can override these defaults by specifying absolute or relative paths in the configuration.
+
+On top of these initial files, the library creates subdirectories inside the `base_directory` when the `manager` is initialized:
+
+-  `history/`: Automatically created if missing. Contains SQLite databases (`.sqlite` files) for each user's conversation history
+-  `files/`: Automatically created if missing. Stores serialized objects from components that return non-JSON-serializable data
+
 ## The Agent System Manager
 
 ### Initialization
