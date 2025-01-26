@@ -823,7 +823,7 @@ manager.show_history()
 For maximum brevity, the whole system can be ran in only one line:
 
 ```python
-manager = AgentSystemManager(config_json="<config_file_name>.json").run("Hey, how are you today?")
+AgentSystemManager(config_json="<config_file_name>.json").run("Hey, how are you today?")
 ```
 
 This builds the system from a JSON configuration file specified using the `config_json` parameter, creates all components if the configuration is valid and runs an automation (either a specified one or a default linear automation) with the provided user input (or starting with no input if none is provided).
