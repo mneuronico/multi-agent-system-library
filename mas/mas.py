@@ -1637,13 +1637,6 @@ class Automation(Component):
         return [items_data]
 
     def _evaluate_condition(self, condition, current_output) -> bool:
-        """
-        Evaluate a condition, which can be:
-        - a string ("fn:function_name:..."), or just "someParam", or a colon-based syntax for input sources
-        - a dict {"input": "...", "value": <literal or list>}
-            If "input" starts with "fn:", then we call that function (must return bool).
-            Otherwise, we retrieve that input from the DB and compare to 'value'.
-        """
 
         db_conn = self.manager._get_user_db()
 
@@ -1652,7 +1645,7 @@ class Automation(Component):
 
             if parsed["is_function"] and parsed["function_name"]:
                 input_data = self._gather_data_for_parser_result(parsed, db_conn)
-                fn = self._get_function(parsed["function_name"])
+                fn = self.manager._get_function_from_string(parsed["function_name"])
                 result = fn(input_data)  # must return a boolean
                 if not isinstance(result, bool):
                     raise ValueError(
@@ -1680,7 +1673,7 @@ class Automation(Component):
 
             if parsed["is_function"] and parsed["function_name"]:
                 input_data = self._gather_data_for_parser_result(parsed, db_conn)
-                fn = self._get_function(parsed["function_name"])
+                fn = self.manager._get_function_from_string(parsed["function_name"])
                 result = fn(input_data)
                 return (result == target_value)
 
@@ -1792,23 +1785,6 @@ class Automation(Component):
             return data
 
 
-    def _get_function(self, function_name: str) -> Callable:
-        """
-        Retrieve a function by name from the manager's loaded fns module or other registry.
-        """
-        fns_path = os.path.join(self.manager.base_directory, self.manager.functions_file)
-        if not os.path.exists(fns_path):
-            raise FileNotFoundError(f"File '{self.manager.functions_file}' not found in base directory: {self.manager.base_directory}")
-
-        spec = importlib.util.spec_from_file_location("fns", fns_path)
-        fns_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(fns_module)
-
-        if not hasattr(fns_module, function_name):
-            raise AttributeError(f"Function '{function_name}' not found in 'fns.py'.")
-        return getattr(fns_module, function_name)
-
-
         
     def _parse_automation_step_string(self, step_str: str) -> tuple:
         component_name = step_str
@@ -1845,7 +1821,7 @@ class AgentSystemManager:
         base_directory: str = os.getcwd(),
         api_keys_path: Optional[str] = None,
         general_system_description: str = "This is a multi agent system.",
-        functions_file: str = "fns.py",
+        functions: Union[str, List[str]] = "fns.py",
         default_models: List[Dict[str, str]] = [{"provider": "groq", "model": "llama-3.1-8b-instant"}],
         on_update: Optional[Callable] = None,
         on_complete: Optional[Callable] = None,
@@ -1872,6 +1848,14 @@ class AgentSystemManager:
 
         self.include_timestamp = include_timestamp
         self.timezone = timezone
+
+        self._function_cache = {}
+        self.functions = functions
+
+        if isinstance(self.functions, str):
+            self.functions = [self.functions]
+        else:
+            self.functions = self.functions
         
         if config_json and config_json.endswith(".json"):
             try:
@@ -1881,7 +1865,6 @@ class AgentSystemManager:
         else:
             self.base_directory = base_directory
             self.general_system_description = general_system_description
-            self.functions_file = functions_file
             self.on_update = self._resolve_callable(on_update)
             self.on_complete = self._resolve_callable(on_complete)
             self._resolve_api_keys_path(api_keys_path)
@@ -1928,31 +1911,77 @@ class AgentSystemManager:
             return
         self._processed_imports.add(import_str)
 
-        # Parse import string
-        if "->" in import_str:
-            file_part, components_part = import_str.split("->", 1)
-            components = components_part.split("+")
-        else:
-            file_part = import_str
-            components = None
+        file_part = import_str.strip()
+        components = None
 
-        # Resolve file path
-        if os.path.isabs(file_part.strip()):
-            json_path = file_part.strip()
-        else:
-            json_path = os.path.join(self.base_directory, file_part.strip())
+        if "->" in import_str:
+            file_part, single_comp = import_str.split("->", 1)
+            file_part = file_part.strip()
+            single_comp = single_comp.strip()
+            components = [single_comp]
         
-        # Load external config
-        with open(json_path, "r") as f:
-            external_config = json.load(f)
-            
-        # Process components
-        for comp_def in external_config.get("components", []):
-            comp_name = comp_def.get("name")
-            if components is None or comp_name in components:
-                if self._component_exists(comp_name):
-                    raise ValueError(f"Component {comp_name} already exists when importing from {import_str}")
-                self._create_component_from_json(comp_def)
+        elif "?" in import_str:
+            file_part, comps_part = import_str.split("?", 1)
+            file_part = file_part.strip()
+            comps_part = comps_part.strip()
+            # Expect something like "[comp1, comp2, ...]"
+            if comps_part.startswith("[") and comps_part.endswith("]"):
+                inside = comps_part[1:-1].strip()  # remove brackets
+                if inside:
+                    # Split by comma to get component names
+                    components = [c.strip() for c in inside.split(",") if c.strip()]
+                else:
+                    # "?[ ]" was empty: no specific components => None => import all
+                    components = None
+
+        if not os.path.isabs(file_part):
+            file_part = os.path.join(self.base_directory, file_part)
+            file_part = os.path.normpath(file_part)
+
+        temp_manager = AgentSystemManager(config_json=file_part)
+        self._merge_imported_components(temp_manager, components)
+
+    def _merge_imported_components(self, other_mgr, only_names):
+
+        # 1) Agents
+        for name, agent_obj in other_mgr.agents.items():
+            if only_names and name not in only_names:
+                continue
+            if name not in self.agents:
+                agent_obj.manager = self
+                self.agents[name] = agent_obj
+                self._component_order.append(name)
+            # else: skip if it already exists
+
+        # 2) Tools
+        for name, tool_obj in other_mgr.tools.items():
+            if only_names and name not in only_names:
+                continue
+            if name not in self.tools:
+                tool_obj.manager = self
+                self.tools[name] = tool_obj
+                self._component_order.append(name)
+            # else: skip if it already exists
+
+        # 3) Processes
+        for name, proc_obj in other_mgr.processes.items():
+            if only_names and name not in only_names:
+                continue
+            if name not in self.processes:
+                proc_obj.manager = self
+                self.processes[name] = proc_obj
+                self._component_order.append(name)
+            # else: skip if it already exists
+
+        # 4) Automations
+        for name, auto_obj in other_mgr.automations.items():
+            if only_names and name not in only_names:
+                continue
+            if name not in self.automations:
+                auto_obj.manager = self
+                self.automations[name] = auto_obj
+                self._component_order.append(name)
+            # else: skip if it already exists
 
     def _component_exists(self, name: str) -> bool:
         return any(
@@ -1961,8 +1990,8 @@ class AgentSystemManager:
         )
 
     def _resolve_callable(self, func):
-        if isinstance(func, str) and func.startswith("fn:"):
-            return self._get_function_from_reference(func)
+        if isinstance(func, str) and ":" in func:
+            return self._get_function_from_string(func)
         elif callable(func):
             return func
         return None
@@ -2655,13 +2684,20 @@ class AgentSystemManager:
 
         self.base_directory = general_params.get("base_directory", os.getcwd())
         self.general_system_description = general_params.get("general_system_description", "This is a multi-agent system.")
-        self.functions_file = general_params.get("functions_file", "fns.py")
+        self.functions = general_params.get("functions", "fns.py")
         self.default_models = general_params.get("default_models", self.default_models)
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
         self.imports = general_params.get("imports", [])
         self.include_timestamp = general_params.get("include_timestamp", False)
         self.timezone = general_params.get("timezone", 'UTC')
+
+        if isinstance(self.functions, str):
+            self.functions = [self.functions]
+        elif isinstance(self.functions, list):
+            self.functions = self.functions
+        else:
+            self.functions = []
         
         self._resolve_api_keys_path(general_params.get("api_keys_path"))
         self._load_api_keys()
@@ -2721,7 +2757,7 @@ class AgentSystemManager:
                 name=name,
                 inputs=component.get("inputs", {}),
                 outputs=component.get("outputs", {}),
-                function=self._get_function_from_reference(fn),
+                function=self._get_function_from_string(fn),
                 default_output=component.get("default_output", None)
             )
 
@@ -2731,7 +2767,7 @@ class AgentSystemManager:
                 raise ValueError("Process must have a 'function'.")
             self.create_process(
                 name=name,
-                function=self._get_function_from_reference(fn)
+                function=self._get_function_from_string(fn)
             )
 
         elif component_type == "automation":
@@ -2743,34 +2779,56 @@ class AgentSystemManager:
         else:
             raise ValueError(f"Unsupported component type: {component_type}")
 
-    def _load_fns_module(self):
-        if not hasattr(self, '_fns_module'):
-            fns_path = os.path.join(self.base_directory, self.functions_file)
-            
-            if not os.path.exists(fns_path):
-                raise FileNotFoundError(f"File '{self.functions_file}' not found in base directory: {self.base_directory}")
+    def _get_function_from_string(self, ref: str) -> Callable:
+        ref = ref.strip()
+        if not ref:
+            raise ValueError(f"Empty function reference.")
 
-            spec = importlib.util.spec_from_file_location("fns", fns_path)
-            self._fns_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(self._fns_module)
+        # If there's a colon that is not just "fn:", it's presumably 'file.py:func'
+        if ":" in ref and not ref.startswith("fn:"):
+            file_part, func_name = ref.rsplit(":", 1)
+            file_path = file_part.strip()
+            func_name = func_name.strip()
+            return self._load_function_from_file(file_path, func_name)
 
-        return self._fns_module
+        # Otherwise, handle the "fn:funcname" style
+        if ref.startswith("fn:"):
+            func_name = ref[3:].strip()
+            # Try each file in self.functions in order
+            for candidate_path in self.functions:
+                if not os.path.isabs(candidate_path):
+                    candidate_path_abs = os.path.join(self.base_directory, candidate_path)
+                else:
+                    candidate_path_abs = candidate_path
 
-    def _get_function_from_reference(self, function_ref: str):
-        """
-        Load a function from fns.py using a reference in the format "fn:<function_name>".
-        """
-        if not function_ref or not function_ref.startswith("fn:"):
-            raise ValueError(f"Invalid function reference: {function_ref}")
+                if not os.path.exists(candidate_path_abs):
+                    continue
+                try:
+                    return self._load_function_from_file(candidate_path_abs, func_name)
+                except AttributeError:
+                    pass
 
-        fns_module = self._load_fns_module()
+            raise ValueError(f"Function '{func_name}' not found in any file specified by 'self.functions'.")
 
-        function_name = function_ref[3:]
+        raise ValueError(f"Invalid function reference '{ref}'. Must be 'file.py:func' or 'fn:func'.")
 
-        if not hasattr(fns_module, function_name):
-            raise AttributeError(f"Function '{function_name}' not found in 'fns.py'.")
+    def _load_function_from_file(self, file_path: str, function_name: str) -> Callable:
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(self.base_directory, file_path)
 
-        return getattr(fns_module, function_name)
+        if file_path not in self._function_cache:
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"Cannot find function file: {file_path}")
+            spec = importlib.util.spec_from_file_location(f"dynamic_{id(self)}", file_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self._function_cache[file_path] = mod
+
+        module = self._function_cache[file_path]
+        if not hasattr(module, function_name):
+            raise AttributeError(f"Function '{function_name}' not found in '{file_path}'.")
+        return getattr(module, function_name)
+    
 
     def _resolve_automation_sequence(self, sequence):
         """
@@ -2780,16 +2838,27 @@ class AgentSystemManager:
 
         for step in sequence:
             if isinstance(step, str) and "->" in step:
-                if ":" in step:
-                    import_ref, target_params = step.split(":", 1)
+                left_part, right_part = step.rsplit("->", 1)
+                left_part = left_part.strip()
+                right_part = right_part.strip()
+
+                if ":" in right_part:
+                    component_name, target_params = right_part.split(":", 1)
+                    component_name = component_name.strip()
+                    target_params = target_params.strip()
                 else:
-                    import_ref = step
+                    component_name = right_part
                     target_params = ""
 
+                import_ref = f"{left_part}->{component_name}"
+
+                # 4) Now we actually process the single import
                 self._process_single_import(import_ref)
-                component_name = import_ref.split("->")[-1].strip()
+
+                # 5) The final resolved step
                 resolved_step = f"{component_name}:{target_params}" if target_params else component_name
                 resolved_sequence.append(resolved_step)
+
             elif isinstance(step, str):
                 resolved_sequence.append(step)
             elif isinstance(step, dict):
@@ -2854,10 +2923,12 @@ class AgentSystemManager:
         if isinstance(condition, bool):
             return condition
         elif isinstance(condition, str):
-            if condition.startswith("fn:"):
-                return self._get_function_from_reference(condition)
+            if ":" in condition:
+                return self._get_function_from_string(condition)
             return condition
         elif isinstance(condition, dict):
+            return condition
+        elif callable(condition):
             return condition
         else:
             raise ValueError(f"Unsupported condition type: {condition}")
@@ -3045,9 +3116,6 @@ class Parser:
     """
 
     def parse_input_string(self, spec: str) -> dict:
-        """
-        Main entry point: parse 'spec' and return a dictionary describing what to do.
-        """
         spec = spec.strip()
         if not spec:
             return {
@@ -3058,36 +3126,20 @@ class Parser:
                 "single_source": None,
             }
 
-        if spec.startswith("fn:"):
-            remainder = spec[3:].strip()
-            return self._parse_as_function_reference(remainder)
+        if ":" in spec and (spec.startswith("fn:") or ".py:" in spec):
+            return self._parse_as_function_reference(spec)
 
         return self._parse_as_non_function(spec)
 
 
-    def _parse_as_function_reference(self, remainder: str) -> dict:
-
-        if ":" in remainder:
-            parts = remainder.split(":", 1)
-            function_name = parts[0].strip()
-            input_part = parts[1].strip()
-            parse_result = self._parse_as_non_function(input_part)
-            return {
-                "is_function": True,
-                "function_name": function_name,
-                "component_or_param": parse_result["component_or_param"],
-                "multiple_sources": parse_result["multiple_sources"],
-                "single_source": parse_result["single_source"],
-            }
-        else:
-            function_name = remainder.strip()
-            return {
-                "is_function": True,
-                "function_name": function_name,
-                "component_or_param": None,
-                "multiple_sources": None,
-                "single_source": None,
-            }
+    def _parse_as_function_reference(self, full_ref: str) -> dict:
+        return {
+            "is_function": True,
+            "function_name": full_ref.strip(),
+            "component_or_param": None,
+            "multiple_sources": None,
+            "single_source": None,
+        }
 
 
     def _parse_as_non_function(self, spec: str) -> dict:
