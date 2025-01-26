@@ -924,7 +924,7 @@ manager.start_telegram_bot(
 After defining the system through JSON and writing the necessary functions, it's possible to run a full Telegram bot with just one line of code:
 
 ```python
-manager = AgentSystemManager(config_json="config.json").start_telegram_bot()
+AgentSystemManager(config_json="config.json").start_telegram_bot()
 ```
 
 Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can return a string (which will be sent to the correct user by the system), `None` to send nothing, or a dict for more advanced response patterns, as described below.
