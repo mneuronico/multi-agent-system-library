@@ -2981,7 +2981,8 @@ class AgentSystemManager:
         return None
     
     def start_telegram_bot(self, telegram_token=None, component_name = None, verbose = False,
-              on_complete = None, on_update = None,
+              on_complete = None, on_update = None, speech_to_text=None,
+              whisper_provider=None, whisper_model=None,
               on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.",
               on_clear_msg = "Message history deleted."):
 
@@ -2994,6 +2995,52 @@ class AgentSystemManager:
 
         on_update = on_update or self.on_update
         on_complete = on_complete or self.on_complete
+
+        async def process_audio_message(update, context, file_id):
+            file = await context.bot.get_file(file_id)
+            file_url = file.file_path
+            
+            # Download the audio file
+            response = requests.get(file_url)
+            if response.status_code != 200:
+                return None, None
+
+            # Store in manager's file system
+            file_data = response.content
+            file_uuid = str(uuid.uuid4())
+            file_name = f"{file_uuid}.ogg"  # Telegram uses OGG for voice messages
+            file_path = os.path.join(self.base_directory, "files", str(update.message.chat.id), file_name)
+            
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "wb") as f:
+                f.write(file_data)
+
+            # Store in manager's file cache
+            file_ref = self._store_file(file_path, str(update.message.chat.id))
+
+            # Transcribe using appropriate method
+            transcript = None
+            try:
+                if callable(speech_to_text):
+                    transcript = speech_to_text({"manager": self, "file_path": file_path, "update": update, "context": context})
+                else:
+                    # Try automatic transcription
+                    transcript = self._transcribe_audio(file_path, whisper_provider, whisper_model)
+
+                    if verbose:
+                        print(f"Audio transcription succeeded: {transcript}")
+            except Exception as e:
+                if verbose:
+                    print(f"Audio transcription failed: {e}")
+
+            return transcript, file_ref
+        
+        async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            audio = update.message.audio or update.message.voice
+            transcript, file_ref = await process_audio_message(update, context, audio.file_id)
+            
+            input_text = transcript if transcript else f"Audio file: {file_ref}"
+            await handle_system_text(update, input_text, file_ref)
 
         async def send_telegram_response(update, response):
             if isinstance(response, str):
@@ -3061,20 +3108,27 @@ class AgentSystemManager:
             self.clear_message_history(update.message.chat.id)
             await update.message.reply_text(on_clear_msg)
 
-        async def get_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            params = {}
-            params["update"] = update
-            params["event_loop"] = asyncio.get_running_loop()
+        async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Handle direct text input from user"""
+            text = update.message.text
+            await handle_system_text(update, text)
+
+        async def handle_system_text(update: Update, input_text, file_ref=None):
+            params = {
+                "update": update,
+                "event_loop": asyncio.get_running_loop(),
+                "file_ref": file_ref
+            }
 
             chat_id = update.message.chat.id
 
             if verbose:
-                print(f"[Manager] Received message from user {chat_id}. Executing...")
+                print(f"[Manager] Processing input for user {chat_id}: {input_text}")
 
             def run_manager_thread():
                 self.run(
                     component_name = component_name,
-                    input=update.message.text, 
+                    input=input_text, 
                     user_id=chat_id,
                     verbose=verbose,
                     blocking=True,
@@ -3092,13 +3146,99 @@ class AgentSystemManager:
         # Add command and message handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("clear", clear))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_response))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text))
+        application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+        application.add_handler(MessageHandler(filters.VOICE, handle_audio))
 
         # Run the bot
         if verbose:
             print("[Manager] Bot running...")
 
         application.run_polling()
+
+    def _transcribe_audio(self, file_path, provider=None, model=None):
+        # Determine which provider to use
+        if provider:
+            provider = provider.lower()
+        else:
+            # Auto-detect provider based on available keys
+            if self.get_key("groq"):
+                provider = "groq"
+            elif self.get_key("openai"):
+                provider = "openai"
+            else:
+                raise ValueError("No supported speech-to-text API keys found")
+
+        # Set default model if not specified
+        if not model:
+            model = {
+                "groq": "whisper-large-v3-turbo",
+                "openai": "whisper-1"
+            }.get(provider)
+
+        # Read audio file
+        with open(file_path, "rb") as audio_file:
+            if provider == "groq":
+                return self._transcribe_groq(audio_file, model)
+            elif provider == "openai":
+                return self._transcribe_openai(audio_file, model)
+            else:
+                raise ValueError(f"Unsupported provider: {provider}")
+
+    def _transcribe_groq(self, audio_file, model):
+        api_key = self.get_key("groq")
+        if not api_key:
+            raise ValueError("Groq API key not found")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+        }
+
+        files = {
+            "file": audio_file,
+            "model": (None, model)#,
+            #"temperature": (None, "0"),
+            #"response_format": (None, "json"),
+            #"language": (None, "en")
+        }
+
+        response = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers=headers,
+            files=files
+        )
+        
+        if response.status_code != 200:
+            print(f"Groq API Error: {response.text}")  # Add debug output
+            response.raise_for_status()
+            
+        return response.json().get("text", "")
+
+    def _transcribe_openai(self, audio_file, model):
+        api_key = self.get_key("openai")
+        if not api_key:
+            raise ValueError("OpenAI API key not found")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}"
+        }
+
+        files = {
+            "file": audio_file,
+            "model": (None, model)
+        }
+
+        response = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers=headers,
+            files=files
+        )
+        
+        if response.status_code != 200:
+            raise ValueError(f"OpenAI API error: {response.text}")
+        
+        return response.json().get("text", "")
+
 
 
 class Parser:

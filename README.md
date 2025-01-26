@@ -896,33 +896,42 @@ In this function, you could possibly send this message to your own database, to 
 The `mas` library allows the developer to integrate any system with Telegram seamlessly to allow users to interact with the system through the messaging app without requiring the developer to define custom async logic and event loops. This is possible through the `start_telegram_bot` method:
 
 ```python
-manager.start_telegram_bot(telegram_token = None, # if not provided, the manager looks for it in its API keys
-component_name = "my_automation", # optional, defaults to default or latest automation
-verbose = False, # defaults to False
-on_complete = None, # defaults to sending latest message to user
-on_update = None, # defaults to no operation
-on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.", # defaults to this message
-on_clear_msg = "Message history deleted." # defaults to this message
+manager.start_telegram_bot(
+  telegram_token = None, # if not provided, the manager looks for it in its API keys
+  component_name = "my_automation", # optional, defaults to default or latest automation
+  verbose = False, # defaults to False
+  on_complete = None, # defaults to sending latest message to user
+  on_update = None, # defaults to no operation
+  whisper_provider=None, # 'groq' and 'openai' are supported
+  whisper_model=None, # defaults to v3-turbo in groq and v2 in openai
+  speech_to_text=None, # optional callable if you need to process your audios and voice notes in a custom way
+  on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.", # defaults to this message
+  on_clear_msg = "Message history deleted." # defaults to this message
 )
 ```
 
--   **`telegram_token`**: The token given by Telegram's `BotFather` after successful bot creation through the Telegram platform. This lets the library connect with a specific bot to send and receive messages. If this is not provided in the function call, the manager will look for `telegram_token` in its API keys. If it's not there, it will throw an error.
+-   **`telegram_token`**: The token given by Telegram's `BotFather` after successful bot creation through the Telegram platform. This lets the library connect with a specific bot to send and receive messages. If this is not provided in the function call, the manager will look for `TELEGRAM_TOKEN` in its API keys. If it's not there, it will throw an error.
 -   **`component_name`**: Optional string defining which component should be executed when receiving a user message. If not set, this defaults to the latest or default automation defined, just like `manager.run()`.
 -   **`verbose`**: Optional boolean, defines whether the system will run in verbose mode or not (defaults to False).
 -   **`on_complete`**: Optional callable, function that will be called when completing execution after a specific user message.
 -   **`on_update`**: Optional callable, function that will be called every time a component finishes execution.
+-   **`whisper_provider`**: Optional string, provider used to transform voice notes and audio files to text in order for them to be processed by the system. If not set, it looks for a `groq` API key first, and for an `openai` API key later, and uses the `whisper` implementation of the first available provider.
+-   **`whisper_model`**: Optional string, `whisper` model used for speech-to-text transformation. Defaults to `whisper-large-v3-turbo` for `groq` and to `whisper-1` for `openai`.
+-   **`speech_to_text`**: Optional callable, custom function to be called instead of the default providers.
 -   **`on_start_msg`**: Optional string defining what the bot will send to the user when receiving '/start' commnad.
 -   **`on_clear_msg`**: Optional string defining what the bot will send to the user when receiving '/clear' command.
 
-After defining the system through JSON and writing the necessary functions, it's possible to run a full Telegram bot with this minimal code example:
+After defining the system through JSON and writing the necessary functions, it's possible to run a full Telegram bot with just one line of code:
 
 ```python
-manager = AgentSystemManager(config_json="config.json") 
-token = "<YOUR_TELEGRAM_TOKEN>"
-manager.start_telegram_bot(token)
+manager = AgentSystemManager(config_json="config.json").start_telegram_bot()
 ```
 
 Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can return a string (which will be sent to the correct user by the system), `None` to send nothing, or a dict for more advanced response patterns, as described below.
+
+#### Speech To Text
+
+The `mas` Telegram integration functionality handles speech-to-text transcription for audios and voice notes automatically. You can specify a provider (either `groq` or `openai`) as described above, or they will be used automatically if the API key is available (`groq` is tried first). You may also define your own `speech_to_text` function if you need to. This function must receive a single argument, a dictionary with keys for `manager`, the audio's `file_path`, and Telegram's `update` and `context`. The function must return the text as string.
 
 #### Advanced Response Patterns
 
