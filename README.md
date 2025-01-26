@@ -184,11 +184,11 @@ manager = AgentSystemManager(
     base_directory="path/to/your/base_dir",  # Default is the current working directory.
     api_keys_path="path/to/your/api_keys.env",  # Default is .env
     general_system_description="This is a description for the overall system.", # Default: "This is a multi agent system."
-    functions_file="my_fns_file.py", # Default: "fns.py"
+    functions="my_fns_file.py", # Default: "fns.py"
     default_models=[{"provider": "groq", "model": "llama-3.1-8b-instant"}],
     imports=[
         "common_tools.json",  # Import all components from file
-        "external_agents.json->research_agent+analysis_tool"  # Import specific components
+        "external_agents.json?[research_agent, analysis_tool]"  # Import specific components
     ],
     on_update=on_update, # Default: none
     on_complete=on_complete, # Default: none
@@ -202,17 +202,24 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 -   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
 -   **`api_keys_path`**: File or path to a `.env` or `json` file containing API keys for various LLM providers.
 -   **`general_system_description`**: A description appended to the system prompt of each agent.
--   **`functions_file`**: The name of a Python file where function definitions must be located. This file must exist in the base directory.
+-   **`functions`**: The name of a Python file, or list of Python files, where function definitions must be located. Files must either exist in the base directory or be referenced as an absolute path. If not defined, this defaults to `fns.py` inside the `base_directory`.
 -   **`default_models`**: A list of models to use when executing agents, for agents that don't define specific models. Each element of the list should be a dictionary with two fields, `provider` (like 'groq' or 'openai') and `model` (the specific model name). These models will be tried in order, and failure of a model will trigger a call to the next one in the chain.
--   **`imports`**: List of component import specifications. Each entry can be either `"<your_json>.json"` to import all components from that file, or `"<your_json>.json"->component1+component2` to import specific components from that file.
+-   **`imports`**: List of component import specifications. Each entry can be either `"<your_json>.json"` to import all components from that file, or `"<your_json>.json?[comp1, comp2]"` to import specific components from that file.
 -   **`on_update`**: Function to be executed each time an individual component is finished running. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like updating an independent database or sending messages to user during an automation.
 -   **`on_complete`**: Function to be executed when `manager.run`() reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both will be executed), but it's different for automations, since it will only be ran at the end of the automation. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like sending the last message to the user after a complex automation workflow.
 -   **`include_timestamp`**: Whether the agents receive the `timestamp` for each message in the conversation history. False by default. This is overriden by the `include_timestamp` parameter associated with each agent, if specified. 
 -   **`timezone`**: String defining what timezone should the `timestamp` information be saved in. Defaults to `UTC`.
 
-`on_update` and `on_complete` can be defined as callables directly, or they can be strings referring to the name of the function to used, located in the `functions_file`. To accomplish this, _function syntax_ must be used, by starting the string with _fn:_, for example:
+`on_update` and `on_complete` can be defined as callables directly, or they can be strings referring to the name of the function to use, located in one of the `functions` files. To accomplish this, _function syntax_ must be used.
 
-_"fn:<your_function_name>"_ will attempt to retrieve a function with the specified name from the `functions_file`.
+#### Function Syntax
+
+You can refer to functions with strings anywhere you can use functions throughout the system (e.g. tools, processes, `on_update`, `on_complete`, control flow statements in automations, etc). To do so, the string must follow one of the following formats:
+
+- `"fn:<your_function_name>"`: The system will look for the function in one of the files included in `functions`. If `functions` is a list, the files are checked in order, so function name redundancy will be resolved by getting the function included in the file that appears first in this list.
+- `"<your_file.py>:<your_function_name>"`: The system will look for the specified file inside the `base_directory`, and then look for the specified function inside that file.
+- `"<path/to/your_file.py>:<your_function_name>"`: The system will look for the specified file in the absolute path provided, and then look for the specified function inside that file.
+
 
 You can accomplish the same thing when defining the system from a JSON file:
 
@@ -222,7 +229,7 @@ You can accomplish the same thing when defining the system from a JSON file:
     "base_directory": "/path/to/your/base_dir",
     "api_keys_path": "/path/to/your/api_keys.env",
     "general_system_description": "This is a description for the overall system.",
-    "functions_file": "my_fns_file.py",
+    "functions": "my_fns_file.py",
     "default_models": [
             {"provider": "deepseek", "model": "deepseek-chat"},
             {"provider": "groq", "model": "llama-3.3-70b-versatile"}
@@ -538,7 +545,7 @@ imports=[
     "common_tools.json",
     
     # Import specific components from a file
-    "external_agents.json->research_agent+analysis_tool",
+    "external_agents.json?[research_agent, analysis_tool]",
 
     # Import components from a file outside the base directory
     "path/to/your/file.json"
