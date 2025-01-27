@@ -1,5 +1,221 @@
 import requests
+from googleapiclient.discovery import build
+from youtube_transcript_api import YouTubeTranscriptApi
+import pytz
+import mercadopago
+from datetime import datetime, timedelta, timezone
+import markdown
+import pdfkit
+import os
 
+def read_google_doc(manager, messages):
+    api_key = manager.get_key("GOOGLE_DRIVE_API")
+    doc_id = manager.get_key("GOOGLE_DOC_ID")
+    
+    print(api_key)
+    print(doc_id)
+
+    # Google Drive API endpoint for exporting a Google Doc as plain text
+    url = f"https://www.googleapis.com/drive/v3/files/{doc_id}/export"
+    
+    # Parameters for the request
+    params = {
+        "mimeType": "text/plain",  # Export as plain text
+        "key": api_key             # API key for authentication
+    }
+    
+    # Make the GET request
+    response = requests.get(url, params=params)
+    
+    # Check if the request was successful
+    if response.status_code == 200:
+        content = response.content.decode('utf-8-sig')
+        return {"doc_text": content}  # Return the plain text content
+    else:
+        return {"doc_text": f"Error: {response.status_code}, {response.text}"}
+
+def weather_query(manager, location: str, unit: str = "metric") -> tuple:
+    API_KEY = manager.get_key("WEATHER_API_KEY")
+    BASE_URL = "http://api.weatherapi.com/v1/current.json"
+
+    if unit == "metric":
+        temp_unit = "C"
+    elif unit == "imperial":
+        temp_unit = "F"
+    else:
+        raise ValueError("Invalid unit. Use 'metric' or 'imperial'.")
+
+    params = {
+        "key": API_KEY,
+        "q": location,
+        "aqi": "no"
+    }
+
+    try:
+        response = requests.get(BASE_URL, params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        temperature = data["current"]["temp_" + temp_unit.lower()]
+        condition = data["current"]["condition"]["text"]
+        wind_speed = data["current"]["wind_kph" if unit == "metric" else "wind_mph"]
+        location_name = f"{data['location']['name']}, {data['location']['country']}"
+
+        return (temperature, condition, wind_speed, location_name)
+
+    except requests.RequestException as e:
+        return (None, "Unavailable", None, location)
+
+def markdown_to_pdf(messages):
+    md_text = messages[-1]["message"]["markdown"]
+
+    title = messages[-1]["message"]["title"]
+
+    # Convert markdown to HTML
+    html_content = markdown.markdown(md_text)
+
+    # Wrap the HTML content with proper encoding meta tag
+    html_with_meta = f"""
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Document</title>
+    </head>
+    <body>
+        {html_content}
+    </body>
+    </html>
+    """
+
+    # Path to wkhtmltopdf executable
+    path_to_kit = r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe"
+    config = pdfkit.configuration(wkhtmltopdf=path_to_kit)
+
+    # Determine the output file name
+    base_name = title
+    extension = ".pdf"
+    i = 0
+    output_file = f"{base_name}{extension}"
+
+    while os.path.exists(output_file):
+        i += 1
+        output_file = f"{base_name}-{i}{extension}"
+
+
+    # Save the HTML as a PDF file
+    pdfkit.from_string(html_with_meta, output_file, configuration=config)
+    
+    return {"pdf_file_path": output_file}
+
+def create_payment_url(manager, name, price, currency, qty):
+    ACCESS_TOKEN = manager.get_key("MERCADOPAGO_ACCESS_TOKEN")
+    sdk = mercadopago.SDK(ACCESS_TOKEN)
+
+    expiration_date = datetime.now(timezone.utc) + timedelta(days=1)
+    expiration_date_iso = expiration_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    preference_data = {
+        "items": [
+            {
+                "title": name,
+                "quantity": price,
+                "currency_id": currency,
+                "unit_price": qty
+            }
+        ],
+        "expiration_date_to": expiration_date_iso
+    }
+
+    preference = sdk.preference().create(preference_data)
+
+    url = preference["response"]["init_point"]
+    return {"payment_url": url}
+
+def get_video_transcript(video_id):
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        # Combine all transcript parts into a single string
+        full_transcript = ' '.join([entry['text'] for entry in transcript])
+        return full_transcript
+    except Exception as e:
+        return f"Could not retrieve transcript."
+
+def youtube_search(manager, query, max_results=3):
+    YOUTUBE_API_SERVICE_NAME = 'youtube'
+    YOUTUBE_API_VERSION = 'v3'
+    API_KEY = manager.get_key('YOUTUBE_API_KEY')
+
+    youtube = build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=API_KEY)
+
+    # Perform the search
+    search_response = youtube.search().list(
+        q=query,
+        part='id,snippet',
+        type='video',
+        maxResults=max_results
+    ).execute()
+
+    results = []
+    for item in search_response['items']:
+        transcript = get_video_transcript(item['id']['videoId'])
+
+        video_data = {
+            'title': item['snippet']['title'],
+            'description': item['snippet']['description'],
+            'url': f"https://www.youtube.com/watch?v={item['id']['videoId']}",
+            'transcript': transcript
+        }
+        results.append(video_data)
+
+    results = {"video_list": results}
+    return results
+
+def get_current_date(messages):
+    return {"current_date": str(datetime.now(timezone.utc))}
+
+def get_calendar(manager, start_date: str, end_date: str, calendar_id: str):
+    # Convertir fechas de string a objetos timezone-aware
+    timezone = pytz.UTC
+    start_datetime = timezone.localize(datetime.strptime(start_date, "%Y-%m-%d"))
+    end_datetime = timezone.localize(datetime.strptime(end_date, "%Y-%m-%d"))
+
+    # Crear un servicio para acceder a la API de Google Calendar
+    API_KEY = manager.get_key('CALENDAR_API_KEY')
+    service = build('calendar', 'v3', developerKey=API_KEY)
+
+    try:
+        # Llamar a la API para obtener eventos
+        events_result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=start_datetime.isoformat(),
+            timeMax=end_datetime.isoformat(),
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        # Obtener eventos
+        events = events_result.get('items', [])
+
+        # Crear la lista de eventos en el formato solicitado
+        event_list = []
+        for event in events:
+            event_data = {
+                "summary": event.get("summary", "Sin título"),
+                "description": event.get("description", "No disponible"),
+                "start": event['start'].get('dateTime', event['start'].get('date')),
+                "end": event['end'].get('dateTime', event['end'].get('date')),
+                "location": event.get("location", "No especificada")
+            }
+            event_list.append(event_data)
+
+        return {"event_list": event_list}
+
+    except Exception as e:
+        print(f"Error al obtener eventos: {e}")
+        return {"error": str(e)}
+    
 def find_food_places(manager, radius, keyword, location):
     google_api_key = manager.get_key("PLACES_API_KEY")
     lat, lng = get_lat_lng(google_api_key, address=location)

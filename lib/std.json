@@ -4,18 +4,105 @@
     },
     "components": [
         {
-        "type": "tool",
-        "name": "place_finder",
-        "inputs": {
-            "radius": "Search radius in meters.",
-            "keyword": "Query to search for in Google Places, according to the user's request.",
-            "location": "Location to search for the query, specific enough and matching user's request if specified. If not specified, default to Buenos Aires, Argentina."
+            "type": "tool",
+            "name": "google_places_search",
+            "inputs": {
+                "radius": "Search radius in meters.",
+                "keyword": "Query to search for in Google Places, according to the user's request.",
+                "location": "Location to search for the query, specific enough and matching user's request if specified. If not specified, default to Buenos Aires, Argentina."
+            },
+            "outputs": {
+                "search_response": "List of places found by Google Places. Each element is an object with the following fields: 'name', 'formatted_address', 'rating' (average rating), 'user_ratings_total' (number of user ratings), 'price_level', 'opening_hours', 'open_now', 'phone_number', 'website', 'editorial_summary' (a general summary of the place) and 'reviews'. Some of these fields might not be available."
+            },
+            "function": "fn:find_food_places",
+            "description": "Find places using Google Places. Requiers 'PLACES_API_KEY'."
         },
-        "outputs": {
-            "search_response": "List of places found by Google Places. Each element is an object with the following fields: 'name', 'formatted_address', 'rating' (average rating), 'user_ratings_total' (number of user ratings), 'price_level', 'opening_hours', 'open_now', 'phone_number', 'website', 'editorial_summary' (a general summary of the place) and 'reviews'. Some of these fields might not be available."
+
+        {
+            "type": "tool",
+            "name": "youtube_search",
+            "inputs": {
+                "query": "Query to be searched on YouTube, based on the context of the conversation.",
+                "n_results": "Number of videos to search for, the default is 3 unless otherwise specified."
+                },
+            "outputs": {
+                "video_list": "List of videos found. Each element in the list is a JSON with the fields 'title', 'description', and 'url'."
+                },
+            "function": "fn:youtube_search",
+            "description": "Find YouTube videos and their transcripts. Requiers 'YOUTUBE_API_KEY', and installing 'googleapiclient' and 'youtube_transcript_api'."
         },
-        "function": "fn:find_food_places",
-        "description": "Find places using Google Places. Requiers an API key for Google Places in the API key file, named 'PLACES_API_KEY'"
+
+        {
+            "type": "process",
+            "name": "current_date",
+            "function": "fn:get_current_date",
+            "description": "Get the current date."
+        },
+
+        {
+            "type": "tool",
+            "name": "calendar_search",
+            "inputs": {
+                "start_date": "Start date of the search in YYYY-MM-DD format.",
+                "end_date": "End date of the search in YYYY-MM-DD format.",
+                "calendar_id": "ID of the specific calendar that will be searched."
+            },
+            "outputs": {
+                "event_list": "List of events found within the searched time period."
+            },
+            "function": "fn:get_calendar",
+            "description": "Find events in a specific calendar and in a specific time range. Requiers 'CALENDAR_API_KEY' and installing 'googleapiclient'."
+        },
+
+        {
+            "type": "tool",
+            "name": "create_mercadopago_payment_url",
+            "inputs": {
+              "name": "The name that will appear in the payment link.",
+              "price": "The total price to pay, in the specified currency.",
+              "currency": "The currency to use ('ARS' or 'USD'). If nothing was specified default to USD.",
+              "quantity": "The quantity of the service (default to 1, unless something else seems more appropriate)."
+            },
+            "outputs": {
+              "payment_url": "The URL where the user can complete the payment."
+            },
+            "function": "fn:create_payment_url",
+            "default_output": {
+              "payment_url": "There was an error creating the URL."
+            },
+            "description": "Create Mercadopago payment links. Requiers 'MERCADOPAGO_ACCESS_TOKEN' and installing 'mercadopago'."
+        },
+
+        {   "type": "process",
+            "name": "markdown_to_pdf",
+            "function": "fn:markdown_to_pdf",
+            "description": "Turn markdown to PDF format. Requiers 'wkhtmltopdf' and 'pdfkit' to be installed. Last message in list given to this process must contain 'markdown' and 'title' fields. Returns pdf_file_path."
+        },
+
+        {
+            "type": "tool",
+            "name": "weather_search",
+            "inputs": {
+                "location": "The name of the location to query weather for.",
+                "unit": "The unit system for temperature ('metric', 'imperial', 'standard')."
+              },
+            "outputs": {
+                "temperature": "Current temperature in the specified unit.",
+                "condition": "Current weather condition.",
+                "wind_speed": "Current wind speed.",
+                "location_name": "Resolved name of the location."
+              },
+            "function": "fn:weather_query",
+            "description": "Get weather data for a specified location. Requires 'WEATHER_API_KEY' for 'http://api.weatherapi.com'."
+        },
+
+        {
+            "type": "process",
+            "name": "get_google_doc",
+            "function": "fn:read_google_doc",
+            "description": "Retrieve full text from a specified Google Document. Requires 'GOOGLE_DRIVE_API' and the 'GOOGLE_DOC_ID'."
         }
+        
+
     ]
 }
