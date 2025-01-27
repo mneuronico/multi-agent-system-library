@@ -1988,6 +1988,8 @@ class AgentSystemManager:
         base_url = "https://raw.githubusercontent.com/mneuronico/multi-agent-system-library/main/lib"
         url = f"{base_url}/{filename_no_ext}.json"
 
+        print(f"Trying to fetch {filename_no_ext} from GitHub...")
+
         resp = requests.get(url)
         if resp.status_code == 200:
             # Save to a temp file
@@ -2789,8 +2791,18 @@ class AgentSystemManager:
         name = component.get("name")
         description = component.get("description")
 
-        if not component_type or not name:
-            raise ValueError("Component must have a 'type' and a 'name'.")
+        if not component_type:
+            raise ValueError("Component must have a 'type'.")
+        
+        if not name:
+            if component_type == "agent":
+                name = self._generate_agent_name()
+            elif component_type == "automation":
+                name = self._generate_automation_name()
+            else:
+                raise ValueError(
+                    f"Component type '{component_type}' must have a 'name'."
+                )
 
         if component_type == "agent":
             agent_name = self.create_agent(
@@ -2924,8 +2936,6 @@ class AgentSystemManager:
     def _fetch_github_py_if_exists(self, filename_no_ext: str) -> Optional[str]:
         base_url = "https://raw.githubusercontent.com/mneuronico/multi-agent-system-library/main/lib"
         url = f"{base_url}/{filename_no_ext}.py"
-
-        print("trying to find py in github", url)
 
         resp = requests.get(url)
         if resp.status_code == 200:
