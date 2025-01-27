@@ -1,14 +1,14 @@
-import requests
-from googleapiclient.discovery import build
-from youtube_transcript_api import YouTubeTranscriptApi
-import pytz
+
+
+
+
 import mercadopago
 from datetime import datetime, timedelta, timezone
-import markdown
-import pdfkit
 import os
 
 def read_google_doc(manager, messages):
+    import requests
+
     api_key = manager.get_key("GOOGLE_DRIVE_API")
     doc_id = manager.get_key("GOOGLE_DOC_ID")
     
@@ -35,6 +35,8 @@ def read_google_doc(manager, messages):
         return {"doc_text": f"Error: {response.status_code}, {response.text}"}
 
 def weather_query(manager, location: str, unit: str = "metric") -> tuple:
+    import requests
+
     API_KEY = manager.get_key("WEATHER_API_KEY")
     BASE_URL = "http://api.weatherapi.com/v1/current.json"
 
@@ -67,6 +69,10 @@ def weather_query(manager, location: str, unit: str = "metric") -> tuple:
         return (None, "Unavailable", None, location)
 
 def markdown_to_pdf(messages):
+    import markdown
+    import pdfkit
+    import os
+
     md_text = messages[-1]["message"]["markdown"]
 
     title = messages[-1]["message"]["title"]
@@ -110,6 +116,9 @@ def markdown_to_pdf(messages):
     return {"pdf_file_path": output_file}
 
 def create_payment_url(manager, name, price, currency, qty):
+    import mercadopago
+    from datetime import datetime, timedelta, timezone
+
     ACCESS_TOKEN = manager.get_key("MERCADOPAGO_ACCESS_TOKEN")
     sdk = mercadopago.SDK(ACCESS_TOKEN)
 
@@ -134,6 +143,8 @@ def create_payment_url(manager, name, price, currency, qty):
     return {"payment_url": url}
 
 def get_video_transcript(video_id):
+    from youtube_transcript_api import YouTubeTranscriptApi
+
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         # Combine all transcript parts into a single string
@@ -143,6 +154,8 @@ def get_video_transcript(video_id):
         return f"Could not retrieve transcript."
 
 def youtube_search(manager, query, max_results=3):
+    from googleapiclient.discovery import build
+
     YOUTUBE_API_SERVICE_NAME = 'youtube'
     YOUTUBE_API_VERSION = 'v3'
     API_KEY = manager.get_key('YOUTUBE_API_KEY')
@@ -173,9 +186,15 @@ def youtube_search(manager, query, max_results=3):
     return results
 
 def get_current_date(messages):
+    from datetime import datetime, timedelta, timezone
+
     return {"current_date": str(datetime.now(timezone.utc))}
 
 def get_calendar(manager, start_date: str, end_date: str, calendar_id: str):
+    from datetime import datetime, timezone
+    import pytz
+    from googleapiclient.discovery import build
+
     # Convertir fechas de string a objetos timezone-aware
     timezone = pytz.UTC
     start_datetime = timezone.localize(datetime.strptime(start_date, "%Y-%m-%d"))
@@ -217,6 +236,8 @@ def get_calendar(manager, start_date: str, end_date: str, calendar_id: str):
         return {"error": str(e)}
     
 def find_food_places(manager, radius, keyword, location):
+    import requests
+
     google_api_key = manager.get_key("PLACES_API_KEY")
     lat, lng = get_lat_lng(google_api_key, address=location)
     location = f"{lat},{lng}"  # Formato "latitud,longitud"
@@ -249,9 +270,8 @@ def find_food_places(manager, radius, keyword, location):
     return {"search_results": results}
 
 def get_lat_lng(api_key, address):
-    """
-    Obtiene latitud y longitud a partir de una dirección usando la API de Google Maps Geocoding.
-    """
+    import requests
+
     endpoint = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {
         "key": api_key,
@@ -272,9 +292,8 @@ def get_lat_lng(api_key, address):
         raise Exception(f"La solicitud a la API falló con el código de estado {response.status_code}")
     
 def get_place_details(api_key, place_id):
-    """
-    Obtiene información detallada sobre un lugar específico usando su Place ID.
-    """
+    import requests
+    
     endpoint = "https://maps.googleapis.com/maps/api/place/details/json"
     params = {
         "key": api_key,
