@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import inspect
 import datetime
 from zoneinfo import ZoneInfo
+from importlib import resources
 
 class Component:
     def __init__(self, name: str):
@@ -1972,7 +1973,7 @@ class AgentSystemManager:
                 resolved_json_path = candidate_local
             else:
                 short_name = os.path.splitext(os.path.basename(file_part))[0]
-                resolved_json_path = self._fetch_github_json_if_exists(short_name)
+                resolved_json_path = self._load_local_json_if_exists(short_name)
         else:
             if os.path.exists(file_part):
                 resolved_json_path = file_part
@@ -1983,24 +1984,21 @@ class AgentSystemManager:
 
         temp_manager = AgentSystemManager(config_json=resolved_json_path)
         self._merge_imported_components(temp_manager, components)
-    
-    def _fetch_github_json_if_exists(self, filename_no_ext: str) -> str:
-        base_url = "https://raw.githubusercontent.com/mneuronico/multi-agent-system-library/main/lib"
-        url = f"{base_url}/{filename_no_ext}.json"
 
-        print(f"Trying to fetch {filename_no_ext} from GitHub...")
+    def _load_local_json_if_exists(self, filename_no_ext: str) -> str:
+        json_file_name = f"{filename_no_ext}.json"
 
-        resp = requests.get(url)
-        if resp.status_code == 200:
-            # Save to a temp file
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-            tmp_file.write(resp.content)
-            tmp_file.flush()
-            tmp_file.close()
-            return tmp_file.name
-        else:
+        try:
+            file_text = resources.read_text("mas.lib", json_file_name)
+        except FileNotFoundError:
             return None
-
+        
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        tmp_file.write(file_text.encode("utf-8"))
+        tmp_file.flush()
+        tmp_file.close()
+        return tmp_file.name
+    
     def _merge_imported_components(self, other_mgr, only_names):
 
         # 1) Agents
@@ -2900,7 +2898,7 @@ class AgentSystemManager:
                 resolved_path = candidate_local
             else:
                 short_name = os.path.splitext(os.path.basename(file_path))[0]
-                fetched = self._fetch_github_py_if_exists(short_name)
+                fetched = self._load_local_py_if_exists(short_name)
                 if fetched:
                     resolved_path = fetched
         else:
@@ -2924,19 +2922,20 @@ class AgentSystemManager:
             raise AttributeError(f"Function '{function_name}' not found in '{resolved_path}'.")
         return getattr(module, function_name)
     
-    def _fetch_github_py_if_exists(self, filename_no_ext: str) -> Optional[str]:
-        base_url = "https://raw.githubusercontent.com/mneuronico/multi-agent-system-library/main/lib"
-        url = f"{base_url}/{filename_no_ext}.py"
+    def _load_local_py_if_exists(self, filename_no_ext: str) -> str:
+        py_file_name = f"{filename_no_ext}.py"
 
-        resp = requests.get(url)
-        if resp.status_code == 200:
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
-            tmp_file.write(resp.content)
-            tmp_file.flush()
-            tmp_file.close()
-            return tmp_file.name
-        return None
+        try:
+            file_text = resources.read_text("mas.lib", py_file_name)
+        except FileNotFoundError:
+            return None
 
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
+        tmp_file.write(file_text.encode("utf-8"))
+        tmp_file.flush()
+        tmp_file.close()
+        return tmp_file.name
+        
     def _resolve_automation_sequence(self, sequence):
         """
         Resolve a sequence in an automation, including control flow objects.
