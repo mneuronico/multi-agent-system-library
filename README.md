@@ -613,7 +613,7 @@ The `mas` package includes a Standard Library of tools, processes and functions 
 }
 ```
 
-You may also import it as `std.py`. In general, any `.json` file you try to import, or any `.py` file you try to use, if not an absolute path and not found in your `base_directory`, will be looked for in the `lib` folder of this project's GitHub. This is where you'll be able to find all standard functions and components. If you don't want to import all components from `std`, you may choose specific ones, just like you do with any other import:
+You may also import it as `std.py`. In general, any `.json` file you try to import, or any `.py` file you try to use, if not an absolute path and not found in your `base_directory`, will be looked for in the `lib` subfolder. This is where you'll be able to find all standard functions and components. If you don't want to import all components from `std`, you may choose specific ones, just like you do with any other import:
 
 ```json
 {
