@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="mas",
-    version="0.1.7",
+    version="0.1.8",
     license="MIT",
     packages=find_packages(),
     install_requires=[

@@ -2892,28 +2892,19 @@ class AgentSystemManager:
             ext = ".py"
             file_path = base_name + ext
 
-        print("loading function from file", file_path)
-
         resolved_path = None
         if not os.path.isabs(file_path):
-            print("not abs")
             candidate_local = os.path.join(self.base_directory, file_path)
             candidate_local = os.path.normpath(candidate_local)
             if os.path.exists(candidate_local):
                 resolved_path = candidate_local
-                print("exists in base", resolved_path)
             else:
                 short_name = os.path.splitext(os.path.basename(file_path))[0]
-                print("not in base", short_name)
                 fetched = self._fetch_github_py_if_exists(short_name)
-                print("fetched", fetched)
                 if fetched:
                     resolved_path = fetched
         else:
-            # Absolute path
-            print("is abs")
             if os.path.exists(file_path):
-                print("exists", file_path)
                 resolved_path = file_path
 
         if not resolved_path:
