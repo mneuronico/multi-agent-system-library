@@ -1,0 +1,21 @@
+{
+    "general_parameters": {
+        "functions": "std"
+    },
+    "components": [
+        {
+        "type": "tool",
+        "name": "place_finder",
+        "inputs": {
+            "radius": "Search radius in meters.",
+            "keyword": "Query to search for in Google Places, according to the user's request.",
+            "location": "Location to search for the query, specific enough and matching user's request if specified. If not specified, default to Buenos Aires, Argentina."
+        },
+        "outputs": {
+            "search_response": "List of places found by Google Places. Each element is an object with the following fields: 'name', 'formatted_address', 'rating' (average rating), 'user_ratings_total' (number of user ratings), 'price_level', 'opening_hours', 'open_now', 'phone_number', 'website', 'editorial_summary' (a general summary of the place) and 'reviews'. Some of these fields might not be available."
+        },
+        "function": "fn:find_food_places",
+        "description": "Find places using Google Places. Requiers an API key for Google Places in the API key file, named 'PLACES_API_KEY'"
+        }
+    ]
+}
