@@ -246,6 +246,7 @@ You can refer to functions with strings anywhere you can use functions throughou
 - `"<your_file.py>:<your_function_name>"`: The system will look for the specified file inside the `base_directory`, and then look for the specified function inside that file.
 - `"<path/to/your_file.py>:<your_function_name>"`: The system will look for the specified file in the absolute path provided, and then look for the specified function inside that file.
 
+In all of these cases, the `.py` extension is optional, the system will look for a `.py` file with the specified name regardless of whether the extension was included in the string.
 
 You can accomplish the same thing when defining the system from a JSON file:
 
@@ -598,6 +599,29 @@ When importing a component directly in an automation step, the string must be re
 
 Component names must be unique across all imports and local components. Duplicate names will throw an error.
 
+In all of these cases, the `.json` file extension is optional. The system will try to find a `.json` file with the specified name regardless of whether the extension was included in the string.
+
+### The `mas` Standard Library
+
+The `mas` package includes a Standard Library of tools, processes and functions that you can use out-of-the-box without having to write them yourself. To use them, you just need to import the standard library's components like so:
+
+```json
+{
+    "general_parameters": {
+        "imports": "std"
+    }
+}
+```
+
+You may also import it as `std.py`. In general, any `.json` file you try to import, or any `.py` file you try to use, if not an absolute path and not found in your `base_directory`, will be looked for in the `lib` folder of this project's GitHub. This is where you'll be able to find all standard functions and components. If you don't want to import all components from `std`, you may choose specific ones, just like you do with any other import:
+
+```json
+{
+    "general_parameters": {
+        "imports": "std?[comp1, comp2]"
+    }
+}
+```
 
 ### Linking Components
 

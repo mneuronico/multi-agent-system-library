@@ -11,6 +11,7 @@ import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import re
+import tempfile
 import requests
 from dotenv import load_dotenv
 import inspect
@@ -1958,12 +1959,45 @@ class AgentSystemManager:
                     # "?[ ]" was empty: no specific components => None => import all
                     components = None
 
+        base, ext = os.path.splitext(file_part)
+        if not ext:
+            ext = ".json"
+            file_part = base + ext
+        
+        resolved_json_path = None
         if not os.path.isabs(file_part):
-            file_part = os.path.join(self.base_directory, file_part)
-            file_part = os.path.normpath(file_part)
+            candidate_local = os.path.join(self.base_directory, file_part)
+            candidate_local = os.path.normpath(candidate_local)
+            if os.path.exists(candidate_local):
+                resolved_json_path = candidate_local
+            else:
+                short_name = os.path.splitext(os.path.basename(file_part))[0]
+                resolved_json_path = self._fetch_github_json_if_exists(short_name)
+        else:
+            if os.path.exists(file_part):
+                resolved_json_path = file_part
 
-        temp_manager = AgentSystemManager(config_json=file_part)
+        if not resolved_json_path:
+            raise FileNotFoundError(f"Could not locate JSON file for '{file_part}' "
+                                    f"locally or in GitHub 'lib' folder.")
+
+        temp_manager = AgentSystemManager(config_json=resolved_json_path)
         self._merge_imported_components(temp_manager, components)
+    
+    def _fetch_github_json_if_exists(self, filename_no_ext: str) -> str:
+        base_url = "https://raw.githubusercontent.com/mneuronico/multi-agent-system-library/main/lib"
+        url = f"{base_url}/{filename_no_ext}.json"
+
+        resp = requests.get(url)
+        if resp.status_code == 200:
+            # Save to a temp file
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+            tmp_file.write(resp.content)
+            tmp_file.flush()
+            tmp_file.close()
+            return tmp_file.name
+        else:
+            return None
 
     def _merge_imported_components(self, other_mgr, only_names):
 
@@ -2715,9 +2749,19 @@ class AgentSystemManager:
         self.default_models = general_params.get("default_models", self.default_models)
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
-        self.imports = general_params.get("imports", [])
         self.include_timestamp = general_params.get("include_timestamp", False)
         self.timezone = general_params.get("timezone", 'UTC')
+
+        imports = general_params.get("imports")
+
+        if not imports:
+            self.imports = []
+        elif isinstance(imports, str):
+            self.imports = [imports]
+        elif isinstance(imports, list):
+            self.imports = imports
+        else:
+            raise ValueError(f"Imports must be list or string")
 
         if isinstance(self.functions, str):
             self.functions = [self.functions]
@@ -2820,15 +2864,8 @@ class AgentSystemManager:
             func_name = ref[3:].strip()
             # Try each file in self.functions in order
             for candidate_path in self.functions:
-                if not os.path.isabs(candidate_path):
-                    candidate_path_abs = os.path.join(self.base_directory, candidate_path)
-                else:
-                    candidate_path_abs = candidate_path
-
-                if not os.path.exists(candidate_path_abs):
-                    continue
                 try:
-                    return self._load_function_from_file(candidate_path_abs, func_name)
+                    return self._load_function_from_file(candidate_path, func_name)
                 except AttributeError:
                     pass
 
@@ -2837,22 +2874,67 @@ class AgentSystemManager:
         raise ValueError(f"Invalid function reference '{ref}'. Must be 'file.py:func' or 'fn:func'.")
 
     def _load_function_from_file(self, file_path: str, function_name: str) -> Callable:
-        if not os.path.isabs(file_path):
-            file_path = os.path.join(self.base_directory, file_path)
 
-        if file_path not in self._function_cache:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Cannot find function file: {file_path}")
-            spec = importlib.util.spec_from_file_location(f"dynamic_{id(self)}", file_path)
+        base_name, ext = os.path.splitext(file_path)
+        if not ext:
+            ext = ".py"
+            file_path = base_name + ext
+
+        print("loading function from file", file_path)
+
+        resolved_path = None
+        if not os.path.isabs(file_path):
+            print("not abs")
+            candidate_local = os.path.join(self.base_directory, file_path)
+            candidate_local = os.path.normpath(candidate_local)
+            if os.path.exists(candidate_local):
+                resolved_path = candidate_local
+                print("exists in base", resolved_path)
+            else:
+                short_name = os.path.splitext(os.path.basename(file_path))[0]
+                print("not in base", short_name)
+                fetched = self._fetch_github_py_if_exists(short_name)
+                print("fetched", fetched)
+                if fetched:
+                    resolved_path = fetched
+        else:
+            # Absolute path
+            print("is abs")
+            if os.path.exists(file_path):
+                print("exists", file_path)
+                resolved_path = file_path
+
+        if not resolved_path:
+            raise FileNotFoundError(f"Cannot find Python file for '{file_path}' locally or on GitHub.")
+
+
+        if resolved_path not in self._function_cache:
+            if not os.path.exists(resolved_path):
+                raise FileNotFoundError(f"Cannot find function file: {resolved_path}")
+            spec = importlib.util.spec_from_file_location(f"dynamic_{id(self)}", resolved_path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            self._function_cache[file_path] = mod
+            self._function_cache[resolved_path] = mod
 
-        module = self._function_cache[file_path]
+        module = self._function_cache[resolved_path]
         if not hasattr(module, function_name):
-            raise AttributeError(f"Function '{function_name}' not found in '{file_path}'.")
+            raise AttributeError(f"Function '{function_name}' not found in '{resolved_path}'.")
         return getattr(module, function_name)
     
+    def _fetch_github_py_if_exists(self, filename_no_ext: str) -> Optional[str]:
+        base_url = "https://raw.githubusercontent.com/mneuronico/multi-agent-system-library/main/lib"
+        url = f"{base_url}/{filename_no_ext}.py"
+
+        print("trying to find py in github", url)
+
+        resp = requests.get(url)
+        if resp.status_code == 200:
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
+            tmp_file.write(resp.content)
+            tmp_file.flush()
+            tmp_file.close()
+            return tmp_file.name
+        return None
 
     def _resolve_automation_sequence(self, sequence):
         """
