@@ -45,7 +45,8 @@ class Agent(Component):
         negative_filter: Optional[List[str]] = None,
         general_system_description: str = "",
         model_params: Optional[Dict[str, Any]] = None,
-        include_timestamp: bool = False
+        include_timestamp: bool = False,
+        description: str = None
     ):
         super().__init__(name)
         self.system_prompt = system_prompt
@@ -62,6 +63,7 @@ class Agent(Component):
         self.general_system_description = general_system_description
         self.model_params = model_params or {}
         self.include_timestamp = include_timestamp
+        self.description = description if description else "Agent"
 
     def to_string(self) -> str:
         return (
@@ -71,6 +73,7 @@ class Agent(Component):
             f"Default Output: {self.default_output}\n"
             f"Positive Filter: {self.positive_filter}\n"
             f"Negative Filter: {self.negative_filter}\n"
+            f"Description: {self.description}"
         )
 
     def run(
@@ -723,7 +726,8 @@ class Tool(Component):
         inputs: Dict[str, str],
         outputs: Dict[str, str],
         function: Callable,
-        default_output: Optional[Dict[str, Any]] = None
+        default_output: Optional[Dict[str, Any]] = None,
+        description: str = None
     ):
 
         super().__init__(name)
@@ -731,6 +735,7 @@ class Tool(Component):
         self.outputs = outputs
         self.function = function
         self.default_output = default_output or {}
+        self.description = description if description else "Tool"
 
         # Check if function expects manager
         sig = inspect.signature(function)
@@ -755,6 +760,7 @@ class Tool(Component):
             f"Inputs: {self.inputs}\n"
             f"Outputs: {self.outputs}\n"
             f"Default Output: {self.default_output}\n"
+            f"Description: {self.description}"
         )
 
     def run(
@@ -1059,9 +1065,10 @@ class Tool(Component):
 
 class Process(Component):
 
-    def __init__(self, name: str, function: Callable):
+    def __init__(self, name: str, function: Callable, description: str = None):
         super().__init__(name)
         self.function = function
+        self.description = description if description else "Process"
 
         # Check if function expects manager
         sig = inspect.signature(function)
@@ -1085,7 +1092,7 @@ class Process(Component):
             )
 
     def to_string(self) -> str:
-        return f"Name: {self.name}"
+        return f"Name: {self.name}\nDescription: {self.description}"
 
     def run(
         self,
@@ -1372,12 +1379,13 @@ class Process(Component):
         return self._transform_to_message_list(final_chosen)
 
 class Automation(Component):
-    def __init__(self, name: str, sequence: List[Union[str, dict]]):
+    def __init__(self, name: str, sequence: List[Union[str, dict]], description: str = None):
         super().__init__(name)
         self.sequence = sequence
+        self.description = description if description else "Automation"
 
     def to_string(self) -> str:
-        return f"Name: {self.name}\nSequence: {self.sequence}\n"
+        return f"Name: {self.name}\nSequence: {self.sequence}\nDescription: {self.description}"
 
     def run(self, verbose: bool = False, on_update: Optional[Callable] = None, on_update_params: Optional[Dict] = None) -> Dict:
         if verbose:
@@ -1843,7 +1851,16 @@ class AgentSystemManager:
         self.parser = Parser()
 
         self.default_models = default_models
-        self.imports = imports or []
+
+        if not imports:
+            self.imports = []
+        elif isinstance(imports, str):
+            self.imports = [imports]
+        elif isinstance(imports, list):
+            self.imports = imports
+        else:
+            raise ValueError(f"Imports must be list or string")
+
         self._processed_imports = set()
 
         self.include_timestamp = include_timestamp
@@ -1879,6 +1896,13 @@ class AgentSystemManager:
         self._load_api_keys()
 
         self._process_imports()
+
+        if hasattr(self, 'pending_links'):
+            for agent_name, tool_name in self.pending_links:
+                try:
+                    self.link(agent_name, tool_name)
+                except ValueError as e:
+                    print(f"Warning: Could not link agent '{agent_name}' to tool '{tool_name}'. Error: {e}")
 
         self._last_known_update = None
 
@@ -2343,7 +2367,8 @@ class AgentSystemManager:
         positive_filter: Optional[List[str]] = None,
         negative_filter: Optional[List[str]] = None,
         model_params: Optional[Dict[str, Any]] = None,
-        include_timestamp: Optional[bool] = None
+        include_timestamp: Optional[bool] = None,
+        description: str = None
     ):
         # Automatically assign name if not provided
         if name is None:
@@ -2377,7 +2402,8 @@ class AgentSystemManager:
             negative_filter=negative_filter,
             general_system_description=self.general_system_description,
             model_params=model_params,
-            include_timestamp=include_timestamp if include_timestamp is not None else self.include_timestamp
+            include_timestamp=include_timestamp if include_timestamp is not None else self.include_timestamp,
+            description=description
         )
 
         agent.manager = self
@@ -2400,34 +2426,35 @@ class AgentSystemManager:
         inputs: Dict[str, str],
         outputs: Dict[str, str],
         function: Callable,
-        default_output: Optional[Dict[str, Any]] = None
+        default_output: Optional[Dict[str, Any]] = None,
+        description: str = None
     ):
         if name in self.tools:
             raise ValueError(f"[Manager] Tool '{name}' already exists.")
-        t = Tool(name, inputs, outputs, function, default_output)
+        t = Tool(name, inputs, outputs, function, default_output, description)
         t.manager = self
         self.tools[name] = t
         self._component_order.append(name)
 
         return name
 
-    def create_process(self, name: str, function: Callable):
+    def create_process(self, name: str, function: Callable, description: str = None):
         if name in self.processes:
             raise ValueError(f"[Manager] Process '{name}' already exists.")
-        p = Process(name, function)
+        p = Process(name, function, description)
         p.manager = self
         self.processes[name] = p
         self._component_order.append(name)
         return name
 
-    def create_automation(self, name: Optional[str] = None, sequence: List[Union[str, dict]] = None):
+    def create_automation(self, name: Optional[str] = None, sequence: List[Union[str, dict]] = None, description: str = None):
         if name is None:
             name = self._generate_automation_name()
 
         if name in self.automations:
             raise ValueError(f"Automation '{name}' already exists.")
 
-        automation = Automation(name=name, sequence=sequence)
+        automation = Automation(name=name, sequence=sequence, description=description)
         automation.manager = self
         self.automations[name] = automation
         self._component_order.append(name)
@@ -2713,17 +2740,10 @@ class AgentSystemManager:
             except ValueError as e:
                 print(f"Warning: Could not create link from '{input_component}' to '{output_component}'. Error: {e}")
 
-         # Process the stored links after components are created
-        if hasattr(self, 'pending_links'):
-            for agent_name, tool_name in self.pending_links:
-                try:
-                    self.link(agent_name, tool_name)
-                except ValueError as e:
-                    print(f"Warning: Could not link agent '{agent_name}' to tool '{tool_name}'. Error: {e}")
-
     def _create_component_from_json(self, component: dict):
         component_type = component.get("type")
         name = component.get("name")
+        description = component.get("description")
 
         if not component_type or not name:
             raise ValueError("Component must have a 'type' and a 'name'.")
@@ -2738,7 +2758,8 @@ class AgentSystemManager:
                 positive_filter=component.get("positive_filter"),
                 negative_filter=component.get("negative_filter"),
                 include_timestamp=component.get("include_timestamp"),
-                model_params=component.get("model_params")
+                model_params=component.get("model_params"),
+                description=description
             )
 
             # Store the link information to be processed later
@@ -2758,7 +2779,8 @@ class AgentSystemManager:
                 inputs=component.get("inputs", {}),
                 outputs=component.get("outputs", {}),
                 function=self._get_function_from_string(fn),
-                default_output=component.get("default_output", None)
+                default_output=component.get("default_output", None),
+                description=description
             )
 
         elif component_type == "process":
@@ -2767,13 +2789,15 @@ class AgentSystemManager:
                 raise ValueError("Process must have a 'function'.")
             self.create_process(
                 name=name,
-                function=self._get_function_from_string(fn)
+                function=self._get_function_from_string(fn),
+                description=description
             )
 
         elif component_type == "automation":
             self.create_automation(
                 name=name,
-                sequence=self._resolve_automation_sequence(component.get("sequence", []))
+                sequence=self._resolve_automation_sequence(component.get("sequence", [])),
+                description=description
             )
 
         else:
