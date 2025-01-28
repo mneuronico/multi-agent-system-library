@@ -1,11 +1,3 @@
-
-
-
-
-import mercadopago
-from datetime import datetime, timedelta, timezone
-import os
-
 def read_google_doc(manager, messages):
     import requests
 
