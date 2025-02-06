@@ -455,6 +455,8 @@ You can also define processes in the config JSON file:
 
 #### Automations
 
+Automations allow you to orchestrate multiple components (agents, tools, processes, and even other automations) in a structured workflow. An automation is defined by a name and a sequence of steps. Each step can either be a simple component name or a control flow dictionary (more on that below).
+
 ```python
 automation_name = manager.create_automation(
     name="myautomation",   # Optional, defaults to automation-<n>
@@ -490,33 +492,7 @@ automation_name = manager.create_automation(
 -   **`name`**: The name of the automation.  If not specified, defaults to `automation-<n>`.
 -   **`sequence`**: An ordered list of steps to execute. Steps can be:
     -   A string representing a component name, with an optional input specification (more on **`mas` input syntax** below).
-    -   A control flow dictionary with the following structure:
-        -   `control_flow_type`:  `"branch"`, `"while"`, or `"for"`.
-        -   For `"branch"`:
-            -   `condition`: A boolean, or a string to evaluate as boolean, or a dict. The syntax to specify conditional statements will be covered below.
-            -   `if_true`: A list of steps to execute if `condition` is `True` (steps can be themselves control flow types).
-            -   `if_false`: A list of steps to execute if `condition` is `False`.
-        -   For `"while"`:
-            -   `start_condition`: A boolean or a string or a dict.  If `True`, the first iteration is executed. if omitted, the first iteration is executed.
-            -   `end_condition`: A boolean or a string to evaluate as boolean, or a dict.
-            -   `body`:  A list of steps to execute in each iteration.
-        -   For `"for"`:
-            -   `items`: Required. Defines what to iterate over. Each time a loop starts, the current item will be added to the message history, under the role of "iterator", wrapped in a dictionary with two fields ("item_number" as the cycle number and "item" as the current item). This field can be:
-                - `numeric range`: A single integer n is taken to be the range [0, n). An array of two numeric elements [a, b] is taken to be the range [a, b). An array of three numeric elements [a, b, c] is taken to be a range from a to b in steps of c.
-                - `component reference`: Using `mas input syntax` (see below) you can iterate through data produced by a previous component. The input defined here can be of the following types:
-                    - `single message`: If the message contains more than one field, the iterator will execute one step per field, wrapping it in a dict with fields "key" and "value", with the key and value of the current dictionary item. If the message contains only one field, the iterator will try to resolve that field as one of the other types.
-                    - `single number or list of two or three numbers`: This type of field is resolved to a numeric range.
-                    - `list of arbitrary length and types`: The iterator executes one step per element.
-                    - `dictionary`: Treats it the same way as a single message, which is itself a dictionary.
-                A component reference can never refer to more than one message, as this is ill-defined for item iteration and will result in an exception.
-            -   `body`: A list of steps (components or control-flow elements) to execute in each iteration.
-        -   For `"switch"`:
-            -   `value`: The comparison value source, can be:
-                - Literal value (string/number/boolean)
-                - MAS input syntax reference (e.g. `":my_agent?[field]"`), which must resolve to a single value to use in the switch statement.
-            -   `cases`: Ordered list of potential matches, each containing:
-                - `case`: Comparison value (use "default" for catch-all)
-                - `body`: Steps to execute on match
+    -   A control flow dictionary (`"branch"`, `"while"`, `"for"`, or `"switch"`) - for more details, please refer to the section below.
 
 Defining an automation in the config JSON file is as simple as including it in the list of components, just like any other component:
 
@@ -557,6 +533,203 @@ Defining an automation in the config JSON file is as simple as including it in t
 ```
 
 Note that these examples use the `mas input syntax`, which will be explained below.
+
+### Control Flow Statements
+
+Control flow statements give you the ability to introduce decision points, loops, and iterations into your automation workflows. They come in several types: `branch`, `while`, `for`, and `switch`. Each type supports specific keys and behaviors to control the execution of the automation sequence.
+
+#### Branch Statements
+
+A branch statement allows you to choose between two different sets of steps based on a condition.
+
+**Structure:**
+
+```json
+{
+  "control_flow_type": "branch",
+  "condition": "my_condition",
+  "if_true": ["comp1", "comp2"],
+  "if_false": ["comp3", "comp4"]
+}
+```
+
+**Parameters:**
+
+-  **`condition`**: This can be a literal boolean (true or false), a string that will be evaluated as a boolean (for example, by refering to a field produced by a previous component that is itself a boolean) or a dictionary for advanced conditional evaluations. Details on conditionals will be provided in the `MAS input syntax` section.
+-  **`if_true`**: A list of steps (components or nested control flow statements) to execute if the condition evaluates to true.
+-  **`if_false`**: A list of steps to execute if the condition evaluates to false.
+
+**Example:**
+
+```json
+"sequence": [
+  "decider",
+  {
+    "control_flow_type": "branch",
+    "condition": ":decider?is_tool_needed",
+    "if_true": ["a_tool", "a_process"],
+    "if_false": ["an_agent"]
+  }
+]
+```
+
+#### While Loops
+
+A while loop enables repeated execution of a set of steps until a specified condition is met.
+
+**Structure:**
+
+```json
+{
+  "control_flow_type": "while",
+  "start_condition": "condition1",
+  "end_condition": "condition2",
+  "body": ["comp1", "comp2"]
+}
+```
+
+**Parameters:**
+
+- **`start_condition`**: A conditional (boolean, string, or dict) that determines whether to run the first iteration. If omitted, the first iteration will run by default.
+- **`end_condition`**: A conditional (boolean, string, or dict) that is evaluated before each iteration. When it evaluates to `true`, the loop stops.
+- **`body`**: A list of steps to execute on each iteration of the loop.
+
+**Example:**
+
+```json
+"sequence": [
+  {
+    "control_flow_type": "while",
+    "start_condition": true,
+    "end_condition": ":loop_decider?[is_process_complete]",
+    "body": [
+      "some_agent",
+      "some_tool",
+      "loop_decider"
+    ]
+  }
+]
+```
+
+#### 3. For Loops
+
+A for loop iterates over a collection of items, executing a body of steps for each item.
+
+**Structure:**
+
+```json
+{
+  "control_flow_type": "for",
+  "items": "my_input_items",
+  "body": ["comp1", "comp2"]
+}
+```
+
+**Parameters:**
+
+- **`items`**: Defines what to iterate over. This can be:
+  - **A numeric range**:
+    - A single integer `n` is interpreted as the range `[0, n)`.
+    - An array `[a, b]` defines the range from `a` to `b` (including a, excluding b).
+    - An array `[a, b, c]` defines the range from `a` to `b` in steps of `c`.
+  - **A component reference (via MAS input syntax)**:
+    - Single message, list, or dictionary fields can be used for iteration.
+- **`body`**:  
+  A list of steps to execute on each iteration.
+
+Each time a cycle of the for loop starts, the current item will be added to the message history, under the role of `"iterator"`, wrapped in a dictionary with two fields (`"item_number"` as the cycle number and `"item"` as the current item). These messages behave just like any other message in the history, and allow components inside the loop to easily access the current item being processed, by referring to the latest `iterator` message using `MAS input syntax`.
+
+When using a component reference in the `items` field, these are the possible references you can make and the expected behavior for each:
+
+- **`single message`**: If the input string used in `items` refers to a single message, but this message contains more than one field, the iterator will execute one cycle per field, wrapping each item in a dictionary with fields `"key"` and `"value"`, with the key and value of the current dictionary item. If the message contains only one field, the iterator will assume the content of this field is the object which must be iterated over, and will try to resolve that field as one of the following types.
+- **`single number or list of two or three numbers`**: If the field referred to is a number or a list of at most 3 numbers, it will be interpreted as a numeric range, as described above. This is useful when loops must be ran a certain number of times, but than number is not known in advanced but defined by a component.
+- **`list of arbitrary length and types`**: If the field referred to is a list, the iterator will execute one cycle per element.
+- **`dictionary`**: If the field referred to is itself a dictionary, the iterator treats it the the same way as a single message. If it has more than one field, it iterates through those fields. Else, checks the inner field recursively.
+
+A component reference inside the `items` field can never refer to more than one message, as this is ill-defined for item iteration and will result in an exception.
+
+
+**Example:**
+
+```json
+"sequence": [
+  "question_generator",
+  {
+    "control_flow_type": "for",
+    "items": "question_generator?-1?[questions]",
+    "body": [
+      "question_responder:(iterator?-1)"
+    ]
+  }
+]
+```
+
+In this example, we assume that `question_generator` is an agent which produces a list of questions. Then, we use a `for` loop to iterate through the list named `questions` inside the latest `question_generator` message. For each question, a `question_responder` agent takes as input the latest `iterator` message (which corresponds to the current item being processed, in this case, the current question) and produces a response for that question. The specifics of the `MAS input syntax` used in this example will be explained below.
+
+
+#### 4. Switch Statements
+
+A switch statement selects one out of several possible branches based on the value of an expression. This is useful, for example, when trying to decide on a set of predefined actions.
+
+**Structure:**
+
+```json
+{
+  "control_flow_type": "switch",
+  "value": "reference_to_switched_value",
+  "cases": [
+    {
+      "case": "case1",
+      "body": [ "comp1", "comp2"]
+    },
+    {
+      "case": "case2",
+      "body": [ "comp3", "comp4"]
+    },
+    {
+      "case": "default",
+      "body": ["comp5", "comp6"]
+    }
+  ]
+}
+```
+
+**Parameters:**
+
+- **`value`**: The source value for comparison. It can be a literal (string, number, boolean) or a MAS input syntax reference (e.g., `":my_agent?[field]"`) that must resolve to a single value.
+- **`cases`**:  
+  An ordered list of case objects, where each case contains:
+  - **`case`**: The value to compare against.
+  - **`body`**: A list of steps to execute if the value matches the case.
+  
+The special `case` value of `"default"` will catch any unmatched values.
+
+**Example:**
+
+```json
+"sequence": [
+  "selector",
+  {
+    "control_flow_type": "switch",
+    "value": ":selector?[action]",
+    "cases": [
+      {
+        "case": "weather",
+        "body": ["weather_tool", "weather_agent"]
+      },
+      {
+        "case": "news",
+        "body": ["news_tool", "news_agent"]
+      },
+      {
+        "case": "default",
+        "body": ["fallback_agent"]
+      }
+    ]
+  }
+]
+```
+
 
 ### Component Imports
 
