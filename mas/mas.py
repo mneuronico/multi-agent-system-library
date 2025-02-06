@@ -346,7 +346,7 @@ class Agent(Component):
                 
                 conversation.extend(subset)
 
-            conversation = self._transform_to_conversation(conversation, fields)
+            conversation = self._transform_to_conversation(conversation)
             
             conversation = [{"role": "system", "content": self.system_prompt}] + conversation
             return conversation
@@ -1648,10 +1648,15 @@ class Automation(Component):
 
     def _evaluate_condition(self, condition, current_output) -> bool:
 
+        print("in evaluate condition")
+
         db_conn = self.manager._get_user_db()
 
         if isinstance(condition, str):
+            print("is string")
             parsed = self.manager.parser.parse_input_string(condition)
+
+            print(parsed)
 
             if parsed["is_function"] and parsed["function_name"]:
                 input_data = self._gather_data_for_parser_result(parsed, db_conn)
@@ -2862,6 +2867,8 @@ class AgentSystemManager:
         if not ref:
             raise ValueError(f"Empty function reference.")
 
+        
+
         # If there's a colon that is not just "fn:", it's presumably 'file.py:func'
         if ":" in ref and not ref.startswith("fn:"):
             file_part, func_name = ref.rsplit(":", 1)
@@ -2884,6 +2891,8 @@ class AgentSystemManager:
         raise ValueError(f"Invalid function reference '{ref}'. Must be 'file.py:func' or 'fn:func'.")
 
     def _load_function_from_file(self, file_path: str, function_name: str) -> Callable:
+        if file_path == "":
+            raise FileNotFoundError(f"Empty file path found when trying to search for function: {function_name}")
 
         base_name, ext = os.path.splitext(file_path)
         if not ext:
@@ -3029,7 +3038,7 @@ class AgentSystemManager:
         if isinstance(condition, bool):
             return condition
         elif isinstance(condition, str):
-            if ":" in condition:
+            if ":" in condition and condition[0] != ":":
                 return self._get_function_from_string(condition)
             return condition
         elif isinstance(condition, dict):
