@@ -27,6 +27,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
+# Set telegram and related loggers to warning or error level
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 class Component:
