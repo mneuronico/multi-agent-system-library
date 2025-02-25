@@ -15,7 +15,7 @@ import tempfile
 import requests
 from dotenv import load_dotenv
 import inspect
-import datetime
+from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from importlib import resources
 import logging
@@ -1854,7 +1854,6 @@ class AgentSystemManager:
         
         if log_level is not None:
             logger.setLevel(log_level)
-        logger.debug("Manager initialized with log level: %s", logger.level)
 
         self._current_user_id: Optional[str] = None
         self._current_db_conn: Optional[sqlite3.Connection] = None
@@ -2184,7 +2183,7 @@ class AgentSystemManager:
         return max_num + 1
 
     def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict], type = "user", model: Optional[str] = None):
-        timestamp = datetime.datetime.now(self.timezone).isoformat()
+        timestamp = datetime.now(self.timezone).isoformat()
 
         if isinstance(content, dict):
             # Convert dict -> JSON, persisting non-JSON objects to files
