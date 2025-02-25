@@ -20,18 +20,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from importlib import resources
 import logging
 
-# Configure logging at the start of your application
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(message)s",
-    handlers=[logging.StreamHandler()]
-)
-
-# Set telegram and related loggers to warning or error level
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Optionally, add a handler just for your logger
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(handler)
 
 class Component:
     def __init__(self, name: str):
