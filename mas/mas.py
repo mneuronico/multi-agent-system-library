@@ -894,8 +894,16 @@ class Tool(Component):
                 raise IndexError(f"Requested index={target_index} but only {len(subset)} messages found.")
             role, content, msg_number, msg_type, timestamp = subset[target_index]
 
+
+        if isinstance(content, str):
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                pass
+        else:
+            data = content
+
         try:
-            data = json.loads(content)
             data = self.manager._load_files_in_dict(data)
 
             final_data = {}
@@ -937,14 +945,19 @@ class Tool(Component):
 
                     if subset:
                         role, content, msg_number, msg_type, timestamp = subset[-1]
-                        try:
-                            data = json.loads(content)
-                            data = self.manager._load_files_in_dict(data)
-                            if isinstance(data, dict):
-                                return data
-                            return {}
-                        except json.JSONDecodeError:
-                            return {}
+
+                        if isinstance(content, str):
+                            try:
+                                data = json.loads(content)
+                            except json.JSONDecodeError:
+                                data = content
+                        else:
+                            data = content
+
+                        data = self.manager._load_files_in_dict(data)
+                        if isinstance(data, dict):
+                            return data
+                        return {}
                     else:
                         return {}
                 else:
@@ -996,11 +1009,15 @@ class Tool(Component):
             return {}
 
         role, content, msg_number, msg_type, timestamp = subset[index]
-        try:
-            data = json.loads(content)
-            data = self.manager._load_files_in_dict(data)
-        except json.JSONDecodeError:
-            data = {}
+        if isinstance(content, str):
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                data = content
+        else:
+            data = content
+
+        data = self.manager._load_files_in_dict(data)
 
         if not isinstance(data, dict):
             return {}
@@ -1060,26 +1077,28 @@ class Tool(Component):
                 raise IndexError(f"Index={index} must be an integer for Tools.")
                 
             for (role, content, msg_number, msg_type, timestamp) in chosen:
-                try:
-                    data = json.loads(content)
-                    data = self.manager._load_files_in_dict(data)
-                    if not isinstance(data, dict):
-                        continue
-                    if fields:
-                        # subset the fields
-                        extracted = {}
-                        for f in fields:
-                            if f in data:
-                                extracted[f] = data[f]
-                        # merge
-                        final_input.update(extracted)
-                    else:
-                        # merge entire data
-                        final_input.update(data)
-                except json.JSONDecodeError:
-                    if verbose:
-                        logger.error(f"[Tool/Process:{self.name}] Error parsing message for '{comp_name}'.")
+                if isinstance(content, str):
+                    try:
+                        data = json.loads(content)
+                    except json.JSONDecodeError:
+                        data = content
+                else:
+                    data = content
+                    
+                data = self.manager._load_files_in_dict(data)
+                if not isinstance(data, dict):
                     continue
+                if fields:
+                    # subset the fields
+                    extracted = {}
+                    for f in fields:
+                        if f in data:
+                            extracted[f] = data[f]
+                    # merge
+                    final_input.update(extracted)
+                else:
+                    # merge entire data
+                    final_input.update(data)
 
         return final_input
 
@@ -1730,12 +1749,16 @@ class Automation(Component):
 
                     if filtered:
                         role, content, msg_number, msg_type, timestamp = filtered[-1]
-                        try:
-                            data = json.loads(content)
-                            data = self.manager._load_files_in_dict(data)
-                            return data
-                        except json.JSONDecodeError:
-                            return content
+                        if isinstance(content, str):
+                            try:
+                                data = json.loads(content)
+                            except json.JSONDecodeError:
+                                data = content
+                        else:
+                            data = content
+
+                        data = self.manager._load_files_in_dict(data)
+                        return data
                     else:
                         return None
                 else:
@@ -1800,11 +1823,15 @@ class Automation(Component):
 
         role, content, msg_number, msg_type, timestamp = subset[index_to_use]
 
-        try:
-            data = json.loads(content)
-            data = self.manager._load_files_in_dict(data)
-        except json.JSONDecodeError:
+        if isinstance(content, str):
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                data = content
+        else:
             data = content
+
+        data = self.manager._load_files_in_dict(data)
 
         if not isinstance(data, dict):
             return data
@@ -2297,9 +2324,12 @@ class AgentSystemManager:
         and replace with the actual object. Return the fully loaded structure.
         """
 
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        else:
             pass
 
         if isinstance(value, dict):
@@ -2363,9 +2393,12 @@ class AgentSystemManager:
 
         messages = []
         for role, content, msg_number, msg_type, model, timestamp in rows:
-            try:
-                content_data = json.loads(content)
-            except json.JSONDecodeError:
+            if isinstance(content, str):
+                try:
+                    content_data = json.loads(content)
+                except json.JSONDecodeError:
+                    content_data = content
+            else:
                 content_data = content
 
             messages.append({
