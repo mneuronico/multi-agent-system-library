@@ -16,8 +16,18 @@ import requests
 from dotenv import load_dotenv
 import inspect
 import datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from importlib import resources
+import logging
+
+# Configure logging at the start of your application
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(message)s",
+    handlers=[logging.StreamHandler()]
+)
+
+logger = logging.getLogger(__name__)
 
 class Component:
     def __init__(self, name: str):
@@ -89,7 +99,7 @@ class Agent(Component):
     ) -> dict:
 
         if verbose:
-            print(f"[Agent:{self.name}] .run() => reading conversation history from DB")
+            logger.debug(f"[Agent:{self.name}] .run() => reading conversation history from DB")
 
         db_conn = self.manager._get_user_db()
 
@@ -114,7 +124,7 @@ class Agent(Component):
             conversation = self._build_default_conversation(filtered_msgs, verbose)
 
         if verbose:
-            print(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2)}\n")
+            logger.debug(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2)}\n")
 
         # Now we call each model in self.models in order:
         for model_info in self.models:
@@ -124,7 +134,7 @@ class Agent(Component):
 
             if not api_key:
                 if verbose:
-                    print(f"[Agent:{self.name}] No API key for '{provider}'. Skipping.")
+                    logger.warning(f"[Agent:{self.name}] No API key for '{provider}'. Skipping.")
                 continue
 
             try:
@@ -169,21 +179,27 @@ class Agent(Component):
                 response_dict = self._extract_and_parse_json(response_str)
                 self._last_used_model = {"provider": provider, "model": model_name}
                 if verbose:
-                    print(f"[Agent:{self.name}] => success from provider={provider}\n{response_dict}")
+                    logger.debug(f"[Agent:{self.name}] => success from provider={provider}\n{response_dict}")
                 return response_dict
 
-            except Exception as e:
+            except requests.exceptions.RequestException as req_err:
                 if verbose:
-                    print(f"[Agent:{self.name}] => failed with provider={provider}, model={model_name}, error={e}")
+                    logger.error(f"[Agent:{self.name}] HTTP error with provider={provider}, model={model_name}: {req_err}")
+            except json.JSONDecodeError as json_err:
+                if verbose:
+                    logger.error(f"[Agent:{self.name}] JSON decoding error with provider={provider}, model={model_name}: {json_err}")
+            except ValueError as val_err:
+                if verbose:
+                    logger.error(f"[Agent:{self.name}] Value error with provider={provider}, model={model_name}: {val_err}")
 
         if verbose:
-            print(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self.default_output}")
+            logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self.default_output}")
         return self.default_output
 
 
     def _build_conversation_from_parser_result(self, parsed: dict, db_conn: sqlite3.Connection, verbose: bool) -> List[Dict[str, Any]]:
         if verbose:
-            print(f"[Agent:{self.name}] _build_conversation_from_parser_result => parsed={parsed}")
+            logger.debug(f"[Agent:{self.name}] _build_conversation_from_parser_result => parsed={parsed}")
 
         all_msgs = self.manager._get_all_messages(db_conn)
         filtered_msgs = self._apply_filters(all_msgs)
@@ -271,7 +287,7 @@ class Agent(Component):
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
             try:
                 data = json.loads(content)
-            except:
+            except json.JSONDecodeError:
                 data = content
 
             if isinstance(data, dict) and fields:
@@ -288,7 +304,7 @@ class Agent(Component):
                 try:
                     dt = datetime.fromisoformat(timestamp)
                     formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
-                except:
+                except (ValueError, TypeError):
                     formatted_ts = timestamp
 
                 compound_str = compound_str + f', timestamp: {formatted_ts}'
@@ -303,8 +319,6 @@ class Agent(Component):
 
         # Sort by msg_number to preserve chronological order
         conversation.sort(key=lambda e: e["msg_number"])
-
-        print(conversation)
 
         if not include_message_number:
             conversation = [{
@@ -338,7 +352,7 @@ class Agent(Component):
 
                 if not subset:
                     if verbose:
-                        print(f"[Agent:{self.name}] No messages found for component/user '{comp_name}'. Skipping.")
+                        logger.debug(f"[Agent:{self.name}] No messages found for component/user '{comp_name}'. Skipping.")
                     continue
 
                 subset = self._handle_index(index, subset)
@@ -357,7 +371,7 @@ class Agent(Component):
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
             try:
                 data = json.loads(content)
-            except:
+            except json.JSONDecodeError:
                 data = content
 
             if isinstance(data, dict) and fields:
@@ -518,7 +532,7 @@ class Agent(Component):
                 new_messages.append({"role": role, "content": content})
 
         if verbose:
-            print(f"[Agent:{self.name}] _call_openai_api => model={model_name} (params = {params})")
+            logger.debug(f"[Agent:{self.name}] _call_openai_api => model={model_name} (params = {params})")
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -566,7 +580,7 @@ class Agent(Component):
             new_messages.append({"role": role, "content": content})
 
         if verbose:
-            print(f"[Agent:{self.name}] _call_deepseek_api => model={model_name} (params = {params})")
+            logger.debug(f"[Agent:{self.name}] _call_deepseek_api => model={model_name} (params = {params})")
         
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -618,7 +632,7 @@ class Agent(Component):
                 })
 
         if verbose:
-            print(f"[Agent:{self.name}] _call_google_api => model={model_name} (params = {params})")
+            logger.debug(f"[Agent:{self.name}] _call_google_api => model={model_name} (params = {params})")
         
         data = {
             "contents": contents,
@@ -659,7 +673,7 @@ class Agent(Component):
         messages = [msg for msg in conversation if msg['role'] != 'system']
 
         if verbose:
-            print(f"[Agent:{self.name}] _call_anthropic_api => model={model_name} (params = {params})")
+            logger.debug(f"[Agent:{self.name}] _call_anthropic_api => model={model_name} (params = {params})")
         
         headers = {
             "x-api-key": api_key,
@@ -697,7 +711,7 @@ class Agent(Component):
         params = {k: v for k, v in params.items() if v is not None}
 
         if verbose:
-            print(f"[Agent:{self.name}] _call_groq_api => model={model_name} (params = {params})")
+            logger.debug(f"[Agent:{self.name}] _call_groq_api => model={model_name} (params = {params})")
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -776,7 +790,7 @@ class Tool(Component):
     ) -> dict:
 
         if verbose:
-            print(
+            logger.debug(
                 f"[Tool:{self.name}] .run() => target_input={target_input}, "
                 f"target_index={target_index}, target_fields={target_fields}, target_custom={target_custom}, input_data={input_data}"
             )
@@ -785,7 +799,7 @@ class Tool(Component):
 
         if isinstance(input_data, dict):
             if verbose:
-                print(f"[Tool:{self.name}] Using provided input_data directly.")
+                logger.debug(f"[Tool:{self.name}] Using provided input_data directly.")
             input_dict = input_data
         else:
             # If we have a `target_input` string that might hold advanced syntax => parse
@@ -816,12 +830,12 @@ class Tool(Component):
                 )
 
             if verbose:
-                print(f"[Tool:{self.name}] => {result}")
+                logger.debug(f"[Tool:{self.name}] => {result}")
             return result
 
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             if verbose:
-                print(f"[Tool:{self.name}] => error {e}")
+                logger.error(f"[Tool:{self.name}] => error: {e}")
                 traceback.print_exc()
             return self.default_output
 
@@ -864,7 +878,7 @@ class Tool(Component):
 
         if not subset:
             if verbose:
-                print(f"[Tool:{self.name}] No messages found for target_input={target_input}, returning empty.")
+                logger.debug(f"[Tool:{self.name}] No messages found for target_input={target_input}, returning empty.")
             return {}
 
         if target_index is None:
@@ -891,7 +905,7 @@ class Tool(Component):
             return final_data
         except json.JSONDecodeError:
             if verbose:
-                print(f"[Tool:{self.name}] Failed to parse content as JSON: {content}")
+                logger.error(f"[Tool:{self.name}] Failed to parse content as JSON: {content}")
             return {}
 
     def _gather_data_for_tool_process(self, parsed: dict, db_conn: sqlite3.Connection, verbose: bool) -> dict:
@@ -901,7 +915,7 @@ class Tool(Component):
         """
 
         if verbose:
-            print(f"[Tool:{self.name}] _gather_data_for_tool_process => parsed={parsed}")
+            logger.debug(f"[Tool:{self.name}] _gather_data_for_tool_process => parsed={parsed}")
 
         if parsed["multiple_sources"] is None and parsed["single_source"] is None:
             if parsed["component_or_param"]:
@@ -924,7 +938,7 @@ class Tool(Component):
                             if isinstance(data, dict):
                                 return data
                             return {}
-                        except:
+                        except json.JSONDecodeError:
                             return {}
                     else:
                         return {}
@@ -980,7 +994,7 @@ class Tool(Component):
         try:
             data = json.loads(content)
             data = self.manager._load_files_in_dict(data)
-        except:
+        except json.JSONDecodeError:
             data = {}
 
         if not isinstance(data, dict):
@@ -1028,7 +1042,7 @@ class Tool(Component):
 
             if not subset:
                 if verbose:
-                    print(f"[Tool/Process:{self.name}] No messages found for '{comp_name}'. Skipping.")
+                    logger.debug(f"[Tool/Process:{self.name}] No messages found for '{comp_name}'. Skipping.")
                 continue
 
             if index is None:
@@ -1057,9 +1071,9 @@ class Tool(Component):
                     else:
                         # merge entire data
                         final_input.update(data)
-                except:
+                except json.JSONDecodeError:
                     if verbose:
-                        print(f"[Tool/Process:{self.name}] Error parsing message for '{comp_name}'.")
+                        logger.error(f"[Tool/Process:{self.name}] Error parsing message for '{comp_name}'.")
                     continue
 
         return final_input
@@ -1107,7 +1121,7 @@ class Process(Component):
     ) -> Dict:
         
         if verbose:
-            print(f"[Process:{self.name}] .run() => target_input={target_input}, "
+            logger.debug(f"[Process:{self.name}] .run() => target_input={target_input}, "
                   f"target_index={target_index}, target_fields={target_fields}, target_custom={target_custom}, input_data={input_data}")
 
         db_conn = self.manager._get_user_db()
@@ -1115,22 +1129,22 @@ class Process(Component):
         # 1) If user explicitly provided a dict (or list) in 'input_data', pass that directly
         if isinstance(input_data, dict) or isinstance(input_data, list):
             if verbose:
-                print(f"[Process:{self.name}] Using user-provided input_data directly.")
+                logger.debug(f"[Process:{self.name}] Using user-provided input_data directly.")
             final_input = input_data
 
         # 2) If advanced parser syntax is in target_input, build the message list from that
         elif target_input and any(x in target_input for x in [":", "fn?", "fn:", "?"]):
             parsed = self.manager.parser.parse_input_string(target_input)
             if verbose:
-                print(f"[Process:{self.name}] Detected advanced parser usage => parsed={parsed}")
+                logger.debug(f"[Process:{self.name}] Detected advanced parser usage => parsed={parsed}")
             final_input = self._build_message_list_from_parser_result(parsed, db_conn, verbose)
         elif target_custom:
             if verbose:
-                print(f"[Process:{self.name}] Using target_custom => building message list from multiple items.")
+                logger.debug(f"[Process:{self.name}] Using target_custom => building message list from multiple items.")
             final_input = self._build_message_list_from_custom(db_conn, target_custom, verbose)
         else:
             if verbose:
-                print(f"[Process:{self.name}] Using fallback => single target_input + target_index.")
+                logger.debug(f"[Process:{self.name}] Using fallback => single target_input + target_index.")
             final_input = self._build_message_list_from_fallback(db_conn, target_input, target_index, target_fields, verbose)
 
         # -- At this point, 'final_input' should be a list of message dicts
@@ -1149,18 +1163,17 @@ class Process(Component):
             if not isinstance(output, dict):
                 raise ValueError("[Process] function must return a dict.")
             if verbose:
-                print(f"[Process:{self.name}] => {output}")
+                logger.debug(f"[Process:{self.name}] => {output}")
             return output
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             if verbose:
-                print(f"[Process:{self.name}] => error {e}")
-                traceback.print_exc()
+                logger.exception(f"[Process:{self.name}] => error: {e}")
             return {}
 
 
     def _build_message_list_from_parser_result(self, parsed: dict, db_conn: sqlite3.Connection, verbose: bool) -> List[dict]:
         if verbose:
-            print(f"[Process:{self.name}] _build_message_list_from_parser_result => parsed={parsed}")
+            logger.debug(f"[Process:{self.name}] _build_message_list_from_parser_result => parsed={parsed}")
 
         all_msgs = self.manager._get_all_messages(db_conn)
 
@@ -1284,7 +1297,7 @@ class Process(Component):
         try:
             data = json.loads(content)
             return self.manager._load_files_in_dict(data)
-        except:
+        except json.JSONDecodeError:
             return content
 
     def _build_message_list_from_custom(
@@ -1309,7 +1322,7 @@ class Process(Component):
 
             if not subset:
                 if verbose:
-                    print(f"[Process:{self.name}] No messages found for '{comp_name}'. Skipping.")
+                    logger.debug(f"[Process:{self.name}] No messages found for '{comp_name}'. Skipping.")
                 continue
 
             chosen = self._handle_index(idx, subset)
@@ -1352,7 +1365,7 @@ class Process(Component):
 
             if not subset:
                 if verbose:
-                    print(f"[Process:{self.name}] No messages found for target_input={target_input}, returning empty.")
+                    logger.debug(f"[Process:{self.name}] No messages found for target_input={target_input}, returning empty.")
                 return []
 
             if target_index is None:
@@ -1360,7 +1373,7 @@ class Process(Component):
             else:
                 if len(subset) < abs(target_index):
                     if verbose:
-                        print(f"[Process:{self.name}] index={target_index} but only {len(subset)} messages.")
+                        logger.warning(f"[Process:{self.name}] index={target_index} but only {len(subset)} messages.")
                     return []
                 chosen = subset[target_index] # this might be wrong, if processes can take message lists, indices should be allowed to be all, or ranges, just like agents
 
@@ -1391,7 +1404,7 @@ class Automation(Component):
 
     def run(self, verbose: bool = False, on_update: Optional[Callable] = None, on_update_params: Optional[Dict] = None) -> Dict:
         if verbose:
-            print(f"[Automation:{self.name}] .run() => executing sequence: {self.sequence}")
+            logger.debug(f"[Automation:{self.name}] .run() => executing sequence: {self.sequence}")
 
         db_conn = self.manager._get_user_db()
         current_output = {}
@@ -1400,7 +1413,7 @@ class Automation(Component):
             current_output = self._execute_step(step, current_output, db_conn, verbose, on_update, on_update_params)
 
         if verbose:
-            print(f"[Automation:{self.name}] => Execution completed.")
+            logger.info(f"[Automation:{self.name}] => Execution completed.")
         return current_output
 
     def _execute_step(self, step, current_output, db_conn, verbose, on_update = None, on_update_params = None):
@@ -1420,11 +1433,11 @@ class Automation(Component):
             comp = self.manager._get_component(comp_name)
             if not comp:
                 if verbose:
-                    print(f"[Automation:{self.name}] => no such component '{comp_name}'. Skipping.")
+                    logger.warning(f"[Automation:{self.name}] => no such component '{comp_name}'. Skipping.")
                 return current_output
 
             if verbose:
-                print(f"[Automation:{self.name}] => running component '{comp_name}' with "
+                logger.debug(f"[Automation:{self.name}] => running component '{comp_name}' with "
                     f"target_input={parsed_target_input}, target_index={parsed_target_index}, "
                     f"target_custom={parsed_target_custom}")
 
@@ -1461,7 +1474,7 @@ class Automation(Component):
                 condition_met = self._evaluate_condition(condition, current_output)
 
                 if verbose:
-                    print(f"[Automation:{self.name}] => branching condition evaluated to {condition_met}.")
+                    logger.debug(f"[Automation:{self.name}] => branching condition evaluated to {condition_met}.")
 
                 next_steps = step["if_true"] if condition_met else step["if_false"]
                 for branch_step in next_steps:
@@ -1478,7 +1491,7 @@ class Automation(Component):
                 (isinstance(start_condition, (str, dict)) and self._evaluate_condition(start_condition, current_output)):
                     while True:
                         if verbose:
-                            print(f"[Automation:{self.name}] => executing while loop body.")
+                            logger.debug(f"[Automation:{self.name}] => executing while loop body.")
                         for nested_step in body:
                             current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
 
@@ -1486,12 +1499,12 @@ class Automation(Component):
                         (isinstance(end_condition, (str, dict)) and self._evaluate_condition(end_condition, current_output)):
                             break
                         if verbose:
-                            print(f"[Automation:{self.name}] => while loop iteration complete.")
+                            logger.debug(f"[Automation:{self.name}] => while loop iteration complete.")
 
             elif control_flow_type == "for":
                 items_spec = step.get("items")
                 if verbose:
-                    print(f"[Automation:{self.name}] Processing FOR loop with items: {items_spec}")
+                    logger.debug(f"[Automation:{self.name}] Processing FOR loop with items: {items_spec}")
 
                 # Resolve items specification
                 items_data = self._resolve_items_spec(items_spec, db_conn, verbose)
@@ -1501,7 +1514,7 @@ class Automation(Component):
 
                 for idx, element in enumerate(elements):
                     if verbose:
-                        print(f"[Automation:{self.name}] FOR loop iteration {idx+1}/{len(elements)}")
+                        logger.debug(f"[Automation:{self.name}] FOR loop iteration {idx+1}/{len(elements)}")
                     
                     # Create iterator message
                     iterator_msg = {
@@ -1530,7 +1543,7 @@ class Automation(Component):
                         
                     if self._case_matches(switch_value, case_value, verbose):
                         if verbose:
-                            print(f"[Automation:{self.name}] Switch matched case: {case_value}")
+                            logger.debug(f"[Automation:{self.name}] Switch matched case: {case_value}")
                         for nested_step in case_body:
                             current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
                         executed = True
@@ -1541,7 +1554,7 @@ class Automation(Component):
                     for case in step.get("cases", []):
                         if case.get("case") == "default":
                             if verbose:
-                                print(f"[Automation:{self.name}] Executing default case")
+                                logger.debug(f"[Automation:{self.name}] Executing default case")
                             for nested_step in case.get("body", []):
                                 current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
                             break
@@ -1559,7 +1572,7 @@ class Automation(Component):
             try:
                 data = json.loads(last_msg)
                 return data.get(value_spec)
-            except:
+            except json.JSONDecodeError:
                 return last_msg
         
         parsed = self.manager.parser.parse_input_string(value_spec)
@@ -1585,9 +1598,9 @@ class Automation(Component):
                 return float(switch_value) == float(case_value)
             # Strict equality for other types
             return switch_value == case_value
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             if verbose:
-                print(f"[Automation] Case comparison error: {e}")
+                logger.error(f"[Automation] Case comparison error: {e}")
             return False
 
     def _resolve_items_spec(self, items_spec, db_conn, verbose):
@@ -1611,7 +1624,7 @@ class Automation(Component):
                 resolved_data = resolved_data[0] if resolved_data else None
             
             if verbose:
-                print(f"[Automation:{self.name}] Resolved items spec '{items_spec}' to: {resolved_data}")
+                logger.debug(f"[Automation:{self.name}] Resolved items spec '{items_spec}' to: {resolved_data}")
             return resolved_data
         
         return items_spec
@@ -1648,15 +1661,10 @@ class Automation(Component):
 
     def _evaluate_condition(self, condition, current_output) -> bool:
 
-        print("in evaluate condition")
-
         db_conn = self.manager._get_user_db()
 
         if isinstance(condition, str):
-            print("is string")
             parsed = self.manager.parser.parse_input_string(condition)
-
-            print(parsed)
 
             if parsed["is_function"] and parsed["function_name"]:
                 input_data = self._gather_data_for_parser_result(parsed, db_conn)
@@ -1721,7 +1729,7 @@ class Automation(Component):
                             data = json.loads(content)
                             data = self.manager._load_files_in_dict(data)
                             return data
-                        except:
+                        except json.JSONDecodeError:
                             return content
                     else:
                         return None
@@ -1783,7 +1791,7 @@ class Automation(Component):
         try:
             data = json.loads(content)
             data = self.manager._load_files_in_dict(data)
-        except:
+        except json.JSONDecodeError:
             data = content
 
         if not isinstance(data, dict):
@@ -1841,8 +1849,13 @@ class AgentSystemManager:
         on_update: Optional[Callable] = None,
         on_complete: Optional[Callable] = None,
         include_timestamp: bool = False,
-        timezone: str = "UTC"
+        timezone: str = "UTC",
+        log_level=None
     ):
+        
+        if log_level is not None:
+            logger.setLevel(log_level)
+        logger.debug("Manager initialized with log level: %s", logger.level)
 
         self._current_user_id: Optional[str] = None
         self._current_db_conn: Optional[sqlite3.Connection] = None
@@ -1885,7 +1898,8 @@ class AgentSystemManager:
             try:
                 self.build_from_json(config_json)
             except (FileNotFoundError, json.JSONDecodeError) as e:
-                print(f"System build failed: {e}")
+                logger.exception(f"System build failed: {e}")
+                raise
         else:
             self.base_directory = base_directory
             self.general_system_description = general_system_description
@@ -1895,8 +1909,8 @@ class AgentSystemManager:
 
         try:
             self.timezone = ZoneInfo(self.timezone)
-        except Exception as e:
-            print(f"Invalid timezone {self.timezone}, defaulting to UTC. Error: {e}")
+        except ZoneInfoNotFoundError as e:
+            logger.warning(f"Invalid timezone {self.timezone}, defaulting to UTC. Error: {e}")
             self.timezone = ZoneInfo("UTC")
             
         self.api_keys: Dict[str, str] = {}
@@ -1909,7 +1923,7 @@ class AgentSystemManager:
                 try:
                     self.link(agent_name, tool_name)
                 except ValueError as e:
-                    print(f"Warning: Could not link agent '{agent_name}' to tool '{tool_name}'. Error: {e}")
+                    logger.error(f"Warning: Could not link agent '{agent_name}' to tool '{tool_name}'. Error: {e}")
 
         self._last_known_update = None
 
@@ -2099,8 +2113,12 @@ class AgentSystemManager:
             return
         
         if self.api_keys_path.endswith('.json'):
-            with open(self.api_keys_path, "r", encoding="utf-8") as f:
-                self.api_keys = json.load(f)
+            try:
+                with open(self.api_keys_path, "r", encoding="utf-8") as f:
+                    self.api_keys = json.load(f)
+            except OSError as e:
+                logger.error(f"Error opening API keys file: {e}")
+                self.api_keys = {}
         elif self.api_keys_path.endswith('.env'):
             load_dotenv(self.api_keys_path, override=True)
             
@@ -2251,8 +2269,12 @@ class AgentSystemManager:
         file_id = str(uuid.uuid4())
         file_path = os.path.join(files_dir, f"{file_id}.pkl")
 
-        with open(file_path, "wb") as f:
-            pickle.dump(obj, f)
+        try:
+            with open(file_path, "wb") as f:
+                pickle.dump(obj, f)
+        except OSError as e:
+            logger.error(f"Failed to store file at {file_path}: {e}")
+            raise
 
         self._file_cache[file_path] = obj
 
@@ -2266,7 +2288,7 @@ class AgentSystemManager:
 
         try:
             value = json.loads(value)
-        except:
+        except json.JSONDecodeError:
             pass
 
         if isinstance(value, dict):
@@ -2286,9 +2308,13 @@ class AgentSystemManager:
     def _load_file(self, file_path: str) -> Any:
         if file_path in self._file_cache:
             return self._file_cache[file_path]
-
-        with open(file_path, "rb") as f:
-            obj = pickle.load(f)
+        
+        try:
+            with open(file_path, "rb") as f:
+                obj = pickle.load(f)
+        except OSError as e:
+            logger.error(f"Failed to load file at {file_path}: {e}")
+            raise
 
         self._file_cache[file_path] = obj
         return obj
@@ -2308,14 +2334,14 @@ class AgentSystemManager:
 
         conn = self._get_user_db()
         rows = self._get_all_messages(conn, include_model = True)
-        print(f"=== Message History for user [{self._current_user_id}] ===")
+        logger.info(f"=== Message History for user [{self._current_user_id}] ===")
         for i, (role, content, msg_number, msg_type, model, timestamp) in enumerate(rows, start=1):
             model_str = f" ({model})" if model else ""
             role_str = f"{msg_number}. {msg_type} - {role}{model_str}" if role != "user" else f"{msg_number}. {role}{model_str}"
             if len(content) > message_char_limit:
                 content = content[:message_char_limit] + "...\nMessage too long to show in history."
-            print(f"{role_str}: {content}")
-        print("============================================\n")
+            logger.info(f"{role_str}: {content}")
+        logger.info("============================================\n")
 
     def get_messages(self, user_id: Optional[str] = None) -> List[Dict[str, str]]:
         if user_id is not None:
@@ -2358,7 +2384,7 @@ class AgentSystemManager:
     
         lines = []
         lines.append(f"You are {name}, an agent who is part of this system.")
-        lines.append(f"You task has been defined as follows:{specific_desc.strip()}\n")
+        lines.append(f"Your task has been defined as follows:{specific_desc.strip()}\n")
         lines.append("You must always and only answer in JSON format.")
         lines.append("Below is the JSON structure you must produce:")
         lines.append("")
@@ -2618,19 +2644,19 @@ class AgentSystemManager:
                 store_role = role if role else "internal"
                 self._save_message(db_conn, store_role, input, store_role)
                 if verbose:
-                    print(f"[Manager] Saved dict input under role='{store_role}'. => {input}")
+                    logger.debug(f"[Manager] Saved dict input under role='{store_role}'. => {input}")
             else:
                 # assume string
                 store_role = role if role else "user"
                 self._save_message(db_conn, store_role, input, store_role)
                 if verbose:
-                    print(f"[Manager] Saved string input under role='{store_role}'. => {input}")
+                    logger.debug(f"[Manager] Saved string input under role='{store_role}'. => {input}")
 
         if component_name is None:
             # Use default or latest automation logic
             if not self.automations or len(self.automations) < 1:
                 if verbose:
-                    print("[Manager] Using default automation.")
+                    logger.info("[Manager] Using default automation.")
                 default_automation_name = "default_automation"
                 default_automation_sequence = list(self._component_order)
                 if default_automation_name not in self.automations:
@@ -2639,12 +2665,12 @@ class AgentSystemManager:
             elif len(self.automations) == 1:
                 automation_name = list(self.automations.keys())[0]
                 if verbose:
-                    print(f"[Manager] Using single existing automation: {automation_name}")
+                    logger.info(f"[Manager] Using single existing automation: {automation_name}")
                 comp = self._get_component(automation_name)
             else:
                 latest_automation_name = list(self.automations.keys())[-1]
                 if verbose:
-                    print(f"[Manager] Using the latest automation: {latest_automation_name}")
+                    logger.info(f"[Manager] Using the latest automation: {latest_automation_name}")
                 comp = self._get_component(latest_automation_name)
         else:
             comp = self._get_component(component_name)
@@ -2653,7 +2679,7 @@ class AgentSystemManager:
 
         if isinstance(comp, Automation):
             if verbose:
-                print(f"[Manager] Running Automation: {component_name or comp.name}")
+                logger.debug(f"[Manager] Running Automation: {component_name or comp.name}")
             
             if on_update_params:
                 output_dict = comp.run(
@@ -2669,7 +2695,7 @@ class AgentSystemManager:
         else:
             # Agents, Tools, and Processes accept input targeting arguments
             if verbose:
-                print(f"[Manager] Running {component_name or comp.name} with target_input={target_input}, "
+                logger.debug(f"[Manager] Running {component_name or comp.name} with target_input={target_input}, "
                     f"target_index={target_index}, target_custom={target_custom}")
             output_dict = comp.run(
                 verbose=verbose,
@@ -2712,18 +2738,14 @@ class AgentSystemManager:
         on_complete = on_complete or self.on_complete
 
         def task():
-            try:
-                self._run_internal(
-                    component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params
-                )
-                if on_complete:
-                    if on_complete_params:
-                        on_complete(self.get_messages(user_id), self, on_complete_params)
-                    else:
-                        on_complete(self.get_messages(user_id), self)
-            except Exception as e:
-                if verbose:
-                    print(f"[Manager] Non-blocking execution error: {e}")
+            self._run_internal(
+                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params
+            )
+            if on_complete:
+                if on_complete_params:
+                    on_complete(self.get_messages(user_id), self, on_complete_params)
+                else:
+                    on_complete(self.get_messages(user_id), self)
 
         if blocking:
             result = self._run_internal(
@@ -2743,8 +2765,15 @@ class AgentSystemManager:
 
 
     def build_from_json(self, json_path: str):
-        with open(json_path, "r", encoding="utf-8") as f:
-            system_definition = json.load(f)
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                system_definition = json.load(f)
+        except OSError as e:
+            logger.error(f"Error opening JSON file at {json_path}: {e}")
+            system_definition = {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON from file at {json_path}: {e}")
+            system_definition = {}
 
         general_params = system_definition.get("general_parameters", {})
 
@@ -2787,7 +2816,7 @@ class AgentSystemManager:
             try:
                 self.link(input_component, output_component)
             except ValueError as e:
-                print(f"Warning: Could not create link from '{input_component}' to '{output_component}'. Error: {e}")
+                logger.error(f"Warning: Could not create link from '{input_component}' to '{output_component}'. Error: {e}")
 
     def _create_component_from_json(self, component: dict):
         component_type = component.get("type")
@@ -3058,16 +3087,16 @@ class AgentSystemManager:
             self.set_current_user(user_id)
 
         if not self._current_user_id:
-            #print("No user ID provided or set. Message history not cleared.")
+            logger.warning("No user ID provided or set. Message history not cleared.")
             return
 
         conn = self._get_user_db()
         cur = conn.cursor()
         cur.execute("DELETE FROM message_history")
         conn.commit()
-        #print(f"Message history cleared for user ID: {self._current_user_id}")
+        logger.info(f"Message history cleared for user ID: {self._current_user_id}")
 
-    def escape_markdown(text: str) -> str:
+    def escape_markdown(self, text: str) -> str:
         """
         Escapes special characters in Markdown v1.
         """
@@ -3127,8 +3156,12 @@ class AgentSystemManager:
             file_path = os.path.join(self.base_directory, "files", str(update.message.chat.id), file_name)
             
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(file_path, "wb") as f:
-                f.write(file_data)
+
+            try:
+                with open(file_path, "wb") as f:
+                    f.write(file_data)
+            except OSError as e:
+                logger.error(f"Error writing audio to file {file_path}: {e}")
 
             # Store in manager's file cache
             file_ref = self._store_file(file_path, str(update.message.chat.id))
@@ -3143,10 +3176,15 @@ class AgentSystemManager:
                     transcript = self._transcribe_audio(file_path, whisper_provider, whisper_model)
 
                     if verbose:
-                        print(f"Audio transcription succeeded: {transcript}")
-            except Exception as e:
+                        logger.debug(f"Audio transcription succeeded: {transcript}")
+            except requests.exceptions.RequestException as e:
                 if verbose:
-                    print(f"Audio transcription failed: {e}")
+                    logger.error(f"HTTP error during transcription: {e}")
+                transcript = None
+            except ValueError as e:
+                if verbose:
+                    logger.error(f"Transcription error: {e}")
+                transcript = None
 
             return transcript, file_ref
         
@@ -3238,7 +3276,7 @@ class AgentSystemManager:
             chat_id = update.message.chat.id
 
             if verbose:
-                print(f"[Manager] Processing input for user {chat_id}: {input_text}")
+                logger.debug(f"[Manager] Processing input for user {chat_id}: {input_text}")
 
             def run_manager_thread():
                 self.run(
@@ -3267,7 +3305,7 @@ class AgentSystemManager:
 
         # Run the bot
         if verbose:
-            print("[Manager] Bot running...")
+            logger.info("[Manager] Bot running...")
 
         application.run_polling()
 
@@ -3292,13 +3330,16 @@ class AgentSystemManager:
             }.get(provider)
 
         # Read audio file
-        with open(file_path, "rb") as audio_file:
-            if provider == "groq":
-                return self._transcribe_groq(audio_file, model)
-            elif provider == "openai":
-                return self._transcribe_openai(audio_file, model)
-            else:
-                raise ValueError(f"Unsupported provider: {provider}")
+        try:
+            with open(file_path, "rb") as audio_file:
+                if provider == "groq":
+                    return self._transcribe_groq(audio_file, model)
+                elif provider == "openai":
+                    return self._transcribe_openai(audio_file, model)
+                else:
+                    raise ValueError(f"Unsupported provider: {provider}")
+        except OSError as e:
+            logger.error(f"Error reading audio file at {file_path}: {e}")
 
     def _transcribe_groq(self, audio_file, model):
         api_key = self.get_key("groq")
@@ -3324,7 +3365,7 @@ class AgentSystemManager:
         )
         
         if response.status_code != 200:
-            print(f"Groq API Error: {response.text}")  # Add debug output
+            logger.error(f"Groq API Error: {response.text}")  # Add debug output
             response.raise_for_status()
             
         return response.json().get("text", "")
