@@ -284,9 +284,12 @@ class Agent(Component):
     def _transform_to_conversation(self, msg_tuples: List[tuple], fields: Optional[list] = None, include_message_number: Optional[bool] = False) -> List[Dict[str, str]]:
         conversation = []
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
+            if isinstance(content, str):
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError:
+                    data = content
+            else:
                 data = content
 
             if isinstance(data, dict) and fields:
@@ -368,9 +371,12 @@ class Agent(Component):
         conversation = []
 
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
+            if isinstance(content, str):
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError:
+                    data = content
+            else:
                 data = content
 
             if isinstance(data, dict) and fields:
@@ -1736,7 +1742,14 @@ class Automation(Component):
                     # It's just a param name or string => interpret it as a param from the last message
                     subset = self.manager._get_all_messages(db_conn)
                     role, content, msg_number, msg_type, timestamp = subset[-1]
-                    data = json.loads(content)
+                    
+                    if isinstance(content, str):
+                        try:
+                            data = json.loads(content)
+                        except json.JSONDecodeError:
+                            data = content
+                    else:
+                        data = content
 
                     return data[parsed["component_or_param"]]
             else:
