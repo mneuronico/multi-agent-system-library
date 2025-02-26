@@ -16,9 +16,14 @@ import requests
 from dotenv import load_dotenv
 import inspect
 from datetime import datetime
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from importlib import resources
 import logging
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)

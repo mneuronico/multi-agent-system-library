@@ -9,6 +9,7 @@ setup(
     install_requires=[
         "python-telegram-bot",
         "requests",
-        "python-dotenv"
+        "python-dotenv",
+        'backports.zoneinfo; python_version < "3.9"'
     ],
 )
