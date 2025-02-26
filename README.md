@@ -205,6 +205,7 @@ On top of these initial files, the library creates subdirectories inside the `ba
 
 ```python
 from mas import AgentSystemManager
+import logging # only necessary if it is required to set a specific log level
 
 manager = AgentSystemManager(
     base_directory="path/to/your/base_dir",  # Default is the current working directory.
@@ -219,7 +220,8 @@ manager = AgentSystemManager(
     on_update=on_update, # Default: none
     on_complete=on_complete, # Default: none
     include_timestamp=False, # Default is False
-    timezone="UTC" # Default is UTC
+    timezone="UTC" # Default is UTC,
+    log_level=logging.INFO # Default is logging.DEBUG
 )
 ```
 
