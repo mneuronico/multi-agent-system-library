@@ -2242,6 +2242,10 @@ class AgentSystemManager:
         )
         conn.commit()
 
+    def add_message(self, role: str, content: Union[str, dict], msg_type: str = "developer") -> None:
+        db_conn = self._get_user_db()
+        self._save_message(db_conn, role, content, msg_type)
+
     def _save_component_output(
         self, db_conn, component, output_dict, verbose=False
     ):

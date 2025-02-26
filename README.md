@@ -962,7 +962,6 @@ manager.show_history()  # Show history of current user
 
 The `get_messages` method retrieves a structured history of all messages for a specific user, useful for analyzing interactions or displaying chat history.
 
-
 #### Method Signature
 
 ```python
@@ -990,6 +989,23 @@ If you need to clear the message history for a user, the `manager` offers a simp
 
 ```python
 manager.clear_message_history(user_id) # if not provided, it will use the current user_id
+```
+
+### Adding Messages: `add_message`
+
+```python
+manager.add_message(role: str, content: Union[str, dict], msg_type: str = "developer") -> None
+```
+
+The add_message method allows the developer to directly insert a message into the conversation history without triggering any component execution. This is useful for manual updates, debugging, or simulating interactions.
+
+#### Usage Example
+
+```python
+manager.add_message(
+    role="developer",
+    content={"info": "Manual update from developer"}
+)
 ```
 
 ### Retrieving API keys with `get_keys`
