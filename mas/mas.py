@@ -2895,7 +2895,6 @@ class AgentSystemManager:
                 self.history_folder = os.path.join(self.base_directory, history_folder)
         else:
             self.history_folder = os.path.join(self.base_directory, "history")
-        os.makedirs(self.history_folder, exist_ok=True)
 
         # Resolve files folder from JSON:
         files_folder = general_params.get("files_folder")
@@ -2906,7 +2905,6 @@ class AgentSystemManager:
                 self.files_folder = os.path.join(self.base_directory, files_folder)
         else:
             self.files_folder = os.path.join(self.base_directory, "files")
-        os.makedirs(self.files_folder, exist_ok=True)
 
 
         imports = general_params.get("imports")
