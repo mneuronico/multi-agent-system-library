@@ -10,6 +10,7 @@ setup(
         "python-telegram-bot",
         "requests",
         "python-dotenv",
-        'backports.zoneinfo; python_version < "3.9"'
+        'backports.zoneinfo; python_version < "3.9"',
+        'tzdata; python_version < "3.9"'
     ],
 )
