@@ -2181,6 +2181,32 @@ class AgentSystemManager:
         if needs_init:
             self._create_table(conn)
         return conn
+    
+    def export_history(self, user_id: str) -> bytes:
+        """
+        Exports the full sqlite database for the given user_id.
+        Returns the file's bytes.
+        """
+        db_path = self._get_db_path_for_user(user_id)
+        if os.path.exists(db_path):
+            with open(db_path, "rb") as f:
+                return f.read()
+        else:
+            # If no DB exists, return empty bytes (or you could raise an error)
+            return b""
+        
+    def import_history(self, user_id: str, sqlite_bytes: bytes):
+        """
+        Imports a sqlite database for the given user_id.
+        It saves the sqlite file into the history folder (using the user_id as filename).
+        If a history file already exists, it overwrites it (logging a warning).
+        """
+        db_path = self._get_db_path_for_user(user_id)
+        if os.path.exists(db_path):
+            # Log a warning that an existing DB is being overwritten
+            logger.warning(f"Overwriting existing history for user {user_id}")
+        with open(db_path, "wb") as f:
+            f.write(sqlite_bytes)
 
 
     def _create_table(self, conn: sqlite3.Connection):
