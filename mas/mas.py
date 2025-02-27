@@ -1973,21 +1973,25 @@ class AgentSystemManager:
         self._last_known_update = None
 
         # Setup history folder:
-        if history_folder is None and not getattr(self, "history_folder", None):
-            self.history_folder = os.path.join(self.base_directory, "history")
-        elif os.path.isabs(history_folder):
-            self.history_folder = history_folder
+        if history_folder is not None:
+            if os.path.isabs(history_folder):
+                self.history_folder = history_folder
+            else:
+                self.history_folder = os.path.join(self.base_directory, history_folder)
         else:
-            self.history_folder = os.path.join(self.base_directory, history_folder)
+            if getattr(self, "history_folder", None) is None:
+                self.history_folder = os.path.join(self.base_directory, "history")
         os.makedirs(self.history_folder, exist_ok=True)
 
         # Setup files folder:
-        if files_folder is None and not getattr(self, "files_folder", None):
-            self.files_folder = os.path.join(self.base_directory, "files")
-        elif os.path.isabs(files_folder):
-            self.files_folder = files_folder
+        if files_folder is not None:
+            if os.path.isabs(files_folder):
+                self.files_folder = files_folder
+            else:
+                self.files_folder = os.path.join(self.base_directory, files_folder)
         else:
-            self.files_folder = os.path.join(self.base_directory, files_folder)
+            if getattr(self, "files_folder", None) is None:
+                self.files_folder = os.path.join(self.base_directory, "files")
         os.makedirs(self.files_folder, exist_ok=True)
 
     def _resolve_api_keys_path(self, api_keys_path):
