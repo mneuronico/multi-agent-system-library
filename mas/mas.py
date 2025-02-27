@@ -2172,7 +2172,7 @@ class AgentSystemManager:
         )
 
     def _load_api_keys(self):
-        if not os.path.exists(self.api_keys_path):
+        if self.api_keys_path is None or not os.path.exists(self.api_keys_path):
             self.api_keys = {}
             return
         
