@@ -1887,6 +1887,8 @@ class AgentSystemManager:
         imports: List[str] = None,
         base_directory: str = os.getcwd(),
         api_keys_path: Optional[str] = None,
+        history_folder: Optional[str] = None,
+        files_folder: Optional[str] = None,
         general_system_description: str = "This is a multi agent system.",
         functions: Union[str, List[str]] = "fns.py",
         default_models: List[Dict[str, str]] = [{"provider": "groq", "model": "llama-3.1-8b-instant"}],
@@ -1955,7 +1957,7 @@ class AgentSystemManager:
         except ZoneInfoNotFoundError as e:
             logger.warning(f"Invalid timezone {self.timezone}, defaulting to UTC. Error: {e}")
             self.timezone = ZoneInfo("UTC")
-            
+
         self.api_keys: Dict[str, str] = {}
         self._load_api_keys()
 
@@ -1970,8 +1972,23 @@ class AgentSystemManager:
 
         self._last_known_update = None
 
-        self.history_folder = os.path.join(self.base_directory, "history")
+        # Setup history folder:
+        if history_folder is None and not getattr(self, "history_folder", None):
+            self.history_folder = os.path.join(self.base_directory, "history")
+        elif os.path.isabs(history_folder):
+            self.history_folder = history_folder
+        else:
+            self.history_folder = os.path.join(self.base_directory, history_folder)
         os.makedirs(self.history_folder, exist_ok=True)
+
+        # Setup files folder:
+        if files_folder is None and not getattr(self, "files_folder", None):
+            self.files_folder = os.path.join(self.base_directory, "files")
+        elif os.path.isabs(files_folder):
+            self.files_folder = files_folder
+        else:
+            self.files_folder = os.path.join(self.base_directory, files_folder)
+        os.makedirs(self.files_folder, exist_ok=True)
 
     def _resolve_api_keys_path(self, api_keys_path):
         if api_keys_path is None:
@@ -2336,7 +2353,7 @@ class AgentSystemManager:
         return self._store_file(value, user_id)
 
     def _store_file(self, obj: Any, user_id: str) -> str:
-        files_dir = os.path.join(self.base_directory, "files", user_id)
+        files_dir = os.path.join(self.files_folder, user_id)
         os.makedirs(files_dir, exist_ok=True)
 
         file_id = str(uuid.uuid4())
@@ -2864,6 +2881,29 @@ class AgentSystemManager:
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
         self.include_timestamp = general_params.get("include_timestamp", False)
         self.timezone = general_params.get("timezone", 'UTC')
+
+        # Resolve history folder from JSON:
+        history_folder = general_params.get("history_folder")
+        if history_folder:
+            if os.path.isabs(history_folder):
+                self.history_folder = history_folder
+            else:
+                self.history_folder = os.path.join(self.base_directory, history_folder)
+        else:
+            self.history_folder = os.path.join(self.base_directory, "history")
+        os.makedirs(self.history_folder, exist_ok=True)
+
+        # Resolve files folder from JSON:
+        files_folder = general_params.get("files_folder")
+        if files_folder:
+            if os.path.isabs(files_folder):
+                self.files_folder = files_folder
+            else:
+                self.files_folder = os.path.join(self.base_directory, files_folder)
+        else:
+            self.files_folder = os.path.join(self.base_directory, "files")
+        os.makedirs(self.files_folder, exist_ok=True)
+
 
         imports = general_params.get("imports")
 
