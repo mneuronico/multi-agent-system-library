@@ -1,33 +1,10 @@
-# More information about the configuration file can be found here:
-# https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-config.html
 version = 0.1
-
-[default.global.parameters]
-stack_name = ...
-
-[default.build.parameters]
-cached = true
-parallel = true
-
-[default.validate.parameters]
-lint = true
-
+[default]
+[default.deploy]
 [default.deploy.parameters]
-capabilities = "CAPABILITY_IAM"
+stack_name = "your-stack-name"
+s3_bucket = "your-sam-deployment-bucket"
+s3_prefix = "your-prefix"
+region = "sa-east-1" # esta región tiene que coincidir siempre con la región en la que estamos trabajando en AWS
 confirm_changeset = true
-resolve_s3 = true
-s3_prefix = ...
-region = ...
-image_repositories = []
-
-[default.package.parameters]
-resolve_s3 = true
-
-[default.sync.parameters]
-watch = true
-
-[default.local_start_api.parameters]
-warm_containers = "EAGER"
-
-[default.local_start_lambda.parameters]
-warm_containers = "EAGER"
+capabilities = "CAPABILITY_IAM"

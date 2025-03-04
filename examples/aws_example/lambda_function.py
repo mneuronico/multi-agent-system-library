@@ -2,11 +2,10 @@ import json
 import boto3
 import os
 import requests
-import mas
 from mas import AgentSystemManager
 
 # Replace with your bot token
-BUCKET_NAME = "ada-bot-data"
+BUCKET_NAME = "your-bucket-name"
 
 lambda_client = boto3.client('lambda')
 s3_client = boto3.client('s3')
@@ -19,15 +18,9 @@ def lambda_handler(event, context):
     try:
         # Check if this is the initial invocation from Telegram
         if 'body' in event:
-
-            print("----- INITIAL INVOCATION ----- NOW WITH MAS")
-            print("MAS VERSION:", mas.__version__)
-
             body = json.loads(event['body'])
             chat_id = body['message']['chat']['id']
             text = body['message']['text']
-
-            print("TEXT:", text)
 
             # Acknowledge the webhook immediately
             response = {
@@ -42,16 +35,13 @@ def lambda_handler(event, context):
             }
             lambda_client.invoke(
                 FunctionName=context.invoked_function_arn,
-                InvocationType='Event',  # Asynchronous invocation
+                InvocationType='Event',
                 Payload=json.dumps(payload)
             )
-
-            print("LAMBDA INVOKED, RETURNING RESPONSE TO TELEGRAM...")
-
+			
             return response
         else:
             # This is the asynchronous invocation for processing
-            print("----- ASYNCHRONOUS INVOCATION ----- THIS IS WWL")
 
             chat_id = event['chat_id']
             text = event['text']
@@ -68,8 +58,6 @@ def lambda_handler(event, context):
         }
     
 def process_message(chat_id, text):
-    print("----- PROCESSING MESSAGE... -----")
-
     try:
         manager = AgentSystemManager(config_json="config.json",
                                      history_folder="/tmp/history",
@@ -99,7 +87,7 @@ def process_message(chat_id, text):
         # Set the current user in the manager so that history operations use the correct DB file
         manager.set_current_user(chat_id)
 
-        # Run the agent on the input text
+        # Run mas
         output = manager.run(
             input=text,
             verbose=True
@@ -111,6 +99,7 @@ def process_message(chat_id, text):
         output = {"response": "Sorry, I made a mistake :("}
 
     try:
+		# the telegram bot token must be included in api_keys.json
         TELEGRAM_BOT_TOKEN = manager.get_key("TELEGRAM_TOKEN")
         # Send the output response back to Telegram
         telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
