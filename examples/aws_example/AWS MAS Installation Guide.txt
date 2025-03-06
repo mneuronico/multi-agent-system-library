@@ -197,13 +197,13 @@ version = 0.1
 stack_name = "your-stack-name"
 s3_bucket = "your-sam-deployment-bucket"
 s3_prefix = "your-prefix"
-region = "sa-east-1" # esta región tiene que coincidir siempre con la región en la que estamos trabajando en AWS
+region = "us-east-1" # esta región tiene que coincidir siempre con la región en la que estamos trabajando en AWS
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 
 6) Necesitamos otro S3 bucket, que no es el mismo que usamos para guardar el historial, sino que este lo usamos para guardar el código -> your-sam-deployment-bucket. Para crearlo, usamos este comando en la terminal de VS code en WSL:
 
-aws s3 mb s3://your-sam-deployment-bucket --region sa-east-1
+aws s3 mb s3://your-sam-deployment-bucket --region us-east-1
 
 7) En la consola de vs code, en el directorio donde están todos nuestros archivos, correr:
 
@@ -219,8 +219,9 @@ Esto va a comenzar un proceso en el que se van a pedir varios datos. Muchos de e
 
 9) Ahora hay que encontrar la URL del endpoint de la API Gateway. Esta es la URL a la que Telegram le va a mandar los mensajes, y que va a conectar esos mensajes con nuestra función Lambda. Para encontrar la URL, hay que ir al servicio API Gateway en la consola web de AWS -> https://sa-east-1.console.aws.amazon.com/console/home?region=sa-east-1 (ojo, cambiar la región por la que corresponda)
 Ahí, elegimos la API que corresponda a nuestro stack.
-En el menú izquierdo, vamos a API settings.
-La URL que está debajo de "Default endpoint" es la que estamos buscando.
+En el menú izquierdo, vamos a Dashboard.
+La URL que se llama invoke URL es la que estamos buscando.
+Si no termina en /webhook, es posible que sea necesario agregarlo.
 
 10) Ahora tenemos que decirle a Telegram que mande los mensajes de nuestro bot a esa URL. Para eso, en cualquier navegador web pegamos esta URL:
 
