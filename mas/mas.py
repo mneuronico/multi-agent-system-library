@@ -99,7 +99,8 @@ class Agent(Component):
         target_index: Optional[int] = None,
         target_fields: Optional[list] = None,
         target_custom: Optional[list] = None,
-        verbose: bool = False
+        verbose: bool = False,
+        return_token_count: bool = False
     ) -> dict:
 
         if verbose:
@@ -142,50 +143,65 @@ class Agent(Component):
                 continue
 
             try:
+                response = None
                 if provider == "openai":
-                    response_str = self._call_openai_api(
+                    response = self._call_openai_api(
                         model_name=model_name,
                         conversation=conversation,
                         api_key=api_key,
-                        verbose=verbose
+                        verbose=verbose,
+                        return_token_count=return_token_count
                     )
                 elif provider == "deepseek":
-                    response_str = self._call_deepseek_api(
+                    response = self._call_deepseek_api(
                         model_name=model_name,
                         conversation=conversation,
                         api_key=api_key,
-                        verbose=verbose
+                        verbose=verbose,
+                        return_token_count=return_token_count
                     )
                 elif provider == "google":
-                    response_str = self._call_google_api(
+                    response = self._call_google_api(
                         model_name=model_name,
                         conversation=conversation,
                         api_key=api_key,
-                        verbose=verbose
+                        verbose=verbose,
+                        return_token_count=return_token_count
                     )
                 elif provider == "groq":
-                    response_str = self._call_groq_api(
+                    response = self._call_groq_api(
                         model_name=model_name,
                         conversation=conversation,
                         api_key=api_key,
-                        verbose=verbose
+                        verbose=verbose,
+                        return_token_count=return_token_count
                     )
                 elif provider == "anthropic":
-                    response_str = self._call_anthropic_api(
+                    response = self._call_anthropic_api(
                         model_name=model_name,
                         conversation=conversation,
                         api_key=api_key,
-                        verbose=verbose
+                        verbose=verbose,
+                        return_token_count=return_token_count
                     )
                 else:
                     raise ValueError(f"[Agent:{self.name}] Unknown provider '{provider}'")
+
+                # Now unpack the result if return_token_count is True:
+                if return_token_count:
+                    response_str, input_tokens, output_tokens = response
+                else:
+                    response_str = response
 
                 response_dict = self._extract_and_parse_json(response_str)
                 self._last_used_model = {"provider": provider, "model": model_name}
                 if verbose:
                     logger.debug(f"[Agent:{self.name}] => success from provider={provider}\n{response_dict}")
+                
+                if return_token_count:
+                    response_dict["metadata"] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
                 return response_dict
-
+                
             except requests.exceptions.RequestException as req_err:
                 if verbose:
                     logger.error(f"[Agent:{self.name}] HTTP error with provider={provider}, model={model_name}: {req_err}")
@@ -519,7 +535,8 @@ class Agent(Component):
         model_name: str,
         conversation: List[Dict[str, Any]],
         api_key: str,
-        verbose: bool
+        verbose: bool,
+        return_token_count: bool = False
     ) -> str:
         schema_for_response = self._build_json_schema()
         
@@ -565,14 +582,25 @@ class Agent(Component):
         )
         response.raise_for_status()
 
-        return response.json()["choices"][0]["message"]["content"]
+        json_response = response.json()
+        content = json_response["choices"][0]["message"]["content"]
+
+        if return_token_count:
+            usage = json_response.get("usage", {})
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+
+            return (content, input_tokens, output_tokens)
+        else:
+            return content
     
     def _call_deepseek_api(
         self,
         model_name: str,
         conversation: List[Dict[str, Any]],
         api_key: str,
-        verbose: bool
+        verbose: bool,
+        return_token_count: bool = False
     ) -> str:
 
         params = {
@@ -609,14 +637,24 @@ class Agent(Component):
         )
         response.raise_for_status()
 
-        return response.json()["choices"][0]["message"]["content"]
+        json_response = response.json()
+        content = json_response["choices"][0]["message"]["content"]
+
+        if return_token_count:
+            usage = json_response.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            return (content, input_tokens, output_tokens)
+        else:
+            return content
     
     def _call_google_api(
         self,
         model_name: str,
         conversation: List[Dict[str, Any]],
         api_key: str,
-        verbose: bool
+        verbose: bool,
+        return_token_count: bool = False
     ) -> str:
         """
         Calls the Google Gemini API to get a response.
@@ -659,14 +697,24 @@ class Agent(Component):
         response.raise_for_status()
         response_json = response.json()
         
-        return response_json["candidates"][0]["content"]["parts"][0]["text"]
+        content = response_json["candidates"][0]["content"]["parts"][0]["text"]
+
+        if return_token_count:
+            # The Gemini API response includes a "usageMetadata" field
+            usage = response_json.get("usageMetadata", {})
+            input_tokens = usage.get("promptTokenCount", 0)
+            output_tokens = usage.get("candidatesTokenCount", 0)
+            return (content, input_tokens, output_tokens)
+        else:
+            return content
 
     def _call_anthropic_api(
         self,
         model_name: str,
         conversation: List[Dict[str, Any]],
         api_key: str,
-        verbose: bool
+        verbose: bool,
+        return_token_count: bool = False
     ) -> str:
         
         params = {
@@ -703,14 +751,25 @@ class Agent(Component):
             json=data
         )
         response.raise_for_status()
-        return response.json()["content"][0]["text"]
+        json_response = response.json()
+    
+        content = json_response["content"][0]["text"]
+
+        if return_token_count:
+            usage = json_response.get("usage", {})
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            return (content, input_tokens, output_tokens)
+        else:
+            return content
 
     def _call_groq_api(
         self,
         model_name: str,
         conversation: List[Dict[str, Any]],
         api_key: str,
-        verbose: bool
+        verbose: bool,
+        return_token_count: bool = False
     ) -> str:
         
         params = {
@@ -741,7 +800,16 @@ class Agent(Component):
         )
         response.raise_for_status()
 
-        return response.json()["choices"][0]["message"]["content"]
+        json_response = response.json()
+        content = json_response["choices"][0]["message"]["content"]
+
+        if return_token_count:
+            usage = json_response.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            return (content, input_tokens, output_tokens)
+        else:
+            return content
 
 
 class Tool(Component):
@@ -1431,7 +1499,10 @@ class Automation(Component):
     def to_string(self) -> str:
         return f"Name: {self.name}\nSequence: {self.sequence}\nDescription: {self.description}"
 
-    def run(self, verbose: bool = False, on_update: Optional[Callable] = None, on_update_params: Optional[Dict] = None) -> Dict:
+    def run(self, verbose: bool = False,
+            on_update: Optional[Callable] = None,
+            on_update_params: Optional[Dict] = None,
+            return_token_count = False) -> Dict:
         if verbose:
             logger.debug(f"[Automation:{self.name}] .run() => executing sequence: {self.sequence}")
 
@@ -1439,13 +1510,15 @@ class Automation(Component):
         current_output = {}
 
         for step in self.sequence:
-            current_output = self._execute_step(step, current_output, db_conn, verbose, on_update, on_update_params)
+            current_output = self._execute_step(step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
 
         if verbose:
             logger.info(f"[Automation:{self.name}] => Execution completed.")
         return current_output
 
-    def _execute_step(self, step, current_output, db_conn, verbose, on_update = None, on_update_params = None):
+    def _execute_step(self, step, current_output, db_conn, verbose,
+                      on_update = None, on_update_params = None,
+                      return_token_count = False):
         """
         Execute a single step, which can be a component name (string) or a control flow dictionary.
         """
@@ -1476,7 +1549,17 @@ class Automation(Component):
             if isinstance(comp, Automation):
                 step_output = comp.run(
                     verbose=verbose,
-                    on_update=lambda messages, manager=None: on_update(messages, manager) if on_update else None  # Pass on_update callback to nested automation
+                    on_update=lambda messages, manager=None: on_update(messages, manager) if on_update else None,
+                    return_token_count=return_token_count
+                )
+            elif isinstance(comp, Agent):
+                step_output = comp.run(
+                    verbose=verbose,
+                    target_input=parsed_target_input,
+                    target_index=parsed_target_index,
+                    target_fields=parsed_target_fields,
+                    target_custom=parsed_target_custom,
+                    return_token_count=return_token_count
                 )
             else:
                 step_output = comp.run(
@@ -1507,7 +1590,7 @@ class Automation(Component):
 
                 next_steps = step["if_true"] if condition_met else step["if_false"]
                 for branch_step in next_steps:
-                    current_output = self._execute_step(branch_step, current_output, db_conn, verbose, on_update, on_update_params)
+                    current_output = self._execute_step(branch_step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
 
             elif control_flow_type == "while":
                 run_first_pass = step.get("run_first_pass", True)
@@ -1522,7 +1605,7 @@ class Automation(Component):
                         if verbose:
                             logger.debug(f"[Automation:{self.name}] => executing while loop body.")
                         for nested_step in body:
-                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
+                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
 
                         if (isinstance(end_condition, bool) and end_condition) or \
                         (isinstance(end_condition, (str, dict)) and self._evaluate_condition(end_condition, current_output)):
@@ -1556,7 +1639,8 @@ class Automation(Component):
                     for nested_step in body:
                         current_output = self._execute_step(
                             nested_step, current_output, db_conn, 
-                            verbose, on_update, on_update_params
+                            verbose, on_update, on_update_params,
+                            return_token_count
                         )
 
             elif control_flow_type == "switch":
@@ -1574,7 +1658,7 @@ class Automation(Component):
                         if verbose:
                             logger.debug(f"[Automation:{self.name}] Switch matched case: {case_value}")
                         for nested_step in case_body:
-                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
+                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
                         executed = True
                         break
                 
@@ -1585,7 +1669,7 @@ class Automation(Component):
                             if verbose:
                                 logger.debug(f"[Automation:{self.name}] Executing default case")
                             for nested_step in case.get("body", []):
-                                current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params)
+                                current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
                             break
 
             else:
@@ -2679,7 +2763,8 @@ class AgentSystemManager:
             target_index: Optional[int],
             target_custom: Optional[list],
             on_update: Optional[Callable],
-            on_update_params: Optional[Dict] = None
+            on_update_params: Optional[Dict] = None,
+            return_token_count = False
         ) -> Dict:
 
         db_conn = self._get_user_db()
@@ -2738,24 +2823,36 @@ class AgentSystemManager:
                 output_dict = comp.run(
                     verbose=verbose,
                     on_update_params = on_update_params,
-                    on_update=lambda messages, manager, on_update_params: on_update(messages, manager, on_update_params) if on_update else None
+                    on_update=lambda messages, manager, on_update_params: on_update(messages, manager, on_update_params) if on_update else None,
+                    return_token_count=return_token_count
                 )
             else:
                 output_dict = comp.run(
                     verbose=verbose,
-                    on_update=lambda messages, manager: on_update(messages, manager) if on_update else None
+                    on_update=lambda messages, manager: on_update(messages, manager) if on_update else None,
+                    return_token_count=return_token_count
                 )
         else:
             # Agents, Tools, and Processes accept input targeting arguments
             if verbose:
                 logger.debug(f"[Manager] Running {component_name or comp.name} with target_input={target_input}, "
                     f"target_index={target_index}, target_custom={target_custom}")
-            output_dict = comp.run(
-                verbose=verbose,
-                target_input=target_input,
-                target_index=target_index,
-                target_custom=target_custom
-            )
+                
+            if isinstance(comp, Agent):
+                output_dict = comp.run(
+                    verbose=verbose,
+                    target_input=target_input,
+                    target_index=target_index,
+                    target_custom=target_custom,
+                    return_token_count=return_token_count
+                )
+            else:
+                output_dict = comp.run(
+                    verbose=verbose,
+                    target_input=target_input,
+                    target_index=target_index,
+                    target_custom=target_custom
+                )
             if on_update:
                 if on_update_params:
                     on_update(self.get_messages(user_id), self, on_update_params)
@@ -2780,7 +2877,8 @@ class AgentSystemManager:
         on_update: Optional[Callable] = None,
         on_complete: Optional[Callable] = None,
         on_update_params: Optional[Dict] = None,
-        on_complete_params: Optional[Dict] = None
+        on_complete_params: Optional[Dict] = None,
+        return_token_count = False
     ) -> Dict:
         """
         - If user_id is given, we switch to that DB. If none, we use/create the current user.
@@ -2792,7 +2890,7 @@ class AgentSystemManager:
 
         def task():
             self._run_internal(
-                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params
+                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
             )
             if on_complete:
                 if on_complete_params:
@@ -2802,7 +2900,7 @@ class AgentSystemManager:
 
         if blocking:
             result = self._run_internal(
-                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params
+                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
             )
             if on_complete:
                 if on_complete_params:
@@ -3181,7 +3279,8 @@ class AgentSystemManager:
               on_complete = None, on_update = None, speech_to_text=None,
               whisper_provider=None, whisper_model=None,
               on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.",
-              on_clear_msg = "Message history deleted."):
+              on_clear_msg = "Message history deleted.",
+              return_token_count = False):
 
         # Get Telegram token from API keys if not provided
         if telegram_token is None:
@@ -3341,7 +3440,8 @@ class AgentSystemManager:
                     on_update=on_update_fn,
                     on_update_params=params,
                     on_complete = on_complete_fn,
-                    on_complete_params=params
+                    on_complete_params=params,
+                    return_token_count=return_token_count
                 )
 
             thread = threading.Thread(target=run_manager_thread, daemon=True)
