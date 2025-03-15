@@ -47,6 +47,7 @@ Installing `mas` from GitHub is easy and straightforward.
 ### Prerequisites
 
 -   Python 3.7+
+-   tzdata Package (pip install --upgrade tzdata)
 -   [Git](https://git-scm.com/downloads)
 -   API keys for services you plan to use (OpenAI, Groq, etc)
 
