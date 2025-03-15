@@ -587,8 +587,8 @@ class Agent(Component):
 
         if return_token_count:
             usage = json_response.get("usage", {})
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
 
             return (content, input_tokens, output_tokens)
         else:
