@@ -305,8 +305,9 @@ agent_name = manager.create_agent(
     default_output={"query": "default query", "items": "default items."}, # Default: {"response": "No valid response."}
     positive_filter=["user", "tool-mytool"], # Default: None
     negative_filter=["bot-otheragent"],  # Default: None
-    include_timestamp=False # Default: False
-    model_params={"temperature": 1.0, "max_tokens": 4096}
+    include_timestamp=False, # Default: False
+    model_params={"temperature": 1.0, "max_tokens": 4096},
+    description="Uses tools to do X." # Default: None
 )
 ```
 
@@ -339,6 +340,7 @@ agent_name = manager.create_agent(
     -   Exact role names (e.g., `myagent`)
 -   **`include_timestamp`**:  Whether this agent should receive `timestamp` information for each message. Defaults to whatever was defined for the manager if not specified, which itself defaults to False.
 -   **`model_params`**: Dictionary including params for advanced LLM configuration. Supported params right now are `temperature`, `max_tokens` and `top_p`. Not defining these will use default configuration for each provider.
+-   **`description`**: Optional description of the component, solely to be read by the developer.
 
 
 You can create agents when defining the system from a JSON file by including them in the component list:
@@ -371,7 +373,8 @@ You can create agents when defining the system from a JSON file by including the
       "model_params": {
         "temperature": 1.0,
         "max_tokens": 4096
-      }
+      },
+      "description": "Uses tools to do X."
     }
   ]
 }
@@ -390,7 +393,8 @@ tool_name = manager.create_tool(
     outputs={"data_field_1": "some data returned by the api",
             "data_field_2": "more data returned by the api"},
     function=my_tool_function,
-    default_output={"items": "Default items"}  # Default: {}
+    default_output={"items": "Default items"},  # Default: {}
+    description="Executes API calls for data retrieval"
 )
 ```
 
@@ -399,6 +403,7 @@ tool_name = manager.create_tool(
 -   **`outputs`**:  A dictionary describing the output parameters of the `function` using descriptions and names.
 -   **`function`**: A callable (function) that performs the task of the tool. This function receives as many arguments as needed, which must be defined in the same order as the dictionary that will be used as input for this tool (the dictionary from the latest message is used by default, but more complex inputs can be defined as explained below). This function can also optionally receive the `manager` as its first argument, in which case `"manager"` should be the first parameter in the function definition, followed by all parameters in the input dictionary.
 -  **`default_output`**: Output to use if there's an error during the function call, or an exception has been raised by the function.
+-   **`description`**: Optional description of the component, solely to be read by the developer.
 
 Tools can be included in the component list of the config JSON file just like agents:
 
@@ -408,6 +413,7 @@ Tools can be included in the component list of the config JSON file just like ag
     {
       "type": "tool",
       "name": "mytool",
+      "description": "Executes API calls for data retrieval.",
       "inputs": {
         "query": "query from the agent to call the tool"
       },
@@ -434,12 +440,14 @@ def my_process_function(manager, messages): # in this case, both manager and mes
 
 process_name = manager.create_process(
     name="myprocess",
-    function=my_process_function
+    function=my_process_function,
+    description="This is what the function does."
 )
 ```
 
 -   **`name`**: The name of the process.
 -   **`function`**: A callable (function) that performs data transformations, data loading, etc. This function can receive as argument the `manager` object itself (the parameter must be called `"manager"`) and/or a list of messages (must be named `"messages"`). Each message is a dictionary with two fields ("source", with the source role, and "message" with the actual content, which itself contains `"source"`, `"message"`, `"msg_number"`, `"type"` and `"timestamp"`). The function must return a dictionary, which will be saved in the message history. Both input parameters are optional: you can define process functions which only receive either the `manager` object, or only the `messages` list, or neither. The function call is invariant to the order of the parameters.
+-   **`description`**: Optional description of the component, solely to be read by the developer.
 
 You can also define processes in the config JSON file:
 
@@ -449,7 +457,8 @@ You can also define processes in the config JSON file:
     {
       "type": "process",
       "name": "myprocess",
-      "function": "fn:my_process_function"
+      "function": "fn:my_process_function",
+      "description": "This is what the function does."
     }
   ]
 }
@@ -462,6 +471,7 @@ Automations allow you to orchestrate multiple components (agents, tools, process
 ```python
 automation_name = manager.create_automation(
     name="myautomation",   # Optional, defaults to automation-<n>
+    description="Orchestrates a series of agents and tools for end-to-end processing.",
     sequence=[
         "first_agent",
         "first_tool",
@@ -492,6 +502,7 @@ automation_name = manager.create_automation(
 ```
 
 -   **`name`**: The name of the automation.  If not specified, defaults to `automation-<n>`.
+-   **`description`**: Optional description of the component, solely to be read by the developer.
 -   **`sequence`**: An ordered list of steps to execute. Steps can be:
     -   A string representing a component name, with an optional input specification (more on **`mas` input syntax** below).
     -   A control flow dictionary (`"branch"`, `"while"`, `"for"`, or `"switch"`) - for more details, please refer to the section below.
@@ -504,6 +515,7 @@ Defining an automation in the config JSON file is as simple as including it in t
     {
       "type": "automation",
       "name": "myautomation",
+      "description": "Orchestrates a series of agents and tools for end-to-end processing.",
       "sequence": [
         "first_agent",
         "first_tool",
@@ -881,7 +893,8 @@ output = manager.run(
    on_complete=None, # Optional -> defaults to defined in system build
    on_update=None, # Optional -> defaults to defined in system build
    on_update_params = {"to_use_in_update": value},
-   on_complete_params = {"to_use_in_complete": value}
+   on_complete_params = {"to_use_in_complete": value},
+   return_token_count=False
 )
 print(output)
 ```
@@ -902,6 +915,7 @@ print(output)
 -   **`on_update`**: Similar to on_complete but runs everytime a component is finished running, useful for automations.
 -   **`on_complete_params`**: Dictionary containing values that can be accessed inside on_complete.
 -   **`on_update_params`**: Dictionary containing values that can be accessed inside on_update.
+-   **`return_token_count`**: Boolean that determines whether the output of agents in this run should include metadata about input and output token count. Useful when debugging and calculating token usage for a system.
 
 ### Running the System in Non-Blocking Mode
 
@@ -1023,6 +1037,27 @@ The `mas` library detects when a tool or a process returns a dictionary with val
 ```python
 manager.clear_file_cache() # Clears the cache that stores pickle objects.
 ```
+
+### Getting a system description with `to_string()`
+
+Each component and the manager provide a `to_string()` method that outputs a human‐readable summary of its configuration and current state.
+
+#### Manager `to_string()`
+
+The `AgentSystemManager.to_string()` method returns a formatted string that includes:
+
+- The base directory
+- The current user ID
+- The general system description
+- A summary of all components (agents, tools, processes, automations), including:
+  - Their names
+  - Descriptions (if provided)
+  - Types and key configuration parameters
+
+```python
+print(manager.to_string())
+```
+
 
 ### Loading from JSON and running the system
 
@@ -1151,7 +1186,8 @@ manager.start_telegram_bot(
   whisper_model=None, # defaults to v3-turbo in groq and v2 in openai
   speech_to_text=None, # optional callable if you need to process your audios and voice notes in a custom way
   on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.", # defaults to this message
-  on_clear_msg = "Message history deleted." # defaults to this message
+  on_clear_msg = "Message history deleted." # defaults to this message,
+  return_token_count = False
 )
 ```
 
@@ -1165,6 +1201,7 @@ manager.start_telegram_bot(
 -   **`speech_to_text`**: Optional callable, custom function to be called instead of the default providers.
 -   **`on_start_msg`**: Optional string defining what the bot will send to the user when receiving '/start' commnad.
 -   **`on_clear_msg`**: Optional string defining what the bot will send to the user when receiving '/clear' command.
+-   **`return_token_count`**: Boolean that determines whether the output of agents should include metadata about input and output token count. Useful when debugging and calculating token usage for a system.
 
 After defining the system through JSON and writing the necessary functions, it's possible to run a full Telegram bot with just one line of code:
 
