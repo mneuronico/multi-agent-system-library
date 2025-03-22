@@ -3393,7 +3393,7 @@ class AgentSystemManager:
                     transcript = speech_to_text({"manager": self, "file_path": file_path, "update": update, "context": context})
                 else:
                     # Try automatic transcription
-                    transcript = self._transcribe_audio(file_path, whisper_provider, whisper_model)
+                    transcript = self.stt(file_path, whisper_provider, whisper_model)
 
                     if verbose:
                         logger.debug(f"Audio transcription succeeded: {transcript}")
@@ -3530,7 +3530,7 @@ class AgentSystemManager:
 
         application.run_polling()
 
-    def _transcribe_audio(self, file_path, provider=None, model=None):
+    def stt(self, file_path, provider=None, model=None):
         # Determine which provider to use
         if provider:
             provider = provider.lower()
@@ -3616,7 +3616,117 @@ class AgentSystemManager:
         
         return response.json().get("text", "")
 
+    def tts(
+        self,
+        text: str,
+        voice: str,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        instruction: Optional[str] = None
+    ) -> str:
+        """
+        Convert text to speech using the specified provider.
+        
+        Returns:
+            The file path to the saved MP3 audio file.
+        """
 
+        provider = (provider or "openai").lower()
+        if provider == "openai":
+            file_path = self._generate_tts_openai(text, voice, model, instruction)
+        elif provider == "elevenlabs":
+            file_path = self._generate_tts_elevenlabs(text, voice, model)
+        else:
+            raise ValueError(f"Unsupported TTS provider: {provider}")
+        return file_path
+
+    def _generate_tts_openai(
+        self,
+        text: str,
+        voice: str,
+        model: Optional[str],
+        instruction: Optional[str]
+    ) -> str:
+        api_key = self.get_key("openai")
+        if not api_key:
+            raise ValueError("OpenAI API key not found.")
+        # Set default model if not provided
+        if not model:
+            model = "gpt-4o-mini-tts"
+        
+        url = "https://api.openai.com/v1/audio/speech"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model,
+            "input": text,
+            "voice": voice.lower()
+        }
+        # Only include instructions if provided
+        if instruction:
+            data["instructions"] = instruction
+
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        audio_bytes = response.content
+        return self._save_tts_file(audio_bytes)
+
+    def _generate_tts_elevenlabs(
+        self,
+        text: str,
+        voice: str,
+        model: Optional[str]
+    ) -> str:
+        api_key = self.get_key("elevenlabs")
+        if not api_key:
+            raise ValueError("ElevenLabs API key not found.")
+        # Set default model if not provided
+        if not model:
+            model = "eleven_multilingual_v2"
+        
+        # Retrieve voices to map the voice name to a voice_id
+        voices_url = "https://api.elevenlabs.io/v1/voices"
+        headers = {"xi-api-key": api_key}
+        voices_response = requests.get(voices_url, headers=headers)
+        voices_response.raise_for_status()
+        voices_data = voices_response.json()
+        voice_id = None
+        for v in voices_data.get("voices", []):
+            if v.get("name", "").lower() == voice.lower():
+                voice_id = v.get("voice_id")
+                break
+        if not voice_id:
+            raise ValueError(f"Voice '{voice}' not found in ElevenLabs voices.")
+        
+        tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=mp3_44100_128"
+        payload = {
+            "text": text,
+            "model_id": model
+        }
+        headers = {
+            "xi-api-key": api_key,
+            "Content-Type": "application/json"
+        }
+        response = requests.post(tts_url, headers=headers, json=payload)
+        response.raise_for_status()
+        audio_bytes = response.content
+        return self._save_tts_file(audio_bytes)
+
+    def _save_tts_file(self, audio_bytes: bytes) -> str:
+        """
+        Helper function to save the audio file (mp3) in the files/tts folder.
+        The file is named as <user_id>_<random_hash>.mp3.
+        """
+        tts_folder = os.path.join(self.files_folder, "tts")
+        os.makedirs(tts_folder, exist_ok=True)
+        user_id = self._current_user_id if self._current_user_id else "unknown"
+        filename = f"{user_id}_{uuid.uuid4().hex}.mp3"
+        file_path = os.path.join(tts_folder, filename)
+        with open(file_path, "wb") as f:
+            f.write(audio_bytes)
+        return file_path
 
 class Parser:
     """

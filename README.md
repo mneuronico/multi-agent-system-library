@@ -1106,6 +1106,36 @@ def on_complete_function(messages, manager):
 
 In this function, you could possibly send this message to your own database, to a messaging app or to a custom user interface.
 
+### Speech-to-Text (STT) Functionality
+
+The MAS library includes built-in speech-to-text support via the manager’s `stt` method. This function converts an audio file into text that can be used as input for agents, tools, or processes.
+
+- **Method Signature:**  
+  `stt(file_path, provider=None, model=None)`  
+  - **file_path:** The local path to the audio file to be transcribed.
+  - **provider:** Optionally specify the transcription provider, either `"groq"` or `"openai"`. If not provided, the method automatically selects a provider based on available API keys.
+  - **model:** Optionally specify the transcription model. Defaults are `"whisper-large-v3-turbo"` for Groq and `"whisper-1"` for OpenAI.
+
+- **Output:**  
+  The method returns the transcribed text as a string.
+
+
+### Text-to-Speech (TTS) Functionality
+
+The MAS library includes built-in text-to-speech support via the manager’s `tts` method. This function converts input text into a speech audio file (MP3), which can be used to generate audio responses in your multi-agent workflows.
+
+- **Method Signature:**  
+  `tts(text, voice, provider=None, model=None, instruction=None)`  
+  - **text:** The text to be converted into speech.
+  - **voice:** The desired voice name. For OpenAI, this value is used directly. For ElevenLabs, the voice name is used to look up the corresponding voice ID.
+  - **provider:** Optionally specify the provider, either `"openai"` or `"elevenlabs"`. If not provided, OpenAI is used by default.
+  - **model:** Optionally specify the model. Defaults are `"gpt-4o-mini-tts"` for OpenAI and `"eleven_multilingual_v2"` for ElevenLabs.
+  - **instruction:** An optional parameter for OpenAI to control the tone or style of the generated speech.
+
+- **Output:**  
+  The generated audio (in MP3 format) is saved in the `files` directory, in a special subfolder named `tts`, with a filename that combines the current user ID and a random hash. The method returns the full path to the saved audio file.
+
+
 ### Telegram Integration
 
 The `mas` library allows the developer to integrate any system with Telegram seamlessly to allow users to interact with the system through the messaging app without requiring the developer to define custom async logic and event loops. This is possible through the `start_telegram_bot` method:
@@ -1144,7 +1174,7 @@ AgentSystemManager(config_json="config.json").start_telegram_bot()
 
 Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can return a string (which will be sent to the correct user by the system), `None` to send nothing, or a dict for more advanced response patterns, as described below.
 
-#### Speech To Text
+#### Automatic Speech To Text in Telegram
 
 The `mas` Telegram integration functionality handles speech-to-text transcription for audios and voice notes automatically. You can specify a provider (either `groq` or `openai`) as described above, or they will be used automatically if the API key is available (`groq` is tried first). You may also define your own `speech_to_text` function if you need to. This function must receive a single argument, a dictionary with keys for `manager`, the audio's `file_path`, and Telegram's `update` and `context`. The function must return the text as string.
 

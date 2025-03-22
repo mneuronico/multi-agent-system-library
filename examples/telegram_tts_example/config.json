@@ -1,0 +1,19 @@
+{
+    "general_parameters": {
+        "default_models": [
+            {"provider": "openai", "model": "gpt-4o-mini"}
+        ]
+    },
+    "components": [
+        {
+            "type": "agent",
+            "name": "talker",
+            "system": "You are a helpful assistant."
+        },
+        {
+            "type": "process",
+            "name": "tts",
+            "function": "fn:tts"
+        }
+    ]
+}

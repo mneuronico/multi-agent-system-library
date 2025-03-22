@@ -1,0 +1,5 @@
+{
+    "openai": "your-openai-key",
+    "elevenlabs": "your-elevenlabs-key",
+    "telegram_token": "your-telegram-token"
+}
