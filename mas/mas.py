@@ -141,21 +141,34 @@ class Agent(Component):
                 if verbose:
                     logger.warning(f"[Agent:{self.name}] No API key for '{provider}'. Skipping.")
                 continue
+            
+            formatted_conversation = self._provider_format_messages(provider, conversation)
 
             try:
                 response = None
+                
                 if provider == "openai":
                     response = self._call_openai_api(
                         model_name=model_name,
-                        conversation=conversation,
+                        conversation=formatted_conversation,
                         api_key=api_key,
                         verbose=verbose,
                         return_token_count=return_token_count
                     )
+                elif provider == "lmstudio":
+                    base_url = model_info.get("base_url")
+                    response = self._call_lmstudio_api(
+                        model_name=model_name,
+                        conversation=formatted_conversation,
+                        api_key=api_key,
+                        verbose=verbose,
+                        return_token_count=return_token_count,
+                        base_url=base_url
+                    )
                 elif provider == "deepseek":
                     response = self._call_deepseek_api(
                         model_name=model_name,
-                        conversation=conversation,
+                        conversation=formatted_conversation,
                         api_key=api_key,
                         verbose=verbose,
                         return_token_count=return_token_count
@@ -163,7 +176,7 @@ class Agent(Component):
                 elif provider == "google":
                     response = self._call_google_api(
                         model_name=model_name,
-                        conversation=conversation,
+                        conversation=formatted_conversation,
                         api_key=api_key,
                         verbose=verbose,
                         return_token_count=return_token_count
@@ -171,7 +184,7 @@ class Agent(Component):
                 elif provider == "groq":
                     response = self._call_groq_api(
                         model_name=model_name,
-                        conversation=conversation,
+                        conversation=formatted_conversation,
                         api_key=api_key,
                         verbose=verbose,
                         return_token_count=return_token_count
@@ -179,7 +192,7 @@ class Agent(Component):
                 elif provider == "anthropic":
                     response = self._call_anthropic_api(
                         model_name=model_name,
-                        conversation=conversation,
+                        conversation=formatted_conversation,
                         api_key=api_key,
                         verbose=verbose,
                         return_token_count=return_token_count
@@ -215,6 +228,158 @@ class Agent(Component):
         if verbose:
             logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self.default_output}")
         return self.default_output
+
+    def _as_blocks(self, content: Any) -> list:
+        """
+        Normaliza cualquier content (str | dict | list) a
+        una lista de bloques  {'type': ..., ...}
+        """
+        if isinstance(content, list) and all(isinstance(b, dict) and "type" in b for b in content):
+            return content
+
+        if isinstance(content, dict):
+            return [{"type": "text", "text": json.dumps(content, ensure_ascii=False)}]
+
+        return [{"type": "text", "text": str(content)}]
+
+    def _provider_format_messages(self, provider: str, conversation: list) -> list:
+        """
+        Convierte una conversación en bloques genéricos al formato específico
+        que espera cada proveedor (OpenAI, Gemini, Anthropic, etc.).
+        """
+        provider = provider.lower()
+        formatted = []
+
+        for msg in conversation:
+            role = msg["role"]
+            blocks = self._as_blocks(msg["content"])
+
+            if provider in {"openai", "groq", "deepseek"}:
+                """ # openai-style => "image_url"
+                parts = []
+                for b in blocks:
+                    if b["type"] == "text":
+                        parts.append({"type": "text", "text": b["text"]})
+                    elif b["type"] == "image":
+                        src = b["source"]
+                        if src["kind"] == "url":
+                            parts.append({"type": "image_url",
+                                        "image_url": {"url": src["url"],
+                                                        "detail": src.get("detail", "auto")}})
+                        elif src["kind"] == "b64":
+                            url = f"data:image/*;base64,{src['b64']}"
+                            parts.append({"type": "image_url",
+                                        "image_url": {"url": url,
+                                                        "detail": src.get("detail", "auto")}})
+                        elif src["kind"] == "file":
+                            # cargamos bytes y los embebemos como b64
+                            file_path = src["path"]
+                            if file_path.startswith("file:"):
+                                file_path = file_path[5:]      # quita prefijo
+                            raw = self.manager._load_file(file_path)
+                            import base64, mimetypes, os
+                            mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
+                            url = f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+                            parts.append({"type": "image_url",
+                                        "image_url": {"url": url,
+                                                        "detail": src.get("detail", "auto")}})
+                formatted.append({"role": role, "content": parts}) """
+                
+                if role == "user":
+                    # Sólo para mensajes user multimodales -> parts[]
+                    parts = []
+                    for b in blocks:
+                        if b["type"] == "text":
+                            parts.append({"type": "text", "text": b["text"]})
+                        elif b["type"] == "image":
+                            src = b["source"]
+                            if src["kind"] == "url":
+                                parts.append({"type": "image_url",
+                                            "image_url": {"url": src["url"],
+                                                            "detail": src.get("detail", "auto")}})
+                            elif src["kind"] == "b64":
+                                url = f"data:image/*;base64,{src['b64']}"
+                                parts.append({"type": "image_url",
+                                            "image_url": {"url": url,
+                                                            "detail": src.get("detail", "auto")}})
+                            elif src["kind"] == "file":
+                                # cargamos bytes y los embebemos como b64
+                                file_path = src["path"]
+                                if file_path.startswith("file:"):
+                                    file_path = file_path[5:]      # quita prefijo
+                                raw = self.manager._load_file(file_path)
+                                import base64, mimetypes, os
+                                mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
+                                url = f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+                                parts.append({"type": "image_url",
+                                            "image_url": {"url": url,
+                                                            "detail": src.get("detail", "auto")}})
+                    formatted.append({"role": role, "content": parts})
+                else:
+                    # system o assistant -> convertir a string plano
+                    text = self._flatten_system_content(blocks)
+                    formatted.append({"role": role, "content": text})
+
+
+            elif provider == "google":
+                # Gemini => "parts" dentro de "contents"
+                part_objs = []
+                for b in blocks:
+                    if b["type"] == "text":
+                        part_objs.append({"text": b["text"]})
+                    elif b["type"] == "image":
+                        src = b["source"]
+                        if src["kind"] == "url":
+                            part_objs.append(
+                                {"inline_data": {"mime_type": "image/*", "data": requests.get(src["url"]).content.encode("base64")}}
+                            )
+                        elif src["kind"] == "b64":
+                            part_objs.append(
+                                {"inline_data": {"mime_type": "image/*", "data": src["b64"]}}
+                            )
+                        elif src["kind"] == "file":
+                            file_path = src["path"]
+                            if file_path.startswith("file:"):
+                                file_path = file_path[5:]      # quita prefijo
+                            raw = self.manager._load_file(file_path)
+                            import base64, mimetypes
+                            mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
+                            part_objs.append(
+                                {"inline_data": {"mime_type": mime, "data": base64.b64encode(raw).decode()}}
+                            )
+                formatted.append({"role": role, "parts": part_objs})
+
+            elif provider == "anthropic":
+                # Claude 3 => blocks "type":"image"/"text"
+                content_blocks = []
+                for b in blocks:
+                    if b["type"] == "text":
+                        content_blocks.append({"type": "text", "text": b["text"]})
+                    elif b["type"] == "image":
+                        src = b["source"]
+                        if src["kind"] in {"url", "b64"}:
+                            content_blocks.append({"type": "image",
+                                                "source": {"type": src["kind"],
+                                                            "data": src.get("b64"),
+                                                            "url": src.get("url"),
+                                                            "media_type": "image/jpeg"}})
+                        elif src["kind"] == "file":
+                            file_path = src["path"]
+                            if file_path.startswith("file:"):
+                                file_path = file_path[5:]      # quita prefijo
+                            raw = self.manager._load_file(file_path)
+                            import base64, mimetypes
+                            mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
+                            content_blocks.append({"type": "image",
+                                                "source": {"type": "base64",
+                                                            "data": base64.b64encode(raw).decode(),
+                                                            "media_type": mime}})
+                formatted.append({"role": role, "content": content_blocks})
+
+            else:
+                return conversation
+
+        return formatted
 
 
     def _build_conversation_from_parser_result(self, parsed: dict, db_conn: sqlite3.Connection, verbose: bool) -> List[Dict[str, Any]]:
@@ -316,29 +481,40 @@ class Agent(Component):
             if isinstance(data, dict) and fields:
                 data = self._extract_fields_from_data(data, fields)
 
-            if isinstance(data, dict):
-                data_str = json.dumps(data, indent=2)
+            if isinstance(data, list) and all(isinstance(b, dict) and "type" in b for b in data):
+                blocks = [b.copy() for b in data]
             else:
-                data_str = str(data)
+                blocks = self._as_blocks(data)
 
-            compound_str = f'{{"source": "{msg_type}: {role}", "message": "{data_str}"}}'
+            if role != self.name:
+                source = f"{msg_type}: {role}"
+                for blk in blocks:
+                    if blk["type"] == "text":
+                        # envolvemos el texto original dentro del JSON wrapper
+                        original = blk["text"]
 
-            if self.include_timestamp:
-                try:
-                    dt = datetime.fromisoformat(timestamp)
-                    formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
-                except (ValueError, TypeError):
-                    formatted_ts = timestamp
+                        wrapper_obj = {
+                            "source": source,
+                            "message": original
+                        }
 
-                compound_str = compound_str + f', timestamp: {formatted_ts}'
+                        if self.include_timestamp:
+                            try:
+                                dt = datetime.fromisoformat(timestamp)
+                                formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
+                            except (ValueError, TypeError):
+                                formatted_ts = timestamp
 
-            message = {
+                            wrapper_obj["timestamp"] = formatted_ts
+
+                        # reemplazamos el campo "text" por la serialización
+                        blk["text"] = json.dumps(wrapper_obj, ensure_ascii=False)
+
+            conversation.append({
                 "role": "assistant" if role == self.name else "user",
-                "content": data_str if role == self.name else compound_str,
+                "content": blocks,
                 "msg_number": msg_number
-            }
-                
-            conversation.append(message)
+            })
 
         # Sort by msg_number to preserve chronological order
         conversation.sort(key=lambda e: e["msg_number"])
@@ -529,7 +705,15 @@ class Agent(Component):
                         continue  # Keep shrinking the window
         return None  # No valid JSON found
     
-
+    def _flatten_system_content(self, blocks):
+        # puede venir string o lista de bloques
+        if isinstance(blocks, str):
+            return blocks
+        if isinstance(blocks, list):
+            return "\n".join(b["text"] for b in blocks if b.get("type") == "text")
+        # fallback
+        return str(blocks)
+    
     def _call_openai_api(
         self,
         model_name: str,
@@ -548,7 +732,7 @@ class Agent(Component):
         # Filter out None values
         params = {k: v for k, v in params.items() if v is not None}
 
-        # Transform system => developer (required for openAI)
+        
         new_messages = []
         for msg in conversation:
             role = msg["role"]
@@ -574,13 +758,85 @@ class Agent(Component):
             },
             **params
         }
+        
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=data
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # imprime status + body
+            status = getattr(e.response, "status_code", None)
+            body   = getattr(e.response, "text", None)
+            logger.error(f"[Agent:{self.name}] OPENAI HTTP {status} ERROR:\n{body}")
+            raise
 
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=data
-        )
-        response.raise_for_status()
+        json_response = response.json()
+        content = json_response["choices"][0]["message"]["content"]
+
+        if return_token_count:
+            usage = json_response.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+
+            return (content, input_tokens, output_tokens)
+        else:
+            return content
+
+
+    def _call_lmstudio_api(
+        self,
+        model_name: str,
+        conversation: List[Dict[str, Any]],
+        api_key: str,
+        verbose: bool,
+        return_token_count: bool = False,
+        base_url: Optional[str] = None
+    ) -> str:
+        api_base = base_url or "http://localhost:1234/v1"
+        url = f"{api_base}/chat/completions"
+        schema_for_response = self._build_json_schema()
+        
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_tokens": self.model_params.get("max_tokens"),
+            "top_p": self.model_params.get("top_p")
+        }
+        # Filter out None values
+        params = {k: v for k, v in params.items() if v is not None}
+
+        if verbose:
+            logger.debug(f"[Agent:{self.name}] _call_lmstudio_api => model={model_name} (params = {params})")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model_name,
+            "messages": conversation,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": schema_for_response
+            },
+            **params
+        }
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=data
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # imprime status + body
+            status = getattr(e.response, "status_code", None)
+            body   = getattr(e.response, "text", None)
+            logger.error(f"[Agent:{self.name}] LMSTUDIO HTTP {status} ERROR:\n{body}")
+            raise
 
         json_response = response.json()
         content = json_response["choices"][0]["message"]["content"]
@@ -630,12 +886,19 @@ class Agent(Component):
             **params
         }
 
-        response = requests.post(
-            "https://api.deepseek.com/chat/completions",
-            headers=headers,
-            json=data
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                "https://api.deepseek.com/chat/completions",
+                headers=headers,
+                json=data
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # imprime status + body
+            status = getattr(e.response, "status_code", None)
+            body   = getattr(e.response, "text", None)
+            logger.error(f"[Agent:{self.name}] DEEPSEEK HTTP {status} ERROR:\n{body}")
+            raise
 
         json_response = response.json()
         content = json_response["choices"][0]["message"]["content"]
@@ -667,34 +930,51 @@ class Agent(Component):
         # Filter out None values
         params = {k: v for k, v in params.items() if v is not None}
 
-        system_instruction = None
+        system_parts = None
         contents = []
         for msg in conversation:
-            if msg["role"] == "system":
-                system_instruction = msg["content"]
+
+            role = msg["role"]
+            parts = msg.get("parts")
+
+
+            if role == "system":
+                system_parts = parts or []
             else:
-                role = "user" if msg["role"] == "user" else "model"
                 contents.append({
-                    "role": role,
-                    "parts": [{"text": msg["content"]}]
+                    "role": "user" if role == "user" else "model",
+                    "parts": parts or []
                 })
 
         if verbose:
             logger.debug(f"[Agent:{self.name}] _call_google_api => model={model_name} (params = {params})")
         
-        data = {
+        payload = {
             "contents": contents,
             "generationConfig": params
         }
-        if system_instruction:
-            data["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        if system_parts is not None:
+            payload["systemInstruction"] = {"parts": system_parts}
 
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
-            json=data
-        )
-        response.raise_for_status()
+        
+
+        try:
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}",
+                headers={"Content-Type": "application/json"},
+                json=payload
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # imprime status + body
+            status = getattr(e.response, "status_code", None)
+            body   = getattr(e.response, "text", None)
+            logger.error(f"[Agent:{self.name}] GOOGLE HTTP {status} ERROR:\n{body}")
+            raise
+
+
+
+
         response_json = response.json()
         
         content = response_json["candidates"][0]["content"]["parts"][0]["text"]
@@ -744,13 +1024,23 @@ class Agent(Component):
             "system": system_prompt,
             **params
         }
-        
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=data
-        )
-        response.raise_for_status()
+
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # imprime status + body
+            status = getattr(e.response, "status_code", None)
+            body   = getattr(e.response, "text", None)
+            logger.error(f"[Agent:{self.name}] ANTHROPIC HTTP {status} ERROR:\n{body}")
+            raise
+
+
+
         json_response = response.json()
     
         content = json_response["content"][0]["text"]
@@ -779,6 +1069,18 @@ class Agent(Component):
         }
         params = {k: v for k, v in params.items() if v is not None}
 
+        new_messages = []
+        for msg in conversation:
+            role = msg["role"]
+            blocks = msg["content"]       # lista de bloques
+
+            if role == "system":
+                # Groq (y la 1.0 de OpenAI) exigen string
+                sys_text = self._flatten_system_content(blocks)
+                new_messages.append({"role": "system", "content": sys_text})
+            else:
+                new_messages.append({"role": role, "content": blocks})
+
         if verbose:
             logger.debug(f"[Agent:{self.name}] _call_groq_api => model={model_name} (params = {params})")
 
@@ -788,17 +1090,24 @@ class Agent(Component):
         }
         data = {
             "model": model_name,
-            "messages": conversation,
+            "messages": new_messages,
             "response_format": {"type": "json_object"},
             **params
         }
 
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=data
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=data
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # imprime status + body
+            status = getattr(e.response, "status_code", None)
+            body   = getattr(e.response, "text", None)
+            logger.error(f"[Agent:{self.name}] GROQ HTTP {status} ERROR:\n{body}")
+            raise
 
         json_response = response.json()
         content = json_response["choices"][0]["message"]["content"]
@@ -2345,11 +2654,15 @@ class AgentSystemManager:
         self._current_user_id = user_id
         self._current_db_conn = self._ensure_user_db(user_id)
 
-    def _get_user_db(self) -> sqlite3.Connection:
-        if not self._current_user_id:
-            # create a new user
+    def ensure_user(self, user_id: Optional[str] = None) -> None:
+        if user_id:
+            self.set_current_user(user_id)
+        elif not self._current_user_id:
             new_user = str(uuid.uuid4())
             self.set_current_user(new_user)
+
+    def _get_user_db(self) -> sqlite3.Connection:
+        self.ensure_user()
         return self._current_db_conn
 
     def _get_next_msg_number(self, conn: sqlite3.Connection) -> int:
@@ -2358,14 +2671,16 @@ class AgentSystemManager:
         max_num = cur.fetchone()[0]
         return max_num + 1
 
-    def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict], type = "user", model: Optional[str] = None):
+    def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict, list], type = "user", model: Optional[str] = None):
         timestamp = datetime.now(self.timezone).isoformat()
 
-        if isinstance(content, dict):
-            # Convert dict -> JSON, persisting non-JSON objects to files
-            content_str = self._dict_to_json_with_file_persistence(content, self._current_user_id)
+        if isinstance(content, (dict, list)):
+            content_str = json.dumps(
+                self._persist_non_json_values(content, self._current_user_id),
+                indent=2
+            )
         else:
-            content_str = content
+            content_str = str(content)
 
         msg_number = self._get_next_msg_number(conn)
         cur = conn.cursor()
@@ -2427,13 +2742,14 @@ class AgentSystemManager:
 
     def _persist_non_json_values(self, value: Any, user_id: str) -> Any:
         if isinstance(value, dict):
-            new_dict = {}
-            for k, v in value.items():
-                new_dict[k] = self._persist_non_json_values(v, user_id)
-            return new_dict
+            return {k: self._persist_non_json_values(v, user_id) for k, v in value.items()}
 
         if isinstance(value, list):
             return [self._persist_non_json_values(item, user_id) for item in value]
+
+        # ⬇️ NUEVO: bytes / bytearray se guardan igual que otros objetos
+        if isinstance(value, (bytes, bytearray)):
+            return self._store_file(value, user_id)
 
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
@@ -2459,32 +2775,23 @@ class AgentSystemManager:
         return f"file:{file_path}"
 
     def _load_files_in_dict(self, value: Any) -> Any:
-        """
-        Recursively walk a dict/list, detect "file:/path" placeholders, load them,
-        and replace with the actual object. Return the fully loaded structure.
-        """
-
         if isinstance(value, str):
             try:
                 value = json.loads(value)
             except json.JSONDecodeError:
                 pass
-        else:
-            pass
 
         if isinstance(value, dict):
-            for k, v in value.items():
-                value[k] = self._load_files_in_dict(v)
-            return value
-        elif isinstance(value, list):
+            return {k: self._load_files_in_dict(v) for k, v in value.items()}
+
+        if isinstance(value, list):
             return [self._load_files_in_dict(item) for item in value]
-        elif isinstance(value, str) and value.startswith("file:"):
-            file_path = value[5:]  # remove "file:"
-            return self._load_file(file_path)
-        elif isinstance(value, str):
-            return value
-        else:
-            return value
+
+        # ⬇️ file:/  -> cargar del disco / caché
+        if isinstance(value, str) and value.startswith("file:"):
+            return self._load_file(value[5:])
+
+        return value
        
     def _load_file(self, file_path: str) -> Any:
         if file_path in self._file_cache:
@@ -2814,7 +3121,6 @@ class AgentSystemManager:
             return_token_count = False
         ) -> Dict:
 
-        db_conn = self._get_user_db()
         if user_id:
             self.set_current_user(user_id)
         elif not self._current_user_id:
@@ -2960,6 +3266,12 @@ class AgentSystemManager:
             thread.daemon = True  # Ensures thread exits when the main program exits
             thread.start()
             return None
+
+    def save_file(self, obj: Any, user_id = None) -> str:
+        # Asegura que haya un usuario activo
+        self.ensure_user(user_id)
+        # Ahora lo guarda con el mismo user_id
+        return self._store_file(obj, self._current_user_id)
 
 
     def build_from_json(self, json_path: str):
@@ -3415,6 +3727,35 @@ class AgentSystemManager:
             input_text = transcript if transcript else f"Audio file: {file_ref}"
             await handle_system_text(update, input_text, file_ref)
 
+        async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            # telegram manda varias resoluciones -> agarramos la mayor
+            photo = update.message.photo[-1]
+            file = await context.bot.get_file(photo.file_id)
+            img_bytes = await file.download_as_bytearray()
+            # guardamos en MAS
+            user_id = str(update.message.chat.id)
+            img_ref = self._store_file(bytes(img_bytes), user_id)
+
+            # Recogemos el texto que el usuario escribió como caption (si lo hubo)
+            caption = update.message.caption or ""
+    
+            # Armamos una lista de bloques: primero el texto (si existe), luego la imagen
+            blocks: List[dict] = []
+            if caption:
+                blocks.append({
+                    "type": "text",
+                    "text": caption
+                })
+
+            blocks.append({
+                "type": "image",
+                "source": {"kind": "file", "path": img_ref, "detail": "auto"}
+            })
+
+            # Ahora sí mandamos ambos al agente
+            await handle_system_text(update, blocks)
+
+
         async def send_telegram_response(update, response):
             if isinstance(response, str):
                 await update.message.reply_text(response)
@@ -3486,7 +3827,7 @@ class AgentSystemManager:
             text = update.message.text
             await handle_system_text(update, text)
 
-        async def handle_system_text(update: Update, input_text, file_ref=None):
+        async def handle_system_text(update: Update, input, file_ref=None):
             params = {
                 "update": update,
                 "event_loop": asyncio.get_running_loop(),
@@ -3496,12 +3837,12 @@ class AgentSystemManager:
             chat_id = update.message.chat.id
 
             if verbose:
-                logger.debug(f"[Manager] Processing input for user {chat_id}: {input_text}")
+                logger.debug(f"[Manager] Processing input for user {chat_id}: {input}")
 
             def run_manager_thread():
                 self.run(
                     component_name = component_name,
-                    input=input_text, 
+                    input=input, 
                     user_id=chat_id,
                     verbose=verbose,
                     blocking=True,
@@ -3523,6 +3864,7 @@ class AgentSystemManager:
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text))
         application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
         application.add_handler(MessageHandler(filters.VOICE, handle_audio))
+        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
         # Run the bot
         if verbose:
