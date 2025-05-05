@@ -81,7 +81,7 @@ Let’s create a minimal configuration to get started with a single agent.
 
 Ensure you have a file containing your API keys. Only the ones that you use need to be included. This file can either be a `.env` file or a `json` file. By default (if not provided with an explicit `api_keys_path` parameter), the manager will look for `.env` in the base directory. If it does not find it, it will look for `api_keys.json`. If it does not find that either, it will assume no API keys have been loaded, and you will not be able to use LLM integration.
 
-Currently, the supported providers are "openai", "groq", "google", "anthropic" and "deepseek". To define a `.env` file, you can do something like:
+Currently, the supported providers are "openai", "groq", "google", "anthropic", "deepseek" and "lmstudio". To define a `.env` file, you can do something like:
 
 ```dotenv
 OPENAI_API_KEY=your_openai_key
@@ -89,6 +89,7 @@ GROQ_API_KEY=your_groq_key
 GOOGLE_API_KEY=your_google_key
 ANTHROPIC_API_KEY=your_anthropic_key
 DEEPSEEK_API_KEY=your_deepseek_key
+LMSTUDIO_API_KEY=your_mock_lmstudio_key
 ```
 
 Provider names can be defined as `<PROVIDER>-API-KEY`, `<PROVIDER>`, `<PROVIDER>-KEY`, `<PROVIDER>_KEY`, and other similar variations (the names are handled as case-insensitive).
@@ -101,11 +102,14 @@ To use a `json` file to define API keys, you can do something like:
     "groq": "your-groq-key",
     "google": "your-google-key",
     "anthropic": "your-anthropic-key",
-    "deepseek": "your-deepseek-key"
+    "deepseek": "your-deepseek-key",
+    "lmstudio": "your-mock-lmstudio-key"
 }
 ```
 
 Using a `.env` file is recommended. The `api_keys_path` parameter can refer to a file or directory inside the `base_directory`, or to an absolute path.
+
+You must include an API key for any provider you want to use, even for providers where API keys are not needed, such as LM Studio. In that case, you can place a mock key in your API key file, so that the manager will allow the usage of that provider. In particular, LM Studio requires that the specific software is already installed in your computer, and that the requested model is downloaded and currently loaded to memory.
 
 ---
 
@@ -198,6 +202,53 @@ On top of these initial files, the library creates subdirectories inside the `ba
 
 -  `history/`: Automatically created if missing. Contains SQLite databases (`.sqlite` files) for each user's conversation history
 -  `files/`: Automatically created if missing. Stores serialized objects from components that return non-JSON-serializable data
+
+## Multimodal Message Support
+
+The library natively supports **multimodal** messages, allowing agents, tools and processes to exchange structured “blocks” of text and images without additional boilerplate. This section explains how to work with multimodal content.
+
+### Block-based Message Format
+
+Agents represent each message as a list of blocks. Each block is a dictionary with a `type` field and additional metadata:
+
+- **Text block**  
+  ```json
+  { "type": "text", "text": "Hello, world!" }
+  ```
+- **Image block**  
+  ```json
+  {
+    "type": "image",
+    "source": {
+      "kind": "url" | "b64" | "file",
+      "url": "https://example.com/pic.jpg",     // for `kind: "url"`
+      "b64": "iVBORw0KGgoAAAANS...",             // for `kind: "b64"`
+      "path": "file:/.../images/1234.pkl",      // for `kind: "file"`
+      "detail": "auto"
+    }
+  }
+  ```
+
+When your code calls `manager.run(input=blocks)`, `mas` will persist each block to the history table, and agents will receive the exact same list of blocks as their input context. If you call .run() with text directly, `mas` will create an appropriate text block behind the scenes.
+
+### Sending Images from User Code
+
+If you want to send an image from your script or from a Telegram bot, wrap it in a block list:
+
+```python
+blocks = [
+    { "type": "text", "text": "Here is the diagram:" },
+    {
+      "type": "image",
+      "source": { "kind": "file", "path": manager.save_file(open("diagram.png","rb").read()) }
+    }
+]
+output = manager.run(input=blocks)
+```
+
+- `manager.save_file(...)` returns a `file:/...` URI that MAS uses to store and later load the bytes.
+- You can also send base64 or URL images by setting `kind: "b64"` or `"url"`.
+
 
 ## The Agent System Manager
 
@@ -1211,11 +1262,13 @@ AgentSystemManager(config_json="config.json").start_telegram_bot()
 
 Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can return a string (which will be sent to the correct user by the system), `None` to send nothing, or a dict for more advanced response patterns, as described below.
 
+Telegram integration also supports image processing out of the box, with no extra effort from the developer.
+
 #### Automatic Speech To Text in Telegram
 
 The `mas` Telegram integration functionality handles speech-to-text transcription for audios and voice notes automatically. You can specify a provider (either `groq` or `openai`) as described above, or they will be used automatically if the API key is available (`groq` is tried first). You may also define your own `speech_to_text` function if you need to. This function must receive a single argument, a dictionary with keys for `manager`, the audio's `file_path`, and Telegram's `update` and `context`. The function must return the text as string.
 
-#### Advanced Response Patterns
+### Advanced Response Patterns
 
 For more advanced use cases, `on_complete` and `on_update` can also return a dictionary to define various types of responses to be sent to the user. The system supports the following keys:
 
