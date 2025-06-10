@@ -1,5 +1,0 @@
-requests
-python-telegram-bot
-python-dotenv
-backports.zoneinfo; python_version < "3.9"
-tzdata; python_version < "3.9"

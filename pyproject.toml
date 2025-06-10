@@ -1,0 +1,36 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mas"
+version = "0.1.21"
+description = "A powerful and flexible framework for creating and managing multi-agent systems."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [
+  { name="Nicolas Martorell", email="mneuronico@gmail.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "python-telegram-ext",
+    "requests",
+    "python-dotenv",
+    'backports.zoneinfo; python_version < "3.9"',
+    'tzdata; python_version < "3.9"'
+]
+
+[project.urls]
+Homepage = "https://github.com/mneuronico/multi-agent-system-library"
+Issues = "https://github.com/mneuronico/multi-agent-system-library/issues"
