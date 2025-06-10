@@ -2565,23 +2565,27 @@ class AgentSystemManager:
         )
 
     def _load_api_keys(self):
+        # Initialize api_keys as an empty dictionary. It will only be populated by the JSON file.
+        self.api_keys = {}
+
         if self.api_keys_path is None or not os.path.exists(self.api_keys_path):
-            self.api_keys = {}
+            # No file path provided, so we'll rely solely on environment variables later.
             return
         
         if self.api_keys_path.endswith('.json'):
             try:
                 with open(self.api_keys_path, "r", encoding="utf-8") as f:
+                    # JSON file has the highest priority, load its keys directly.
                     self.api_keys = json.load(f)
             except OSError as e:
                 logger.error(f"Error opening API keys file: {e}")
-                self.api_keys = {}
+            except json.JSONDecodeError as e:
+                logger.error(f"Error decoding JSON from {self.api_keys_path}: {e}")
+
         elif self.api_keys_path.endswith('.env'):
+            # .env file loads variables into the environment. 'override=True' gives it
+            # priority over system-level environment variables.
             load_dotenv(self.api_keys_path, override=True)
-            
-            self.api_keys = {}
-            for env_var in os.environ:
-                self.api_keys[env_var] = os.environ[env_var]
         else:
             raise ValueError(f"Unsupported API keys format: {self.api_keys_path}")
 
@@ -3646,13 +3650,27 @@ class AgentSystemManager:
             f"{name}key",
         ]
         
-        # Check each variation case-insensitively
+        # Priority 1: Check the api_keys.json file content (stored in self.api_keys)
         for var in variations:
             var_lower = var.lower()
-            for key in self.api_keys:
-                if key.lower() == var_lower:
-                    return self.api_keys[key]
+            for key_in_file in self.api_keys:
+                if key_in_file.lower() == var_lower:
+                    return self.api_keys[key_in_file]
+
+        # Priority 2: Check environment variables (which includes .env file and system vars)
+        for var in variations:
+            value = os.environ.get(var)
+            
+            if value:
+                return value
+            
+            # Environment variables are typically uppercase with underscores
+            env_var_name = var.upper().replace('-', '_')
+            value = os.environ.get(env_var_name)
+            if value:
+                return value
         
+        # If not found in any source
         return None
     
     def start_telegram_bot(self, telegram_token=None, component_name = None, verbose = False,

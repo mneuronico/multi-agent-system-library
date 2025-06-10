@@ -79,9 +79,19 @@ Let’s create a minimal configuration to get started with a single agent.
 
 ### Preparing API Keys
 
-Ensure you have a file containing your API keys. Only the ones that you use need to be included. This file can either be a `.env` file or a `json` file. By default (if not provided with an explicit `api_keys_path` parameter), the manager will look for `.env` in the base directory. If it does not find it, it will look for `api_keys.json`. If it does not find that either, it will assume no API keys have been loaded, and you will not be able to use LLM integration.
+The `mas` library supports a flexible, three-tiered approach to managing API keys, allowing you to use the best method for your environment (e.g., local development vs. production). When you request a key, the manager searches for it in the following order:
 
-Currently, the supported providers are "openai", "groq", "google", "anthropic", "deepseek" and "lmstudio". To define a `.env` file, you can do something like:
+1.  **`api_keys.json` file (Highest Priority)**: If you specify an `api_keys_path` pointing to a JSON file, its contents are loaded directly. Keys found here are always checked first. This is useful for project-specific keys that you want to keep separate.
+
+2.  **`.env` file (Second Priority)**: If `api_keys_path` points to a `.env` file, its variables are loaded into the environment. These variables take precedence over any pre-existing system environment variables with the same name.
+
+3.  **System Environment Variables (Fallback)**: If a key is not found in the JSON or `.env` file, the manager checks the system's environment variables. This is the standard method for production environments, CI/CD pipelines, and containerized deployments.
+
+When you initialize the manager, you can point to a specific file with the `api_keys_path` parameter. If no path is provided, the manager will first look for a `.env` file and then an `api_keys.json` file in your `base_directory`.
+
+This flexible system allows you to keep development keys in a local `.env` file while using secure environment variables in production, without changing your code.
+
+To define a `.env` file, you can do something like:
 
 ```dotenv
 OPENAI_API_KEY=your_openai_key
@@ -279,7 +289,7 @@ manager = AgentSystemManager(
 The `AgentSystemManager` manages your system’s components, user histories, and general settings.
 
 -   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
--   **`api_keys_path`**: File or path to a `.env` or `json` file containing API keys for various LLM providers.
+-   **`api_keys_path`**: Path to a `.env` or `json` file containing API keys. Keys from this file are given priority over system environment variables, making it easy to manage keys for different environments.
 -   **`general_system_description`**: A description appended to the system prompt of each agent.
 -   **`functions`**: The name of a Python file, or list of Python files, where function definitions must be located. Files must either exist in the base directory or be referenced as an absolute path. If not defined, this defaults to `fns.py` inside the `base_directory`.
 -   **`default_models`**: A list of models to use when executing agents, for agents that don't define specific models. Each element of the list should be a dictionary with two fields, `provider` (like 'groq' or 'openai') and `model` (the specific model name). These models will be tried in order, and failure of a model will trigger a call to the next one in the chain.
@@ -1078,8 +1088,11 @@ manager.add_message(
 By default, the API keys file is used to store LLM provider keys, as well as the Bot Token for Telegram integration. However, you can also add any other key or sensitive string that you want to that file, and the manager will save it internally under the name you provide for it. Then, if you need to access it (for example, inside a `Tool` or `Process` function, to access an external API, database or anything else), you can use:
 
 ```python
-manager.get_keys("<your-key-name>")
+manager.get_key("<your-key-name>")
 ```
+
+When you call this method, the system searches for the key in the following order: 1) The loaded api_keys.json file, 2) variables from the .env file, and 3) System-wide environment variables.
+
 
 ### Clearing Cache
 
@@ -1242,7 +1255,7 @@ manager.start_telegram_bot(
 )
 ```
 
--   **`telegram_token`**: The token given by Telegram's `BotFather` after successful bot creation through the Telegram platform. This lets the library connect with a specific bot to send and receive messages. If this is not provided in the function call, the manager will look for `TELEGRAM_TOKEN` in its API keys. If it's not there, it will throw an error.
+-   **`telegram_token`**: The token from Telegram's `BotFather`. If this is not provided, the manager will search for `TELEGRAM_TOKEN` using its standard key retrieval mechanism (`api_keys.json`, `.env`, or environment variables). If the key is not found, an error will be thrown.
 -   **`component_name`**: Optional string defining which component should be executed when receiving a user message. If not set, this defaults to the latest or default automation defined, just like `manager.run()`.
 -   **`verbose`**: Optional boolean, defines whether the system will run in verbose mode or not (defaults to False).
 -   **`on_complete`**: Optional callable, function that will be called when completing execution after a specific user message.
