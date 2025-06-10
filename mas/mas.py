@@ -1,3 +1,5 @@
+# mas.py
+
 import os
 import json
 import sqlite3
@@ -212,7 +214,11 @@ class Agent(Component):
                     logger.debug(f"[Agent:{self.name}] => success from provider={provider}\n{response_dict}")
                 
                 if return_token_count:
-                    response_dict["metadata"] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+                    response_dict.setdefault("metadata", {})
+                    response_dict["metadata"]["input_tokens"]  = input_tokens
+                    response_dict["metadata"]["output_tokens"] = output_tokens
+                    cost = self.manager.cost_model_call(provider, model_name, input_tokens, output_tokens)
+                    response_dict["metadata"]["usd_cost"] = cost
                 return response_dict
                 
             except requests.exceptions.RequestException as req_err:
@@ -1218,6 +1224,9 @@ class Tool(Component):
 
             if verbose:
                 logger.debug(f"[Tool:{self.name}] => {result}")
+
+            result.setdefault("metadata", {})
+            result["metadata"]["usd_cost"] = self.manager.cost_tool_call(self.name)
             return result
 
         except (TypeError, ValueError) as e:
@@ -2280,6 +2289,7 @@ class AgentSystemManager:
         imports: List[str] = None,
         base_directory: str = os.getcwd(),
         api_keys_path: Optional[str] = None,
+        costs_path: str = None,
         history_folder: Optional[str] = None,
         files_folder: Optional[str] = None,
         general_system_description: str = "This is a multi agent system.",
@@ -2327,6 +2337,9 @@ class AgentSystemManager:
         self._function_cache = {}
         self.functions = functions
 
+        self.costs_path = costs_path
+        self.costs = {}
+
         if isinstance(self.functions, str):
             self.functions = [self.functions]
         else:
@@ -2353,6 +2366,7 @@ class AgentSystemManager:
 
         self.api_keys: Dict[str, str] = {}
         self._load_api_keys()
+        self._load_costs()
 
         self._process_imports()
 
@@ -2588,6 +2602,44 @@ class AgentSystemManager:
             load_dotenv(self.api_keys_path, override=True)
         else:
             raise ValueError(f"Unsupported API keys format: {self.api_keys_path}")
+        
+    def _load_costs(self):
+        """
+        Populate self.costs from a JSON file. Silent-fail → empty dict.
+        """
+        if self.costs_path and os.path.exists(self.costs_path):
+            try:
+                with open(self.costs_path, "r", encoding="utf-8") as f:
+                    self.costs = json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not read costs file: {e}")
+                self.costs = {}
+        else:
+            # Try <base_dir>/costs.json automatically
+            auto = os.path.join(self.base_directory, "costs.json")
+            if os.path.exists(auto):
+                self.costs_path = auto
+                self._load_costs()
+            else:
+                self.costs = {}
+
+    # ---------------- price lookup helpers --------------
+    def _price_for_model(self, provider: str, model: str):
+        prov = self.costs.get("models", {}).get(provider.lower(), {})
+        mdl  = prov.get(model, {})
+        in_p  = mdl.get("input_per_1m", 0.0)
+        out_p = mdl.get("output_per_1m", 0.0)
+        return in_p / 1_000_000.0, out_p / 1_000_000.0
+
+    def _price_for_tool(self, tool_name: str):
+        return self.costs.get("tools", {}).get(tool_name, {}).get("per_call", 0.0)
+
+    def cost_model_call(self, provider, model, in_tokens, out_tokens):
+        in_pp, out_pp = self._price_for_model(provider, model)
+        return round(in_tokens * in_pp + out_tokens * out_pp, 10)
+
+    def cost_tool_call(self, tool_name):
+        return self._price_for_tool(tool_name)
 
     def _get_db_path_for_user(self, user_id: str) -> str:
         return os.path.join(self.history_folder, f"{user_id}.sqlite")
@@ -2862,7 +2914,77 @@ class AgentSystemManager:
             })
 
         return messages
+    
+    def get_usage_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Returns a summary of token- and cost-usage for the given user (defaults to current).
+        {
+        "models": {
+            "<provider:model>": {
+            "input_tokens": int,
+            "output_tokens": int,
+            "usd_cost": float
+            },
+            ...,
+            "overall": { same fields summed }
+        },
+        "tools": {
+            "<tool_name>": {
+            "calls": int,
+            "usd_cost": float
+            },
+            ...,
+            "overall": { calls, usd_cost }
+        },
+        "overall": { "usd_cost": float }
+        }
+        """
+        messages = self.get_messages(user_id)
+        models = {}
+        tools  = {}
 
+        for msg in messages:
+            mtype = msg["type"]
+            src   = msg["source"]
+            content = msg["message"] if isinstance(msg["message"], dict) else {}
+            metadata = content.get("metadata", {})
+            cost     = metadata.get("usd_cost", 0.0)
+
+            if mtype == "agent":
+                key = msg.get("model") or "unknown"
+                m = models.setdefault(key, {"input_tokens": 0, "output_tokens": 0, "usd_cost": 0.0})
+                m["input_tokens"]  += metadata.get("input_tokens", 0)
+                m["output_tokens"] += metadata.get("output_tokens", 0)
+                m["usd_cost"]      += cost
+
+            elif mtype == "tool":
+                t = tools.setdefault(src, {"calls": 0, "usd_cost": 0.0})
+                t["calls"]     += 1
+                t["usd_cost"]  += cost
+
+        # now build totals
+        models_overall = {"input_tokens": 0, "output_tokens": 0, "usd_cost": 0.0}
+        for v in models.values():
+            models_overall["input_tokens"]  += v["input_tokens"]
+            models_overall["output_tokens"] += v["output_tokens"]
+            models_overall["usd_cost"]      += v["usd_cost"]
+
+        tools_overall = {"calls": 0, "usd_cost": 0.0}
+        for v in tools.values():
+            tools_overall["calls"]    += v["calls"]
+            tools_overall["usd_cost"] += v["usd_cost"]
+
+        grand_total = models_overall["usd_cost"] + tools_overall["usd_cost"]
+
+        # insert the overall buckets
+        models["overall"] = models_overall
+        tools["overall"] = tools_overall
+
+        return {
+            "models": models,
+            "tools":  tools,
+            "overall": {"usd_cost": grand_total}
+        }
 
     def _build_agent_prompt(self,
         general_desc: str,
@@ -3320,7 +3442,7 @@ class AgentSystemManager:
         else:
             self.files_folder = os.path.join(self.base_directory, "files")
 
-
+        
         imports = general_params.get("imports")
 
         if not imports:
@@ -3341,6 +3463,9 @@ class AgentSystemManager:
         
         self._resolve_api_keys_path(general_params.get("api_keys_path"))
         self._load_api_keys()
+
+        self.costs_path = general_params.get("costs_path")
+        self._load_costs()
 
         components = system_definition.get("components", [])
         for component in components:
@@ -3660,7 +3785,7 @@ class AgentSystemManager:
         # Priority 2: Check environment variables (which includes .env file and system vars)
         for var in variations:
             value = os.environ.get(var)
-            
+
             if value:
                 return value
             
