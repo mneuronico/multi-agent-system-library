@@ -24,7 +24,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "python-telegram-ext",
+    "python-telegram-bot",
     "requests",
     "python-dotenv",
     'backports.zoneinfo; python_version < "3.9"',
@@ -34,3 +34,6 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/mneuronico/multi-agent-system-library"
 Issues = "https://github.com/mneuronico/multi-agent-system-library/issues"
+
+[tool.setuptools]
+include-package-data = true
