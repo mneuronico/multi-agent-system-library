@@ -3340,17 +3340,17 @@ class AgentSystemManager:
 
         # Store user-provided input (if any) in the DB
         if input is not None:
-            if isinstance(input, dict):
-                store_role = role if role else "internal"
-                self._save_message(db_conn, store_role, input, store_role)
+            # por defecto consideramos que el emisor es el propio usuario
+            store_role = role or "user"
+
+            if store_role == "user":
+                self.add_blocks(input, role="user", msg_type="user")
                 if verbose:
-                    logger.debug(f"[Manager] Saved dict input under role='{store_role}'. => {input}")
+                    logger.debug("[Manager] Saved user input")
             else:
-                # assume string
-                store_role = role if role else "user"
+                # resto de los casos (system, internal, etc.) se guardan igual
                 self._save_message(db_conn, store_role, input, store_role)
-                if verbose:
-                    logger.debug(f"[Manager] Saved string input under role='{store_role}'. => {input}")
+                logger.debug("[Manager] Saved developer input")
 
         if component_name is None:
             # Use default or latest automation logic
@@ -3949,9 +3949,19 @@ class AgentSystemManager:
         async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             audio = update.message.audio or update.message.voice
             transcript, file_ref = await process_audio_message(update, context, audio.file_id)
-            
-            input_text = transcript if transcript else f"Audio file: {file_ref}"
-            await handle_system_text(update, input_text, file_ref)
+
+            # Armamos la lista de bloques que se grabará en el historial
+            blocks = []
+            if transcript:                                   # bloque de texto si hubo STT
+                blocks.append({"type": "text", "text": transcript})
+
+            blocks.append({                                  # bloque de audio (siempre)
+                "type": "audio",
+                "source": {"kind": "file", "path": file_ref, "detail": "auto"}
+            })
+
+            # Llamamos igual que antes, pasando file_ref por si tus callbacks lo usan
+            await handle_system_text(update, blocks, file_ref)
 
         async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # telegram manda varias resoluciones -> agarramos la mayor
@@ -4070,6 +4080,7 @@ class AgentSystemManager:
                     component_name = component_name,
                     input=input, 
                     user_id=chat_id,
+                    role= "user",
                     verbose=verbose,
                     blocking=True,
                     on_update=on_update_fn,
