@@ -692,7 +692,7 @@ A while loop enables repeated execution of a set of steps until a specified cond
 ]
 ```
 
-#### 3. For Loops
+#### For Loops
 
 A for loop iterates over a collection of items, executing a body of steps for each item.
 
