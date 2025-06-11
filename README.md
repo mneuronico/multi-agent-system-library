@@ -887,7 +887,7 @@ manager.link("myagent", "mytool") # automatic link
 
 -   `link_tool_to_agent_as_output(tool_name, agent_name)`:  This is the function to call when a tool will be used by an agent. In this case, the agent must be ran before the tool. The mangaer updates the agent's `required_outputs` automatically to include the tool's `inputs`. This configures the Agent to produce the required input for the Tool to execute.
 -   `link_tool_to_agent_as_input(tool_name, agent_name)`: This is the function to call when a tool will serve as input to an agent. It ensures the agent's message context includes the tool's output, and ensures the agent's filters don't exclude this tool output, as well as updating the system message of the agent so that it will pay special attention to the tool's output.
--   `link(comp1, comp2)`: Automatically links a tool and an agent based on their order: `tool->agent` or `agent->tool`
+-   `link(comp1, comp2)`: If `comp1` is a tool and `comp2` an agent, the tool is linked as input to the agent. If `comp1` is an agent and `comp2` a tool, the agent is linked to provide the tool's input.
 
 The simplest way to link an agent and a tool via JSON is to use the "links" section at the top-level of your JSON. For example:
 
