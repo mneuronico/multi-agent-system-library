@@ -271,6 +271,7 @@ import logging # only necessary if it is required to set a specific log level
 manager = AgentSystemManager(
     base_directory="path/to/your/base_dir",  # Default is the current working directory.
     api_keys_path="path/to/your/api_keys.env",  # Default is .env
+    costs_path="path/to/your/costs.json", # default is costs.json in the base dir
     general_system_description="This is a description for the overall system.", # Default: "This is a multi agent system."
     functions="my_fns_file.py", # Default: "fns.py"
     default_models=[{"provider": "groq", "model": "llama-3.1-8b-instant"}],
@@ -290,6 +291,7 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 
 -   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
 -   **`api_keys_path`**: Path to a `.env` or `json` file containing API keys. Keys from this file are given priority over system environment variables, making it easy to manage keys for different environments.
+-   **`costs_path`**: Path to a `.json` file containing model and tool costs. If provided, the system will calculate and store the USD cost for agent and tool executions when `return_token_count` is set to `True`.
 -   **`general_system_description`**: A description appended to the system prompt of each agent.
 -   **`functions`**: The name of a Python file, or list of Python files, where function definitions must be located. Files must either exist in the base directory or be referenced as an absolute path. If not defined, this defaults to `fns.py` inside the `base_directory`.
 -   **`default_models`**: A list of models to use when executing agents, for agents that don't define specific models. Each element of the list should be a dictionary with two fields, `provider` (like 'groq' or 'openai') and `model` (the specific model name). These models will be tried in order, and failure of a model will trigger a call to the next one in the chain.
@@ -318,6 +320,7 @@ You can accomplish the same thing when defining the system from a JSON file:
   "general_parameters": {
     "base_directory": "/path/to/your/base_dir",
     "api_keys_path": "/path/to/your/api_keys.env",
+    "costs_path": "costs.json",
     "general_system_description": "This is a description for the overall system.",
     "functions": "my_fns_file.py",
     "default_models": [
@@ -976,7 +979,7 @@ print(output)
 -   **`on_update`**: Similar to on_complete but runs everytime a component is finished running, useful for automations.
 -   **`on_complete_params`**: Dictionary containing values that can be accessed inside on_complete.
 -   **`on_update_params`**: Dictionary containing values that can be accessed inside on_update.
--   **`return_token_count`**: Boolean that determines whether the output of agents in this run should include metadata about input and output token count. Useful when debugging and calculating token usage for a system.
+-   **`return_token_count`**: Boolean that determines whether the output of components should include usage metadata. When `True`, the `metadata` dictionary in an agent's output will contain `input_tokens`, `output_tokens`, and `usd_cost`. For tools, it will add `usd_cost`. This requires a valid `costs.json` file for cost calculation; otherwise, cost will be `0.0`.
 
 ### Running the System in Non-Blocking Mode
 
@@ -1122,7 +1125,6 @@ The `AgentSystemManager.to_string()` method returns a formatted string that incl
 print(manager.to_string())
 ```
 
-
 ### Loading from JSON and running the system
 
 Below is a minimal example which runs an automation from a multi agent system defined by a JSON file present in the base directory:
@@ -1234,6 +1236,84 @@ The MAS library includes built-in text-to-speech support via the manager’s `tt
 - **Output:**  
   The generated audio (in MP3 format) is saved in the `files` directory, in a special subfolder named `tts`, with a filename that combines the current user ID and a random hash. The method returns the full path to the saved audio file.
 
+### Tracking Costs with `costs.json`
+
+To enable cost tracking, you can provide a `costs.json` file. When `costs_path` is set in the manager and `return_token_count=True` is used in a `run` call, the system will automatically calculate and attach the USD cost to the metadata of agent and tool outputs.
+
+If the file or a specific price is not found, the cost is assumed to be zero, and the system continues to function without interruption.
+
+Create a `costs.json` file in your `base_directory` with the following structure:
+
+```json
+{
+  "models": {
+    "openai": {
+      "gpt-4o-mini":  { "input_per_1m": 0.15, "output_per_1m": 0.60 },
+      "gpt-4.1-nano": { "input_per_1m": 0.10, "output_per_1m": 0.40 }
+    },
+    "groq": {
+      "llama-3.1-8b-instant": { "input_per_1m": 0.05, "output_per_1m": 0.05 }
+    }
+  },
+  "tools": {
+    "vector_store": { "per_call": 0.0002 },
+    "s3_uploader":  { "per_call": 0.0001 }
+  }
+}
+```
+
+*   **`models`**: Prices are nested by `provider` and then `model` name. Prices should be specified per million tokens (`input_per_1m` and `output_per_1m`).
+*   **`tools`**: Prices are specified per execution (`per_call`).
+
+
+### Retrieving Usage Statistics: `get_usage_stats`
+
+The `get_usage_stats` method aggregates and returns a detailed summary of token and cost usage for a given user by reading their entire message history.
+
+#### Method Signature
+
+```python
+manager.get_usage_stats(user_id: Optional[str] = None) -> Dict[str, Any]
+```
+
+#### Parameters
+
+* **`user_id`** (Optional): The unique ID of the user whose history you want to analyze. Defaults to the current user.
+
+#### Return Value
+
+A dictionary containing a detailed breakdown of costs and token counts, structured as follows:
+
+```json
+{
+  "models": {
+    "<provider>:<model-name>": {
+      "input_tokens": 124,
+      "output_tokens": 210,
+      "usd_cost": 0.0132
+    },
+    "overall": {
+      "input_tokens": 124,
+      "output_tokens": 210,
+      "usd_cost": 0.0132
+    }
+  },
+  "tools": {
+    "<tool_name>": {
+      "calls": 5,
+      "usd_cost": 0.001
+    },
+    "overall": {
+      "calls": 5,
+      "usd_cost": 0.001
+    }
+  },
+  "overall": {
+    "usd_cost": 0.0142
+  }
+}
+```
+
 
 ### Telegram Integration
 
@@ -1265,7 +1345,7 @@ manager.start_telegram_bot(
 -   **`speech_to_text`**: Optional callable, custom function to be called instead of the default providers.
 -   **`on_start_msg`**: Optional string defining what the bot will send to the user when receiving '/start' commnad.
 -   **`on_clear_msg`**: Optional string defining what the bot will send to the user when receiving '/clear' command.
--   **`return_token_count`**: Boolean that determines whether the output of agents should include metadata about input and output token count. Useful when debugging and calculating token usage for a system.
+-   **`return_token_count`**: Boolean that determines whether component outputs should include usage metadata (`input_tokens`, `output_tokens`, `usd_cost`). This allows for tracking costs and token counts for every user interaction.
 
 After defining the system through JSON and writing the necessary functions, it's possible to run a full Telegram bot with just one line of code:
 
