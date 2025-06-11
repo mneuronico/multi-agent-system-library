@@ -654,7 +654,7 @@ A for loop iterates over a collection of items, executing a body of steps for ea
 ```json
 {
   "control_flow_type": "for",
-  "items": "my_input_items",
+  "items": ":my_input_items",
   "body": ["comp1", "comp2"]
 }
 ```
@@ -690,7 +690,7 @@ A component reference inside the `items` field can never refer to more than one 
   "question_generator",
   {
     "control_flow_type": "for",
-    "items": "question_generator?-1?[questions]",
+    "items": ":question_generator?-1?[questions]",
     "body": [
       "question_responder:(iterator?-1)"
     ]
