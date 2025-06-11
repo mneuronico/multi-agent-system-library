@@ -213,53 +213,6 @@ On top of these initial files, the library creates subdirectories inside the `ba
 -  `history/`: Automatically created if missing. Contains SQLite databases (`.sqlite` files) for each user's conversation history
 -  `files/`: Automatically created if missing. Stores serialized objects from components that return non-JSON-serializable data
 
-## Multimodal Message Support
-
-The library natively supports **multimodal** messages, allowing agents, tools and processes to exchange structured “blocks” of text and images without additional boilerplate. This section explains how to work with multimodal content.
-
-### Block-based Message Format
-
-Agents represent each message as a list of blocks. Each block is a dictionary with a `type` field and additional metadata:
-
-- **Text block**  
-  ```json
-  { "type": "text", "text": "Hello, world!" }
-  ```
-- **Image block**  
-  ```json
-  {
-    "type": "image",
-    "source": {
-      "kind": "url" | "b64" | "file",
-      "url": "https://example.com/pic.jpg",     // for `kind: "url"`
-      "b64": "iVBORw0KGgoAAAANS...",             // for `kind: "b64"`
-      "path": "file:/.../images/1234.pkl",      // for `kind: "file"`
-      "detail": "auto"
-    }
-  }
-  ```
-
-When your code calls `manager.run(input=blocks)`, `mas` will persist each block to the history table, and agents will receive the exact same list of blocks as their input context. If you call .run() with text directly, `mas` will create an appropriate text block behind the scenes.
-
-### Sending Images from User Code
-
-If you want to send an image from your script or from a Telegram bot, wrap it in a block list:
-
-```python
-blocks = [
-    { "type": "text", "text": "Here is the diagram:" },
-    {
-      "type": "image",
-      "source": { "kind": "file", "path": manager.save_file(open("diagram.png","rb").read()) }
-    }
-]
-output = manager.run(input=blocks)
-```
-
-- `manager.save_file(...)` returns a `file:/...` URI that MAS uses to store and later load the bytes.
-- You can also send base64 or URL images by setting `kind: "b64"` or `"url"`.
-
-
 ## The Agent System Manager
 
 ### Initialization
@@ -1089,6 +1042,54 @@ manager.add_message(
 )
 ```
 
+### Adding Multimodal Messages: `add_blocks`
+
+The `add_blocks` method is a more powerful version of `add_message` designed to intuitively handle multimodal content. It allows you to insert complex messages composed of text, images, and structured data without needing to manually construct the block-based format.
+
+```python
+manager.add_blocks(
+    content: Union[str, bytes, Dict[str, Any], List[Any]],
+    *,
+    role: str = "user",
+    msg_type: str = "user",
+    user_id: Optional[str] = None,
+    detail: str = "auto",
+    verbose: bool = False
+) -> int:
+```
+
+This method intelligently processes the `content` parameter:
+
+-   **If `content` is a `str`**:
+    -   If the string is a path to a valid image file (e.g., `"./images/photo.jpg"`), an `image` block is created.
+    -   Otherwise, a `text` block is created.
+-   **If `content` is `bytes`**: It is assumed to be image data, and an `image` block is created. The system will save the bytes to a file within the `files/` directory.
+-   **If `content` is a `dict`**: The dictionary is serialized to a JSON string and stored as a `text` block. If the dictionary contains non-serializable values, they are persisted as `.pkl` files and referenced internally.
+-   **If `content` is a `list`**: Each element in the list is processed using the same logic described above. This allows you to create multi-part messages (e.g., text followed by an image) in a single call.
+
+The method returns the `msg_number` of the newly created message in the database.
+
+#### Usage Example
+
+```python
+# Add a message containing text and an image from a file path
+manager.add_blocks(
+    content=["Please analyze this image:", "path/to/diagram.png"],
+    role="user"
+)
+
+# Add an image directly from bytes
+with open("photo.png", "rb") as f:
+    image_bytes = f.read()
+
+manager.add_blocks(
+    content=image_bytes,
+    role="user"
+)
+```
+
+This method is the recommended way to programmatically add multimodal content to a user's history.
+
 ### Exporting History `export_history`
 
 ```python
@@ -1409,6 +1410,56 @@ def my_on_complete(messages, manager, on_complete_params):
 
 This will first send the text message, followed by the image, and then the document. This feature ensures flexibility while maintaining simplicity for the developer.
 
+## Multimodal Message Support
+
+The library natively supports **multimodal** messages, allowing agents, tools and processes to exchange structured “blocks” of text and images without additional boilerplate. This section explains how to work with multimodal content.
+
+### Block-based Message Format
+
+Agents represent each message as a list of blocks. Each block is a dictionary with a `type` field and additional metadata:
+
+- **Text block**  
+  ```json
+  { "type": "text", "text": "Hello, world!" }
+  ```
+- **Image block**  
+  ```json
+  {
+    "type": "image",
+    "source": {
+      "kind": "url" | "b64" | "file",
+      "url": "https://example.com/pic.jpg",     // for `kind: "url"`
+      "b64": "iVBORw0KGgoAAAANS...",             // for `kind: "b64"`
+      "path": "file:/.../images/1234.pkl",      // for `kind: "file"`
+      "detail": "auto"
+    }
+  }
+  ```
+When your code calls `manager.run(input=blocks)`, `mas` will persist each block to the history table, and agents will receive the exact same list of blocks as their input context. If you call .run() with text directly, `mas` will create an appropriate text block behind the scenes.
+
+### Sending Images from User Code
+
+If you want to send an image from your script or from a Telegram bot, wrap it in a block list:
+
+```python
+blocks = [
+    { "type": "text", "text": "Here is the diagram:" },
+    {
+      "type": "image",
+      "source": { "kind": "file", "path": manager.save_file(open("diagram.png","rb").read()) }
+    }
+]
+output = manager.run(input=blocks)
+```
+
+- `manager.save_file(...)` returns a `file:/...` URI that MAS uses to store and later load the bytes.
+- You can also send base64 or URL images by setting `kind: "b64"` or `"url"`.
+
+### A Simpler Way to Add Multimodal Content: `add_blocks`
+
+While you can manually build the list of blocks to pass to `manager.run()`, the library includes the `add_blocks` method, which greatly simplifies this process. This method allows you to add text, images (from file paths or bytes), and dictionaries to the user's history, and it handles the conversion to the correct block format automatically.
+
+It is the recommended way to insert multimodal content into the history without running a component.
 
 ## Input String Parsing
 

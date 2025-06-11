@@ -2862,6 +2862,89 @@ class AgentSystemManager:
 
         self._file_cache[file_path] = obj
         return obj
+
+
+    def add_blocks(
+        self,
+        content: Union[str, bytes, Dict[str, Any], List[Any]],
+        *,
+        role: str = "user",
+        msg_type: str = "user",
+        user_id: Optional[str] = None,
+        detail: str = "auto",
+        verbose: bool = False,
+    ) -> int:
+        """
+        Inserta un mensaje multimodal en la historia del usuario.
+
+        • content puede ser: str | bytes | dict | list
+        – str:
+            · Si es ruta de imagen válida → bloque 'image'.
+            · En cualquier otro caso → bloque 'text'.
+        – bytes (se asume imagen) → bloque 'image'.
+        – dict → se serializa a JSON (valores no-JSON se persisten vía files/) → bloque 'text'.
+        – list  → se procesa cada elemento con la misma lógica (no se asume que ya sea lista de bloques).
+
+        Devuelve el msg_number guardado.
+        """
+        import mimetypes
+
+        def _is_image_path(p: str) -> bool:
+            mime, _ = mimetypes.guess_type(p)
+            return mime and mime.startswith("image/") and os.path.isfile(p)
+
+        def _image_block_from_bytes(img_bytes: bytes) -> dict:
+            file_ref = self.save_file(img_bytes, user_id=user_id)
+            return {
+                "type": "image",
+                "source": {"kind": "file", "path": file_ref, "detail": detail},
+            }
+
+        def _blocks_from_single(elem) -> list[dict]:
+            # 1) Bloques ya formados
+            if isinstance(elem, dict) and "type" in elem:
+                return [elem]
+
+            # 2) bytes  -> imagen
+            if isinstance(elem, (bytes, bytearray)):
+                return [_image_block_from_bytes(bytes(elem))]
+
+            # 3) str
+            if isinstance(elem, str):
+                path_candidate = elem.strip()
+                if _is_image_path(path_candidate):
+                    with open(path_candidate, "rb") as f:
+                        img_bytes = f.read()
+                    return [_image_block_from_bytes(img_bytes)]
+                return [{"type": "text", "text": path_candidate}]
+
+            # 4) dict (no-bloque) -> serializar
+            if isinstance(elem, dict):
+                json_str = self._dict_to_json_with_file_persistence(elem, self._current_user_id)
+                return [{"type": "text", "text": json_str}]
+
+            # 5) tipo no soportado
+            raise TypeError(f"add_blocks(): tipo no soportado en lista: {type(elem)}")
+
+        # ------------------------------------------------------------------ #
+        # Construcción de la lista de bloques
+        if isinstance(content, list):
+            blocks: list[dict] = []
+            for item in content:
+                blocks.extend(_blocks_from_single(item))
+        else:
+            blocks = _blocks_from_single(content)
+
+        # ------------------------------------------------------------------ #
+        if verbose:
+            logger.debug(f"[MAS.add_blocks] role={role} msg_type={msg_type} blocks={blocks}")
+
+        # Guardamos
+        self.ensure_user(user_id)
+        conn = self._get_user_db()
+        msg_number = self._get_next_msg_number(conn)
+        self._save_message(conn, role, blocks, msg_type)
+        return msg_number
     
     def _get_all_messages(self, conn: sqlite3.Connection, include_model = False) -> List[tuple]:
         cur = conn.cursor()
