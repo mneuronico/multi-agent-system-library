@@ -290,6 +290,8 @@ manager = AgentSystemManager(
 The `AgentSystemManager` manages your system’s components, user histories, and general settings.
 
 -   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
+-   **`history_folder`**: Path for storing per-user SQLite databases. Defaults to `<base_directory>/history`.
+-   **`files_folder`**: Path for storing serialized object files. Defaults to `<base_directory>/files`.
 -   **`api_keys_path`**: Path to a `.env` or `json` file containing API keys. Keys from this file are given priority over system environment variables, making it easy to manage keys for different environments.
 -   **`costs_path`**: Path to a `.json` file containing model and tool costs. If provided, the system will calculate and store the USD cost for agent and tool executions when `return_token_count` is set to `True`.
 -   **`general_system_description`**: A description appended to the system prompt of each agent.
@@ -300,6 +302,7 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 -   **`on_complete`**: Function to be executed when `manager.run`() reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both will be executed), but it's different for automations, since it will only be ran at the end of the automation. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like sending the last message to the user after a complex automation workflow.
 -   **`include_timestamp`**: Whether the agents receive the `timestamp` for each message in the conversation history. False by default. This is overriden by the `include_timestamp` parameter associated with each agent, if specified. 
 -   **`timezone`**: String defining what timezone should the `timestamp` information be saved in. Defaults to `UTC`.
+-   **`log_level`**: Logging level for the library. Defaults to `logging.DEBUG`.
 
 `on_update` and `on_complete` can be defined as callables directly, or they can be strings referring to the name of the function to use, located in one of the `functions` files. To accomplish this, _function syntax_ must be used.
 
