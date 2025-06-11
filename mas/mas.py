@@ -3450,6 +3450,12 @@ class AgentSystemManager:
         on_update = on_update or self.on_update
         on_complete = on_complete or self.on_complete
 
+        if return_token_count and blocking:
+            _uid = user_id or self._current_user_id
+            prev_usage = self.get_usage_stats(_uid)
+        else:
+            prev_usage = None
+
         def task():
             self._run_internal(
                 component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
@@ -3464,6 +3470,38 @@ class AgentSystemManager:
             result = self._run_internal(
                 component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
             )
+
+            if return_token_count and prev_usage is not None:
+                _uid = user_id or self._current_user_id
+                post_usage = self.get_usage_stats(_uid)
+
+                delta_in   = post_usage["models"]["overall"]["input_tokens"]   - prev_usage["models"]["overall"]["input_tokens"]
+                delta_out  = post_usage["models"]["overall"]["output_tokens"]  - prev_usage["models"]["overall"]["output_tokens"]
+                delta_mcost = post_usage["models"]["overall"]["usd_cost"]      - prev_usage["models"]["overall"]["usd_cost"]
+                delta_tcost = post_usage["tools"]["overall"]["usd_cost"]       - prev_usage["tools"]["overall"]["usd_cost"]
+                delta_total = post_usage["overall"]["usd_cost"]                - prev_usage["overall"]["usd_cost"]
+
+                usage_summary = {
+                    "input_tokens":  delta_in,
+                    "output_tokens": delta_out,
+                    "models_cost":   round(delta_mcost, 6),
+                    "tools_cost":    round(delta_tcost, 6),
+                    "total_cost":    round(delta_total, 6)
+                }
+
+                # Log simple
+                if verbose:
+                    logger.info(
+                        f"[Usage] +{delta_in} in / +{delta_out} out tokens  "
+                        f"→ ${usage_summary['total_cost']:.6f} "
+                        f"(models: ${usage_summary['models_cost']:.6f}, "
+                        f"tools: ${usage_summary['tools_cost']:.6f})"
+                    )
+
+                # Y lo devolvemos embebido en el dict resultado
+                if isinstance(result, dict):
+                    result.setdefault("metadata", {})["usage_summary"] = usage_summary
+
             if on_complete:
                 if on_complete_params:
                     on_complete(self.get_messages(user_id), self, on_complete_params)
