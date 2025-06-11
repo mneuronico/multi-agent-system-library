@@ -395,7 +395,7 @@ agent_name = manager.create_agent(
             {"provider": "groq", "model": "llama-3.1-8b-instant"}
         ]
     ```
-    Supported providers so far are: `"openai"`, `"google"`, `"groq"`, `"anthropic"`, and `"deepseek"`. Ensure the corresponding `api_key` is available in your API key file.
+    Supported providers so far are: `"openai"`, `"google"`, `"groq"`, `"anthropic"`, `"deepseek"`, and `"lmstudio"`. Ensure the corresponding `api_key` is available in your API key file. LM Studio models can optionally include a `base_url` in the model dictionary when connecting to a non-default server.
 -   **`default_output`**: The output to use when all the models fail, should match the `required_outputs`.
 -   **`positive_filter`**: A list of `roles` to be included in the context of the agent (all other roles will be ignored if this is defined).
 -   **`negative_filter`**:  A list of `roles` to be excluded from the context.
