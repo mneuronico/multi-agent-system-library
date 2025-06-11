@@ -1089,6 +1089,27 @@ manager.add_message(
 )
 ```
 
+### Exporting History `export_history`
+
+```python
+sqlite_bytes = manager.export_history(user_id)
+```
+
+Exports the SQLite database for the specified user and returns its raw bytes. This
+is useful for creating backups or sending the history to another storage system.
+
+### Importing History `import_history`
+
+```python
+manager.import_history(user_id, sqlite_bytes)
+```
+
+Loads a SQLite database from bytes for the given user, overwriting any existing
+history file.
+
+`manager.has_new_updates()` can then be used as a boolean check to detect if new
+messages were added to the current user's history since the last check.
+
 ### Retrieving API keys with `get_keys`
 
 By default, the API keys file is used to store LLM provider keys, as well as the Bot Token for Telegram integration. However, you can also add any other key or sensitive string that you want to that file, and the manager will save it internally under the name you provide for it. Then, if you need to access it (for example, inside a `Tool` or `Process` function, to access an external API, database or anything else), you can use:
