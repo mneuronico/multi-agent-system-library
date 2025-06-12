@@ -2022,12 +2022,21 @@ class Automation(Component):
         return resolved
 
     def _case_matches(self, switch_value, case_value, verbose):
-        """Compare values with type coercion for numbers"""
+        """Compare switch/case values more flexibly."""
+        # ── NEW: unwrap single-element lists ─────────────────────────────
+        if isinstance(switch_value, list) and len(switch_value) == 1:
+            switch_value = switch_value[0]
+        if isinstance(case_value, list) and len(case_value) == 1:
+            case_value = case_value[0]
+        # ── NEW: normalise strings (trim + case-fold) ───────────────────
+        if isinstance(switch_value, str):
+            switch_value = switch_value.strip().lower()
+        if isinstance(case_value, str):
+            case_value = case_value.strip().lower()
+        # ── ORIGINAL numeric check + strict equality ────────────────────
         try:
-            # Numeric equivalence check
             if isinstance(switch_value, (int, float)) and isinstance(case_value, (int, float)):
                 return float(switch_value) == float(case_value)
-            # Strict equality for other types
             return switch_value == case_value
         except (TypeError, ValueError) as e:
             if verbose:
