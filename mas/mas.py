@@ -3835,7 +3835,12 @@ class AgentSystemManager:
             try:
                 dumped = json.dumps(value, ensure_ascii=False)
             except TypeError:
-                dumped = str(value)
+                # Fallback: persist non-serializable values into files
+                if isinstance(value, dict):
+                    dumped = self._dict_to_json_with_file_persistence(value, user_id)
+                else:
+                    data_copy = self._persist_non_json_values(value, user_id)
+                    dumped = json.dumps(data_copy, ensure_ascii=False)
             return [{
                 "type": "text",
                 "content": dumped
