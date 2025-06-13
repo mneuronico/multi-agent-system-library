@@ -76,7 +76,7 @@
         {   "type": "process",
             "name": "markdown_to_pdf",
             "function": "fn:markdown_to_pdf",
-            "description": "Turn markdown to PDF format. Requiers 'wkhtmltopdf' and 'pdfkit' to be installed. Last message in list given to this process must contain 'markdown' and 'title' fields. Returns pdf_file_path."
+            "description": "Turn markdown to PDF format. Requires 'wkhtmltopdf' and 'pdfkit' to be installed. The latest message must include a text block with JSON containing 'markdown' and 'title'. Returns pdf_file_path."
         },
 
         {

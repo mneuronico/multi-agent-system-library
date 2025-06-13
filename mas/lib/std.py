@@ -60,14 +60,18 @@ def weather_query(manager, location: str, unit: str = "metric") -> tuple:
     except requests.RequestException as e:
         return (None, "Unavailable", None, location)
 
-def markdown_to_pdf(messages):
+def markdown_to_pdf(manager, messages):
     import markdown
     import pdfkit
     import os
 
-    md_text = messages[-1]["message"]["markdown"]
+    # The latest message should contain a text block with a JSON string.
+    # Parse it using the manager helper to obtain a dictionary.
+    data = manager._blocks_as_tool_input(messages[-1]["message"])
 
-    title = messages[-1]["message"]["title"]
+    md_text = data["markdown"]
+
+    title = data["title"]
 
     # Convert markdown to HTML
     html_content = markdown.markdown(md_text)
