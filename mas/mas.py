@@ -209,17 +209,28 @@ class Agent(Component):
                     response_str = response
 
                 response_dict = self._extract_and_parse_json(response_str)
+
+                if response_dict is None:
+                    response_dict = {"response": response_str}
+
+                response_blocks = self.manager._to_blocks(
+                    response_dict, self.manager._current_user_id
+                )
+
                 self._last_used_model = {"provider": provider, "model": model_name}
                 if verbose:
                     logger.debug(f"[Agent:{self.name}] => success from provider={provider}\n{response_dict}")
                 
                 if return_token_count:
-                    response_dict.setdefault("metadata", {})
-                    response_dict["metadata"]["input_tokens"]  = input_tokens
-                    response_dict["metadata"]["output_tokens"] = output_tokens
-                    cost = self.manager.cost_model_call(provider, model_name, input_tokens, output_tokens)
-                    response_dict["metadata"]["usd_cost"] = cost
-                return response_dict
+                    # empaquetamos los metadatos en el primer bloque de texto
+                    response_blocks[0].setdefault("metadata", {})
+                    md = response_blocks[0]["metadata"]
+                    md["input_tokens"]  = input_tokens
+                    md["output_tokens"] = output_tokens
+                    md["usd_cost"]      = self.manager.cost_model_call(
+                        provider, model_name, input_tokens, output_tokens
+                    )
+                return response_blocks
                 
             except requests.exceptions.RequestException as req_err:
                 if verbose:
@@ -235,157 +246,120 @@ class Agent(Component):
             logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self.default_output}")
         return self.default_output
 
-    def _as_blocks(self, content: Any) -> list:
+    def _as_blocks(self, value):
         """
-        Normaliza cualquier content (str | dict | list) a
-        una lista de bloques  {'type': ..., ...}
+        Con la normalización global, *todo* lo que viene de la DB
+        ya es List[Block]. Este helper sólo garantiza eso para
+        casos heredados o tests unitarios.
         """
-        if isinstance(content, list) and all(isinstance(b, dict) and "type" in b for b in content):
-            return content
+        if isinstance(value, list) and value and all(
+            isinstance(b, dict) and "type" in b and "content" in b for b in value
+        ):
+            return value
 
-        if isinstance(content, dict):
-            return [{"type": "text", "text": json.dumps(content, ensure_ascii=False)}]
-
-        return [{"type": "text", "text": str(content)}]
+        # Fallback: pedile al Manager que lo normalice
+        return self.manager._to_blocks(value)
 
     def _provider_format_messages(self, provider: str, conversation: list) -> list:
         """
-        Convierte una conversación en bloques genéricos al formato específico
-        que espera cada proveedor (OpenAI, Gemini, Anthropic, etc.).
+        Convierte cada mensaje (que SIEMPRE es List[Block])
+        al formato requerido por cada proveedor.
         """
+        import base64, mimetypes, os, requests, json
         provider = provider.lower()
-        formatted = []
+        out = []
 
+        # ---- helpers internos --------------------------------
+        def _image_to_datauri(path):
+            mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            return f"data:{mime};base64,{b64}"
+
+        # ---- conversión --------------------------------------
         for msg in conversation:
-            role = msg["role"]
+            role   = msg["role"]
             blocks = self._as_blocks(msg["content"])
 
             if provider in {"openai", "groq", "deepseek"}:
-                """ # openai-style => "image_url"
-                parts = []
-                for b in blocks:
-                    if b["type"] == "text":
-                        parts.append({"type": "text", "text": b["text"]})
-                    elif b["type"] == "image":
-                        src = b["source"]
-                        if src["kind"] == "url":
-                            parts.append({"type": "image_url",
-                                        "image_url": {"url": src["url"],
-                                                        "detail": src.get("detail", "auto")}})
-                        elif src["kind"] == "b64":
-                            url = f"data:image/*;base64,{src['b64']}"
-                            parts.append({"type": "image_url",
-                                        "image_url": {"url": url,
-                                                        "detail": src.get("detail", "auto")}})
-                        elif src["kind"] == "file":
-                            # cargamos bytes y los embebemos como b64
-                            file_path = src["path"]
-                            if file_path.startswith("file:"):
-                                file_path = file_path[5:]      # quita prefijo
-                            raw = self.manager._load_file(file_path)
-                            import base64, mimetypes, os
-                            mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
-                            url = f"data:{mime};base64,{base64.b64encode(raw).decode()}"
-                            parts.append({"type": "image_url",
-                                        "image_url": {"url": url,
-                                                        "detail": src.get("detail", "auto")}})
-                formatted.append({"role": role, "content": parts}) """
-                
+                # OpenAI / Groq style: user puede ser multimodal, system/assistant solo texto
                 if role == "user":
-                    # Sólo para mensajes user multimodales -> parts[]
                     parts = []
-                    for b in blocks:
-                        if b["type"] == "text":
-                            parts.append({"type": "text", "text": b["text"]})
-                        elif b["type"] == "image":
-                            src = b["source"]
-                            if src["kind"] == "url":
-                                parts.append({"type": "image_url",
-                                            "image_url": {"url": src["url"],
-                                                            "detail": src.get("detail", "auto")}})
-                            elif src["kind"] == "b64":
+                    for blk in blocks:
+                        if blk["type"] == "text":
+                            parts.append({"type": "text", "text": blk["content"]})
+                        elif blk["type"] == "image":
+                            src = blk["content"]
+                            if src["kind"] == "file":
+                                url = _image_to_datauri(src["path"])
+                            elif src["kind"] == "url":
+                                url = src["url"]
+                            else:   # b64 directo
                                 url = f"data:image/*;base64,{src['b64']}"
-                                parts.append({"type": "image_url",
-                                            "image_url": {"url": url,
-                                                            "detail": src.get("detail", "auto")}})
-                            elif src["kind"] == "file":
-                                # cargamos bytes y los embebemos como b64
-                                file_path = src["path"]
-                                if file_path.startswith("file:"):
-                                    file_path = file_path[5:]      # quita prefijo
-                                raw = self.manager._load_file(file_path)
-                                import base64, mimetypes, os
-                                mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
-                                url = f"data:{mime};base64,{base64.b64encode(raw).decode()}"
-                                parts.append({"type": "image_url",
-                                            "image_url": {"url": url,
-                                                            "detail": src.get("detail", "auto")}})
-                    formatted.append({"role": role, "content": parts})
+                            parts.append({"type": "image_url",
+                                          "image_url": {"url": url,
+                                                        "detail": src.get("detail","auto")}})
+                    out.append({"role": role, "content": parts})
+                else:   # assistant / system
+                    text = "\n".join(
+                        blk["content"] if blk["type"] == "text"
+                        else "[image omitted]"
+                        for blk in blocks
+                    )
+                    out.append({"role": role, "content": text})
+
+            elif provider == "google":        # Gemini
+                gem_parts = []
+                for blk in blocks:
+                    if blk["type"] == "text":
+                        gem_parts.append({"text": blk["content"]})
+                    elif blk["type"] == "image":
+                        src = blk["content"]
+                        if src["kind"] == "file":
+                            data = open(src["path"],"rb").read()
+                        elif src["kind"] == "url":
+                            data = requests.get(src["url"]).content
+                        else:
+                            data = base64.b64decode(src["b64"])
+                        gem_parts.append({
+                            "inline_data": {
+                                "mime_type": "image/jpeg",
+                                "data": base64.b64encode(data).decode()
+                            }
+                        })
+                if role == "system":
+                    out.append({"role": role, "parts": gem_parts})
                 else:
-                    # system o assistant -> convertir a string plano
-                    text = self._flatten_system_content(blocks)
-                    formatted.append({"role": role, "content": text})
+                    out.append({"role": "user" if role=="user" else "model",
+                                "parts": gem_parts})
 
-
-            elif provider == "google":
-                # Gemini => "parts" dentro de "contents"
-                part_objs = []
-                for b in blocks:
-                    if b["type"] == "text":
-                        part_objs.append({"text": b["text"]})
-                    elif b["type"] == "image":
-                        src = b["source"]
-                        if src["kind"] == "url":
-                            part_objs.append(
-                                {"inline_data": {"mime_type": "image/*", "data": requests.get(src["url"]).content.encode("base64")}}
-                            )
-                        elif src["kind"] == "b64":
-                            part_objs.append(
-                                {"inline_data": {"mime_type": "image/*", "data": src["b64"]}}
-                            )
-                        elif src["kind"] == "file":
-                            file_path = src["path"]
-                            if file_path.startswith("file:"):
-                                file_path = file_path[5:]      # quita prefijo
-                            raw = self.manager._load_file(file_path)
-                            import base64, mimetypes
+            elif provider == "anthropic":     # Claude
+                c_blocks = []
+                for blk in blocks:
+                    if blk["type"] == "text":
+                        c_blocks.append({"type":"text", "text": blk["content"]})
+                    elif blk["type"] == "image":
+                        src = blk["content"]
+                        if src["kind"] == "file":
+                            data = open(src["path"],"rb").read()
                             mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
-                            part_objs.append(
-                                {"inline_data": {"mime_type": mime, "data": base64.b64encode(raw).decode()}}
-                            )
-                formatted.append({"role": role, "parts": part_objs})
-
-            elif provider == "anthropic":
-                # Claude 3 => blocks "type":"image"/"text"
-                content_blocks = []
-                for b in blocks:
-                    if b["type"] == "text":
-                        content_blocks.append({"type": "text", "text": b["text"]})
-                    elif b["type"] == "image":
-                        src = b["source"]
-                        if src["kind"] in {"url", "b64"}:
-                            content_blocks.append({"type": "image",
-                                                "source": {"type": src["kind"],
-                                                            "data": src.get("b64"),
-                                                            "url": src.get("url"),
-                                                            "media_type": "image/jpeg"}})
-                        elif src["kind"] == "file":
-                            file_path = src["path"]
-                            if file_path.startswith("file:"):
-                                file_path = file_path[5:]      # quita prefijo
-                            raw = self.manager._load_file(file_path)
-                            import base64, mimetypes
-                            mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
-                            content_blocks.append({"type": "image",
-                                                "source": {"type": "base64",
-                                                            "data": base64.b64encode(raw).decode(),
-                                                            "media_type": mime}})
-                formatted.append({"role": role, "content": content_blocks})
+                            b64  = base64.b64encode(data).decode()
+                            c_blocks.append({"type":"image",
+                                             "source":{"type":"base64",
+                                                       "media_type":mime,
+                                                       "data": b64}})
+                        elif src["kind"] == "url":
+                            c_blocks.append({"type":"image",
+                                             "source":{"type":"url",
+                                                       "media_type":"image/jpeg",
+                                                       "url": src["url"]}})
+                out.append({"role": role, "content": c_blocks})
 
             else:
-                return conversation
+                # Por defecto: devolvemos los bloques sin tocar
+                out.append({"role": role, "content": blocks})
 
-        return formatted
+        return out
 
 
     def _build_conversation_from_parser_result(self, parsed: dict, db_conn: sqlite3.Connection, verbose: bool) -> List[Dict[str, Any]]:
@@ -476,16 +450,12 @@ class Agent(Component):
     def _transform_to_conversation(self, msg_tuples: List[tuple], fields: Optional[list] = None, include_message_number: Optional[bool] = False) -> List[Dict[str, str]]:
         conversation = []
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
-            if isinstance(content, str):
-                try:
-                    data = json.loads(content)
-                except json.JSONDecodeError:
-                    data = content
-            else:
-                data = content
+            data = content
 
-            if isinstance(data, dict) and fields:
-                data = self._extract_fields_from_data(data, fields)
+            if fields:
+                data = self.manager._filter_blocks_by_fields(
+                    self._as_blocks(data), fields
+                )
 
             if isinstance(data, list) and all(isinstance(b, dict) and "type" in b for b in data):
                 blocks = [b.copy() for b in data]
@@ -497,7 +467,7 @@ class Agent(Component):
                 for blk in blocks:
                     if blk["type"] == "text":
                         # envolvemos el texto original dentro del JSON wrapper
-                        original = blk["text"]
+                        original = blk["content"]
 
                         wrapper_obj = {
                             "source": source,
@@ -514,7 +484,7 @@ class Agent(Component):
                             wrapper_obj["timestamp"] = formatted_ts
 
                         # reemplazamos el campo "text" por la serialización
-                        blk["text"] = json.dumps(wrapper_obj, ensure_ascii=False)
+                        blk["content"] = json.dumps(wrapper_obj, ensure_ascii=False)
 
             conversation.append({
                 "role": "assistant" if role == self.name else "user",
@@ -574,16 +544,12 @@ class Agent(Component):
         conversation = []
 
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
-            if isinstance(content, str):
-                try:
-                    data = json.loads(content)
-                except json.JSONDecodeError:
-                    data = content
-            else:
-                data = content
+            data = content
 
-            if isinstance(data, dict) and fields:
-                data = self._extract_fields_from_data(data, fields)
+            if fields:
+                data = self.manager._filter_blocks_by_fields(
+                    self._as_blocks(data), fields
+                )
 
             conversation.append((role, data, msg_number, msg_type, timestamp))
 
@@ -632,19 +598,6 @@ class Agent(Component):
         conversation = self._transform_to_conversation(filtered_msgs)
         conversation = [{"role": "system", "content": self.system_prompt}] + conversation
         return conversation
-
-
-    def _extract_fields_from_data(self, data: dict, fields: list) -> dict:
-        """
-        Attempt to extract only the specified fields from data.
-        Returns a new dict containing only those fields.
-        """
-        relevant = {}
-        for f in fields:
-            if f in data:
-                relevant[f] = data[f]
-        return relevant
-
 
     def _apply_filters(self, messages: List[tuple]) -> List[tuple]:
         if not self.positive_filter and not self.negative_filter:
@@ -716,7 +669,7 @@ class Agent(Component):
         if isinstance(blocks, str):
             return blocks
         if isinstance(blocks, list):
-            return "\n".join(b["text"] for b in blocks if b.get("type") == "text")
+            return "\n".join(b["content"] for b in blocks if b.get("type") == "text")
         # fallback
         return str(blocks)
     
@@ -1286,13 +1239,8 @@ class Tool(Component):
             role, content, msg_number, msg_type, timestamp = subset[target_index]
 
 
-        if isinstance(content, str):
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
-                pass
-        else:
-            data = content
+        blocks = content                           # ya es List[Block]
+        data   = self.manager._blocks_as_tool_input(blocks)
 
         try:
             data = self.manager._load_files_in_dict(data)
@@ -1337,13 +1285,8 @@ class Tool(Component):
                     if subset:
                         role, content, msg_number, msg_type, timestamp = subset[-1]
 
-                        if isinstance(content, str):
-                            try:
-                                data = json.loads(content)
-                            except json.JSONDecodeError:
-                                data = content
-                        else:
-                            data = content
+                        blocks = content                           # ya es List[Block]
+                        data   = self.manager._blocks_as_tool_input(blocks)
 
                         data = self.manager._load_files_in_dict(data)
                         if isinstance(data, dict):
@@ -1400,13 +1343,8 @@ class Tool(Component):
             return {}
 
         role, content, msg_number, msg_type, timestamp = subset[index]
-        if isinstance(content, str):
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
-                data = content
-        else:
-            data = content
+        blocks = content                           # ya es List[Block]
+        data   = self.manager._blocks_as_tool_input(blocks)
 
         data = self.manager._load_files_in_dict(data)
 
@@ -1468,13 +1406,8 @@ class Tool(Component):
                 raise IndexError(f"Index={index} must be an integer for Tools.")
                 
             for (role, content, msg_number, msg_type, timestamp) in chosen:
-                if isinstance(content, str):
-                    try:
-                        data = json.loads(content)
-                    except json.JSONDecodeError:
-                        data = content
-                else:
-                    data = content
+                blocks = content                           # ya es List[Block]
+                data   = self.manager._blocks_as_tool_input(blocks)
                     
                 data = self.manager._load_files_in_dict(data)
                 if not isinstance(data, dict):
@@ -1645,9 +1578,11 @@ class Process(Component):
 
         final = []
         for (role, content, msg_num, msg_type, timestamp) in chosen:
-            data = self._safe_json_load(content)
-            if isinstance(data, dict) and fields:
-                data = {f: data[f] for f in fields if f in data}
+            data = content
+            if fields:
+                data = self.manager._filter_blocks_by_fields(
+                    self.manager._to_blocks(data), fields
+                )
             final.append((role, data, msg_num, msg_type, timestamp))
 
         return final
@@ -1744,9 +1679,11 @@ class Process(Component):
 
             final = []
             for (role, content, msg_num, msg_type, timestamp) in chosen:
-                data = self._safe_json_load(content)
-                if isinstance(data, dict) and fields:
-                    data = {f: data[f] for f in fields if f in data}
+                data = content
+                if fields:
+                    data = self.manager._filter_blocks_by_fields(
+                        self.manager._to_blocks(data), fields
+                    )
                 final.append((role, data, msg_num, msg_type, timestamp))
 
             combined.extend(final)
@@ -1999,12 +1936,9 @@ class Automation(Component):
         """Resolve switch value using parser logic"""
         if isinstance(value_spec, str) and not value_spec.startswith(":"):
             # Direct field reference from last message
-            last_msg = self.manager._get_all_messages(db_conn)[-1][1]
-            try:
-                data = json.loads(last_msg)
-                return data.get(value_spec)
-            except json.JSONDecodeError:
-                return last_msg
+            last_blocks = self.manager._get_all_messages(db_conn)[-1][1]
+            data_dict   = self.manager._blocks_as_tool_input(last_blocks)
+            return data_dict.get(value_spec)
         
         parsed = self.manager.parser.parse_input_string(value_spec)
         resolved = self._gather_data_for_parser_result(parsed, db_conn)
@@ -2165,16 +2099,9 @@ class Automation(Component):
 
                     if filtered:
                         role, content, msg_number, msg_type, timestamp = filtered[-1]
-                        if isinstance(content, str):
-                            try:
-                                data = json.loads(content)
-                            except json.JSONDecodeError:
-                                data = content
-                        else:
-                            data = content
-
-                        data = self.manager._load_files_in_dict(data)
-                        return data
+                        blocks = content
+                        data_dict = self.manager._blocks_as_tool_input(blocks)
+                        return data_dict
                     else:
                         return None
                 else:
@@ -2182,13 +2109,8 @@ class Automation(Component):
                     subset = self.manager._get_all_messages(db_conn)
                     role, content, msg_number, msg_type, timestamp = subset[-1]
                     
-                    if isinstance(content, str):
-                        try:
-                            data = json.loads(content)
-                        except json.JSONDecodeError:
-                            data = content
-                    else:
-                        data = content
+                    blocks = content                           # ya es List[Block]
+                    data   = self.manager._blocks_as_tool_input(blocks)
 
                     return data[parsed["component_or_param"]]
             else:
@@ -2239,28 +2161,12 @@ class Automation(Component):
 
         role, content, msg_number, msg_type, timestamp = subset[index_to_use]
 
-        if isinstance(content, str):
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
-                data = content
-        else:
-            data = content
-
-        data = self.manager._load_files_in_dict(data)
-
-        if not isinstance(data, dict):
-            return data
+        blocks = content
+        base_dict = self.manager._blocks_as_tool_input(blocks)
 
         if fields:
-            filtered_data = {}
-            for f in fields:
-                if f in data:
-                    filtered_data[f] = data[f]
-            return filtered_data
-        else:
-            # No field filter => return entire dict
-            return data
+            return {k: base_dict[k] for k in fields if k in base_dict}
+        return base_dict
 
 
         
@@ -2763,38 +2669,49 @@ class AgentSystemManager:
         self._save_message(db_conn, role, content, msg_type)
 
     def _save_component_output(
-        self, db_conn, component, output_dict, verbose=False
+        self,
+        db_conn,
+        component,
+        output_value,
+        verbose=False
     ):
-        
-        if not hasattr(component, '_last_used_model'):
-            model_info = None
-        else:
-            model_info = component._last_used_model
-            del component._last_used_model
-
-        if not output_dict:
-            return
-
-        save_role = component.name
-        component_type = None
-        model_str = None
-
-        if model_info:
-            model_str = f"{model_info['provider']}:{model_info['model']}"
-
-        if isinstance(component, Agent):
-            component_type = "agent"
-        elif isinstance(component, Tool):
-           component_type = "tool"
-        elif isinstance(component, Process):
-            component_type = "process"
-        elif isinstance(component, Automation):
-           component_type = "automation"
-
+        """
+        Recibe la salida cruda del componente, la convierte en bloques y la guarda.
+        """
+        # Automatizaciones no se persisten (mantengo comportamiento original)
         if isinstance(component, Automation):
             return
 
-        self._save_message(db_conn, save_role, output_dict, component_type, model_str)
+        # ---- info de metadatos ────────────────────────────────
+        model_info = getattr(component, "_last_used_model", None)
+        if model_info:
+            del component._last_used_model
+            model_str = f"{model_info['provider']}:{model_info['model']}"
+        else:
+            model_str = None
+
+        if output_value is None:
+            return  # nada que guardar
+
+        # ---- normalización a bloques ──────────────────────────
+        blocks = self._to_blocks(output_value, self._current_user_id)
+
+        save_role      = component.name
+        component_type = (
+            "agent"      if isinstance(component, Agent)      else
+            "tool"       if isinstance(component, Tool)       else
+            "process"    if isinstance(component, Process)    else
+            "automation"
+        )
+
+        # ---- persistencia final ───────────────────────────────
+        self._save_message(
+            db_conn,
+            save_role,
+            blocks,
+            component_type,
+            model_str
+        )
 
         
     def _dict_to_json_with_file_persistence(self, data: dict, user_id: str) -> str:
@@ -2875,85 +2792,50 @@ class AgentSystemManager:
 
     def add_blocks(
         self,
-        content: Union[str, bytes, Dict[str, Any], List[Any]],
+        content,
         *,
         role: str = "user",
         msg_type: str = "user",
-        user_id: Optional[str] = None,
+        user_id: str | None = None,
         detail: str = "auto",
         verbose: bool = False,
     ) -> int:
         """
-        Inserta un mensaje multimodal en la historia del usuario.
-
-        • content puede ser: str | bytes | dict | list
-        – str:
-            · Si es ruta de imagen válida → bloque 'image'.
-            · En cualquier otro caso → bloque 'text'.
-        – bytes (se asume imagen) → bloque 'image'.
-        – dict → se serializa a JSON (valores no-JSON se persisten vía files/) → bloque 'text'.
-        – list  → se procesa cada elemento con la misma lógica (no se asume que ya sea lista de bloques).
-
-        Devuelve el msg_number guardado.
+        Normaliza *content* a List[Block] con _to_blocks() y lo guarda.
+        Devuelve el msg_number asignado.
         """
-        import mimetypes
+        blocks = self._to_blocks(content, user_id=user_id, detail=detail)
 
-        def _is_image_path(p: str) -> bool:
-            mime, _ = mimetypes.guess_type(p)
-            return mime and mime.startswith("image/") and os.path.isfile(p)
-
-        def _image_block_from_bytes(img_bytes: bytes) -> dict:
-            file_ref = self.save_file(img_bytes, user_id=user_id)
-            return {
-                "type": "image",
-                "source": {"kind": "file", "path": file_ref, "detail": detail},
-            }
-
-        def _blocks_from_single(elem) -> list[dict]:
-            # 1) Bloques ya formados
-            if isinstance(elem, dict) and "type" in elem:
-                return [elem]
-
-            # 2) bytes  -> imagen
-            if isinstance(elem, (bytes, bytearray)):
-                return [_image_block_from_bytes(bytes(elem))]
-
-            # 3) str
-            if isinstance(elem, str):
-                path_candidate = elem.strip()
-                if _is_image_path(path_candidate):
-                    with open(path_candidate, "rb") as f:
-                        img_bytes = f.read()
-                    return [_image_block_from_bytes(img_bytes)]
-                return [{"type": "text", "text": path_candidate}]
-
-            # 4) dict (no-bloque) -> serializar
-            if isinstance(elem, dict):
-                json_str = self._dict_to_json_with_file_persistence(elem, self._current_user_id)
-                return [{"type": "text", "text": json_str}]
-
-            # 5) tipo no soportado
-            raise TypeError(f"add_blocks(): tipo no soportado en lista: {type(elem)}")
-
-        # ------------------------------------------------------------------ #
-        # Construcción de la lista de bloques
-        if isinstance(content, list):
-            blocks: list[dict] = []
-            for item in content:
-                blocks.extend(_blocks_from_single(item))
-        else:
-            blocks = _blocks_from_single(content)
-
-        # ------------------------------------------------------------------ #
         if verbose:
-            logger.debug(f"[MAS.add_blocks] role={role} msg_type={msg_type} blocks={blocks}")
+            logger.debug(f"[MAS.add_blocks] role={role} type={msg_type} blocks={blocks}")
 
-        # Guardamos
         self.ensure_user(user_id)
         conn = self._get_user_db()
         msg_number = self._get_next_msg_number(conn)
         self._save_message(conn, role, blocks, msg_type)
         return msg_number
+    
+    def _filter_blocks_by_fields(self, blocks, fields):
+        """
+        • Si no hay bloque text ⇒ devuelve blocks sin tocar.
+        • Si hay → decodifica JSON, filtra campos, vuelve a serializar.
+        """
+        import json, copy
+        if not fields:
+            return blocks
+
+        new_blocks = copy.deepcopy(blocks)
+        for b in new_blocks:
+            if b.get("type") == "text":
+                raw = b["content"]
+                try:
+                    obj = json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    break                                   # no es JSON
+                if isinstance(obj, dict):
+                    sub = {k: obj[k] for k in fields if k in obj}
+                    b["content"] = json.dumps(sub, ensure_ascii=False)
+        return new_blocks
     
     def _get_all_messages(self, conn: sqlite3.Connection, include_model = False) -> List[tuple]:
         cur = conn.cursor()
@@ -3893,6 +3775,101 @@ class AgentSystemManager:
         pattern = r'([_*\[\]\(\)~`>#\+\-=|{}\.!\\])'
         return re.sub(pattern, r'\\\1', text)
     
+    def _is_block(self, obj):
+        """True si obj es un bloque {'type','content'}."""
+        return isinstance(obj, dict) and "type" in obj and "content" in obj
+    
+    def _is_image_bytes(self, val):
+        return isinstance(val, (bytes, bytearray))
+
+    def _is_valid_image_path(self, p):
+        if not isinstance(p, str):
+            return False
+        import mimetypes, os
+        mime, _ = mimetypes.guess_type(p)
+        return mime and mime.startswith("image/") and os.path.isfile(p)
+
+    def _to_blocks(self, value, user_id=None, detail="auto"):
+        """
+        Convierte *cualquier* valor Python a List[Block] con schema:
+            { "type": "text"|"image", "content": … }
+
+        Reglas:
+          • Si ya es lista de bloques válidos → la devuelve intacta.
+          • Si ya es bloque único  → lo envuelve en lista.
+          • bytes / imagen → bloque image.
+          • dict / list / str / cualquier otro → bloque text (json-dump si ≠str).
+        """
+        import json
+
+        # Aseguramos user_id para guardar archivos cuando haga falta
+        self.ensure_user(user_id)
+        user_id = user_id or self._current_user_id
+
+        # 1) lista de bloques válida
+        if isinstance(value, list) and value and all(self._is_block(b) for b in value):
+            return value
+
+        # 2) bloque suelto
+        if self._is_block(value):
+            return [value]
+
+        # 3) bytes  /  ruta de imagen
+        if self._is_image_bytes(value):
+            file_ref = self.save_file(bytes(value), user_id)
+            return [{
+                "type": "image",
+                "content": {"kind": "file", "path": file_ref, "detail": detail}
+            }]
+        if self._is_valid_image_path(value):
+            with open(value, "rb") as f:
+                raw = f.read()
+            file_ref = self.save_file(raw, user_id)
+            return [{
+                "type": "image",
+                "content": {"kind": "file", "path": file_ref, "detail": detail}
+            }]
+
+        # 4) dict / list → serializamos si no son ya bloques
+        if isinstance(value, dict) or isinstance(value, list):
+            try:
+                dumped = json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                dumped = str(value)
+            return [{
+                "type": "text",
+                "content": dumped
+            }]
+
+        # 5) todo lo demás (str, int, float, …)
+        return [{
+            "type": "text",
+            "content": str(value)
+        }]
+    
+    def _first_text_block(self, blocks):
+        """Devuelve el primer bloque 'text' o None."""
+        for b in blocks:
+            if b.get("type") == "text":
+                return b["content"]
+        return None
+
+    def _blocks_as_tool_input(self, blocks):
+        """
+        • Obtiene el primer bloque text, lo intenta json.loads().
+        • Si no hay bloque text → lanza ValueError (Tools no soportan imagen directa).
+        """
+        import json
+        raw = self._first_text_block(blocks)
+        if raw is None:
+            raise ValueError("Tool input must contain at least one text block")
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
+        return raw
+    
     def get_key(self, name: str) -> Optional[str]:
         name = name.lower()
 
@@ -4000,14 +3977,13 @@ class AgentSystemManager:
             # Armamos la lista de bloques que se grabará en el historial
             blocks = []
             if transcript:                                   # bloque de texto si hubo STT
-                blocks.append({"type": "text", "text": transcript})
+                blocks.extend(self._to_blocks(transcript, user_id=str(update.message.chat.id)))
 
             blocks.append({                                  # bloque de audio (siempre)
                 "type": "audio",
                 "source": {"kind": "file", "path": file_ref, "detail": "auto"}
             })
 
-            # Llamamos igual que antes, pasando file_ref por si tus callbacks lo usan
             await handle_system_text(update, blocks, file_ref)
 
         async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4025,74 +4001,86 @@ class AgentSystemManager:
             # Armamos una lista de bloques: primero el texto (si existe), luego la imagen
             blocks: List[dict] = []
             if caption:
-                blocks.append({
-                    "type": "text",
-                    "text": caption
-                })
+                blocks.extend(self._to_blocks(caption, user_id=str(update.message.chat.id)))
 
             blocks.append({
                 "type": "image",
                 "source": {"kind": "file", "path": img_ref, "detail": "auto"}
             })
 
-            # Ahora sí mandamos ambos al agente
             await handle_system_text(update, blocks)
 
+        async def send_telegram_response(update, blocks):
+            """
+            blocks: List[Block] normalizados.
+            • text ⇒ envía el campo 'response' si existe, si no el content tal cual.
+            • image ⇒ envía la foto referenciada.
+            Se envía cada bloque en un mensaje separado.
+            """
+            import json
 
-        async def send_telegram_response(update, response):
-            if isinstance(response, str):
-                await update.message.reply_text(response)
-            elif isinstance(response, dict):
-                for key, value in response.items():
-                    if key == "text":
-                        await update.message.reply_text(value)
-                    elif key == "markdown":
-                        value = self.escape_markdown(value)
-                        await update.message.reply_text(value, parse_mode="MarkdownV2")
-                    elif key == "image":
-                        await update.message.reply_photo(value)
-                    elif key == "audio":
-                        await update.message.reply_audio(value)
-                    elif key == "voice_note":
-                        await update.message.reply_voice(value)
-                    elif key == "document":
-                        await update.message.reply_document(value)
-
-
-        def on_complete_fn(messages, manager, on_complete_params):
-
-            if on_complete is not None:
-                response = on_complete(messages, manager, on_complete_params)
-            else:
-                last_message = messages[-1]
-                response = last_message.get("message", {}).get("response")
-
-            if response is None:
+            if not blocks:
                 return
 
-            update = on_complete_params["update"]
-            loop = on_complete_params["event_loop"]
+            for blk in blocks:
+                if blk["type"] == "text":
+                    raw = blk["content"]
+                    try:
+                        # intentamos interpretar como JSON por si es objeto
+                        parsed = json.loads(raw)
+                        # contrato MAS: por defecto los agentes/tools guardan 'response'
+                        txt = parsed.get("response", raw) if isinstance(parsed, dict) else raw
+                    except json.JSONDecodeError:
+                        txt = raw
+                    await update.message.reply_text(txt)
+                    #value = self.escape_markdown(value)
+                    #await update.message.reply_text(value, parse_mode="MarkdownV2")
+
+                elif blk["type"] == "image":
+                    await update.message.reply_photo(blk["content"]["path"])
+
+                elif blk["type"] == "audio":
+                    await update.message.reply_voice(blk["content"]["path"])
+
+                
+
+
+        def on_complete_fn(messages, manager, params):
+
+            blocks = None
+            if on_complete is not None:
+                response = on_complete(messages, manager, params)
+                blocks = self._to_blocks(response, user_id=str(params["update"].message.chat.id))
+            
+            if blocks is None:
+                blocks = messages[-1]["message"] if messages else []
+
+            if blocks is None:
+                return
+
+            update = params["update"]
+            loop = params["event_loop"]
 
             def callback():
-                asyncio.create_task(send_telegram_response(update, response))
+                asyncio.create_task(send_telegram_response(update, blocks))
 
             loop.call_soon_threadsafe(callback)
 
-        def on_update_fn(messages, manager, on_update_params):
-
+        def on_update_fn(messages, manager, params):
+            
+            blocks = None
             if on_update is not None:
-                response = on_update(messages, manager, on_update_params)
-            else:
-                response = None
+                response = on_update(messages, manager, params)
+                blocks = self._to_blocks(response, user_id=str(params["update"].message.chat.id))
             
-            if response is None:
+            if blocks is None:
                 return
-            
-            update = on_update_params["update"]
-            loop = on_update_params["event_loop"]
+
+            update = params["update"]
+            loop = params["event_loop"]
 
             def callback():
-                asyncio.create_task(send_telegram_response(update, response))
+                asyncio.create_task(send_telegram_response(update, blocks))
 
             loop.call_soon_threadsafe(callback)
 
