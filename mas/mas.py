@@ -2788,7 +2788,7 @@ class AgentSystemManager:
         *,
         role: str = "user",
         msg_type: str = "user",
-        user_id: str | None = None,
+        user_id: Union[str, None] = None,
         detail: str = "auto",
         verbose: bool = False,
     ) -> int:
