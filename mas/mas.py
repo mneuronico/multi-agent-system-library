@@ -3801,6 +3801,13 @@ class AgentSystemManager:
         # 1) lista de bloques válida
         if isinstance(value, list) and value and all(self._is_block(b) for b in value):
             return value
+        
+        # 1-bis) ----- lista *mixta* → procesar elemento por elemento ----
+        if isinstance(value, list):
+            merged = []
+            for item in value:
+                merged.extend(self._to_blocks(item, user_id=user_id, detail=detail))
+            return merged
 
         # 2) bloque suelto
         if self._is_block(value):
