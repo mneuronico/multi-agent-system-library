@@ -3333,6 +3333,12 @@ class AgentSystemManager:
         on_update = on_update or self.on_update
         on_complete = on_complete or self.on_complete
 
+        run_user_id = user_id or self._current_user_id
+        if not run_user_id:
+            # Si todavía no hay usuario, créalo y establécelo ahora.
+            run_user_id = str(uuid.uuid4())
+            self.set_current_user(run_user_id)
+
         if return_token_count and blocking:
             _uid = user_id or self._current_user_id
             prev_usage = self.get_usage_stats(_uid)
