@@ -464,6 +464,7 @@ class Agent(Component):
 
             if role != self.name:
                 source = f"{msg_type}: {role}"
+                wrapped_any = False
                 for blk in blocks:
                     if blk["type"] == "text":
                         # envolvemos el texto original dentro del JSON wrapper
@@ -473,6 +474,8 @@ class Agent(Component):
                             "source": source,
                             "message": original
                         }
+
+                        wrapped_any = True
 
                         if self.include_timestamp:
                             try:
@@ -485,6 +488,13 @@ class Agent(Component):
 
                         # reemplazamos el campo "text" por la serialización
                         blk["content"] = json.dumps(wrapper_obj, ensure_ascii=False)
+                
+                if not wrapped_any:
+                    wrapper_obj = {"source": source, "message": "<non-text payload>"}
+                    blocks.insert(
+                        0,
+                        {"type": "text", "content": json.dumps(wrapper_obj, ensure_ascii=False)}
+                    )
 
             conversation.append({
                 "role": "assistant" if role == self.name else "user",
@@ -1696,7 +1706,7 @@ class Process(Component):
         self,
         db_conn: sqlite3.Connection,
         target_input: Optional[str],
-        target_index: Optional[int], #should this not handle ranges and stuff now?? what else is wrong and needs changing in this codebase after changing the indexing schema?
+        target_index: Optional[int],
         target_fields: Optional[list],
         verbose: bool
     ) -> List[dict]:
@@ -1705,45 +1715,27 @@ class Process(Component):
         if not all_msgs:
             return []
 
-        if not target_input:
-            # no component specified => entire DB => last message
-            chosen = [all_msgs[-1]]
-        else:
-            subset = [
-                        (r, c, n, t, ts) 
-                        for (r, c, n, t, ts) in all_msgs 
-                        if r == target_input
-                    ]
+        # 1) filtrado por componente
+        subset = (
+            [row for row in all_msgs if row[0] == target_input]
+            if target_input else all_msgs
+        )
+        if not subset:
+            return []
 
-            if not subset:
-                if verbose:
-                    logger.debug(f"[Process:{self.name}] No messages found for target_input={target_input}, returning empty.")
-                return []
+        # 2) manejamos el índice / rango
+        chosen = self._handle_index(target_index, subset)
 
-            if target_index is None:
-                chosen = subset[-1]
-            else:
-                if len(subset) < abs(target_index):
-                    if verbose:
-                        logger.warning(f"[Process:{self.name}] index={target_index} but only {len(subset)} messages.")
-                    return []
-                chosen = subset[target_index] # this might be wrong, if processes can take message lists, indices should be allowed to be all, or ranges, just like agents
-
-        if not isinstance(chosen, list):
-            chosen = [chosen]
-
+        # 3) filtramos fields
         if target_fields:
-            final_chosen = []
+            tmp = []
+            for (role, content, num, typ, ts) in chosen:
+                blocks = self.manager._filter_blocks_by_fields(content, target_fields)
+                tmp.append((role, blocks, num, typ, ts))
+            chosen = tmp
 
-            for ch in chosen:
-                new_ch = {}
-                for field in target_fields:
-                    new_ch[field] = ch[field]
-                final_chosen.append(new_ch)
-        else:
-            final_chosen = chosen
+        return self._transform_to_message_list(chosen)
 
-        return self._transform_to_message_list(final_chosen)
 
 class Automation(Component):
     def __init__(self, name: str, sequence: List[Union[str, dict]], description: str = None):
@@ -3867,13 +3859,23 @@ class AgentSystemManager:
         import json
         raw = self._first_text_block(blocks)
         if raw is None:
-            raise ValueError("Tool input must contain at least one text block")
+            raise ValueError("Input must contain at least one text block")
         if isinstance(raw, str):
             try:
-                return json.loads(raw)
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    return obj
             except json.JSONDecodeError:
-                return raw
-        return raw
+                pass
+            # texto plano → envolvemos
+            return {"text_content": raw}
+
+        # raro: el campo 'content' ya era un obj
+        if isinstance(raw, dict):
+            return raw
+
+        # cualquier otro tipo lo envolvemos igual
+        return {"text_content": str(raw)}
     
     def get_key(self, name: str) -> Optional[str]:
         name = name.lower()
