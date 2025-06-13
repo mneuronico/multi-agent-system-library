@@ -2881,6 +2881,39 @@ class AgentSystemManager:
 
         return messages
     
+    # ---------- helper: saca metadata de una lista de bloques --------------
+    def _extract_metadata_from_blocks(self, content):
+        """
+        Devuelve el dict metadata que guarda MAS dentro del primer bloque con ella.
+        Si no hay, devuelve {}.
+        """
+        import json
+
+        # Caso antiguo: ya era dict con metadata en la raíz
+        if isinstance(content, dict):
+            return content.get("metadata", {})
+
+        # Caso nuevo: lista de bloques
+        if isinstance(content, list):
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                # 1) bloque con metadata explícita
+                if "metadata" in blk:
+                    return blk["metadata"]
+
+                # 2) bloque type=text con JSON serializado
+                if blk.get("type") == "text":
+                    raw = blk.get("content") or blk.get("text")
+                    if isinstance(raw, str):
+                        try:
+                            obj = json.loads(raw)
+                            if isinstance(obj, dict) and "metadata" in obj:
+                                return obj["metadata"]
+                        except json.JSONDecodeError:
+                            pass
+        return {}
+    
     def get_usage_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Returns a summary of token- and cost-usage for the given user (defaults to current).
@@ -2912,8 +2945,8 @@ class AgentSystemManager:
         for msg in messages:
             mtype = msg["type"]
             src   = msg["source"]
-            content = msg["message"] if isinstance(msg["message"], dict) else {}
-            metadata = content.get("metadata", {})
+            content = msg["message"]
+            metadata = self._extract_metadata_from_blocks(content)
             cost     = metadata.get("usd_cost", 0.0)
 
             if mtype == "agent":
