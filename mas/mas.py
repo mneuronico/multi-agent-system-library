@@ -18,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 import inspect
 from datetime import datetime
-
+import imghdr, mimetypes, shutil
 from importlib import resources
 import logging
 
@@ -446,59 +446,49 @@ class Agent(Component):
 
         return chosen
 
-
     def _transform_to_conversation(self, msg_tuples: List[tuple], fields: Optional[list] = None, include_message_number: Optional[bool] = False) -> List[Dict[str, str]]:
         conversation = []
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
-            data = content
-
-            if fields:
-                data = self.manager._filter_blocks_by_fields(
-                    self._as_blocks(data), fields
-                )
+            data = json.loads(content) if isinstance(content, str) else content
 
             if isinstance(data, list) and all(isinstance(b, dict) and "type" in b for b in data):
                 blocks = [b.copy() for b in data]
             else:
                 blocks = self._as_blocks(data)
 
+            if fields:
+                data = self.manager._filter_blocks_by_fields(
+                    data, fields
+                )
+
+            final_blocks = []
+
             if role != self.name:
-                source = f"{msg_type}: {role}"
-                wrapped_any = False
-                for blk in blocks:
-                    if blk["type"] == "text":
-                        # envolvemos el texto original dentro del JSON wrapper
-                        original = blk["content"]
+                source_id = f"{role}"
+                source_obj = {"source": source_id}
 
-                        wrapper_obj = {
-                            "source": source,
-                            "message": original
-                        }
+                if self.include_timestamp:
+                    try:
+                        dt = datetime.fromisoformat(timestamp)
+                        formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
+                    except (ValueError, TypeError):
+                        formatted_ts = timestamp
 
-                        wrapped_any = True
+                    source_obj["timestamp"] = formatted_ts
 
-                        if self.include_timestamp:
-                            try:
-                                dt = datetime.fromisoformat(timestamp)
-                                formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
-                            except (ValueError, TypeError):
-                                formatted_ts = timestamp
+                source_block = {
+                    "type": "text",
+                    "content": json.dumps(source_obj, ensure_ascii=False)
+                }
+                final_blocks.append(source_block)
 
-                            wrapper_obj["timestamp"] = formatted_ts
-
-                        # reemplazamos el campo "text" por la serialización
-                        blk["content"] = json.dumps(wrapper_obj, ensure_ascii=False)
-                
-                if not wrapped_any:
-                    wrapper_obj = {"source": source, "message": "<non-text payload>"}
-                    blocks.insert(
-                        0,
-                        {"type": "text", "content": json.dumps(wrapper_obj, ensure_ascii=False)}
-                    )
+                final_blocks.extend(blocks)
+            else:
+                final_blocks = blocks
 
             conversation.append({
                 "role": "assistant" if role == self.name else "user",
-                "content": blocks,
+                "content": final_blocks,
                 "msg_number": msg_number
             })
 
@@ -1518,10 +1508,12 @@ class Process(Component):
 
             output = self.function(*args)
                 
-            if not isinstance(output, dict):
-                raise ValueError("[Process] function must return a dict.")
+            if not isinstance(output, (dict, list)):
+                output = {"result": output}
+
             if verbose:
                 logger.debug(f"[Process:{self.name}] => {output}")
+
             return output
         except (TypeError, ValueError) as e:
             if verbose:
@@ -2614,7 +2606,7 @@ class AgentSystemManager:
     
 
     def set_current_user(self, user_id: str):
-        self._current_user_id = user_id
+        self._current_user_id = str(user_id)
         self._current_db_conn = self._ensure_user_db(user_id)
 
     def ensure_user(self, user_id: Optional[str] = None) -> None:
@@ -2729,24 +2721,52 @@ class AgentSystemManager:
             return value
 
         return self._store_file(value, user_id)
+    
+    
+
+    def _detect_extension(self, data: bytes, fallback=".bin") -> str:
+        """Devuelve '.jpg' | '.png' | '.gif'… si data es imagen, 
+        '.ogg' | '.mp3' si es audio (cabecera “ID3”…), etc.
+        Si no reconoce, usa fallback."""
+        
+        ext = imghdr.what(None, h=data)
+        if ext:
+            return f".{ext}"
+        # audio muy simple → ID3, OggS…
+        if data[:3] == b"ID3":
+            return ".mp3"
+        if data[:4] == b"OggS":
+            return ".ogg"
+        return fallback
 
     def _store_file(self, obj: Any, user_id: str) -> str:
+        user_id = str(user_id)
         files_dir = os.path.join(self.files_folder, user_id)
         os.makedirs(files_dir, exist_ok=True)
 
-        file_id = str(uuid.uuid4())
-        file_path = os.path.join(files_dir, f"{file_id}.pkl")
+        # ── 1. si es ruta a un archivo existente … ──────────────────────
+        if isinstance(obj, str) and os.path.isfile(obj):
+            ext = os.path.splitext(obj)[1] or ".bin"
+            new_path = os.path.join(files_dir, f"{uuid.uuid4()}{ext}")
+            shutil.copy2(obj, new_path)
+            self._file_cache[new_path] = obj          # opcional: apuntar a path original
+            return f"file:{new_path}"
 
-        try:
-            with open(file_path, "wb") as f:
-                pickle.dump(obj, f)
-        except OSError as e:
-            logger.error(f"Failed to store file at {file_path}: {e}")
-            raise
+        # ── 2. si es bytes / bytearray … ────────────────────────────────
+        if isinstance(obj, (bytes, bytearray)):
+            ext = self._detect_extension(obj)
+            new_path = os.path.join(files_dir, f"{uuid.uuid4()}{ext}")
+            with open(new_path, "wb") as f:
+                f.write(obj)
+            self._file_cache[new_path] = bytes(obj)
+            return f"file:{new_path}"
 
-        self._file_cache[file_path] = obj
-
-        return f"file:{file_path}"
+        # ── 3. cualquier otro objeto → pickle (comportamiento previo) ───
+        new_path = os.path.join(files_dir, f"{uuid.uuid4()}.pkl")
+        with open(new_path, "wb") as f:
+            pickle.dump(obj, f)
+        self._file_cache[new_path] = obj
+        return f"file:{new_path}"
 
     def _load_files_in_dict(self, value: Any) -> Any:
         if isinstance(value, str):
@@ -2770,13 +2790,14 @@ class AgentSystemManager:
     def _load_file(self, file_path: str) -> Any:
         if file_path in self._file_cache:
             return self._file_cache[file_path]
-        
-        try:
+
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".pkl":                       #  ← solo los .pkl se des-pickle-an
             with open(file_path, "rb") as f:
                 obj = pickle.load(f)
-        except OSError as e:
-            logger.error(f"Failed to load file at {file_path}: {e}")
-            raise
+        else:                                   #  imágenes / audio → bytes
+            with open(file_path, "rb") as f:
+                obj = f.read()
 
         self._file_cache[file_path] = obj
         return obj
@@ -3902,10 +3923,28 @@ class AgentSystemManager:
         • Obtiene el primer bloque text, lo intenta json.loads().
         • Si no hay bloque text → lanza ValueError (Tools no soportan imagen directa).
         """
-        import json
+
+        if isinstance(blocks, str):
+            try:
+                maybe = json.loads(blocks)
+                # sólo aceptamos si parece lista de bloques
+                if isinstance(maybe, list) and all(isinstance(b, dict) for b in maybe):
+                    blocks = maybe
+                else:
+                    # string plano → lo tratamos como un solo bloque de texto
+                    blocks = [{"type": "text", "content": blocks}]
+            except json.JSONDecodeError:
+                # string plano → idem
+                blocks = [{"type": "text", "content": blocks}]
+
+        # ── 2)  Validación mínima ──────────────────────────────────────────
+        if not isinstance(blocks, list):
+            raise ValueError("Tool input must be a list of blocks or JSON-encoded list")
+        
         raw = self._first_text_block(blocks)
         if raw is None:
             raise ValueError("Input must contain at least one text block")
+        
         if isinstance(raw, str):
             try:
                 obj = json.loads(raw)
@@ -4090,10 +4129,22 @@ class AgentSystemManager:
                     #await update.message.reply_text(value, parse_mode="MarkdownV2")
 
                 elif blk["type"] == "image":
-                    await update.message.reply_photo(blk["content"]["path"])
+                    path = blk["content"]["path"]
+                    if path.startswith("file:"):
+                        local_path = path[5:]
+                        with open(local_path, "rb") as fp:
+                            await update.message.reply_photo(fp)
+                    else:                       # ya es URL http://  o file_id
+                        await update.message.reply_photo(path)
 
                 elif blk["type"] == "audio":
-                    await update.message.reply_voice(blk["content"]["path"])
+                    path = blk["content"]["path"]
+                    if path.startswith("file:"):
+                        local_path = path[5:]
+                        with open(local_path, "rb") as fp:
+                            await update.message.reply_voice(fp)
+                    else:
+                        await update.message.reply_voice(path)
 
                 
 
