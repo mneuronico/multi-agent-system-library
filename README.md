@@ -165,26 +165,106 @@ Components are the fundamental building blocks of your multi-agent system:
 
 -   **`Agent`**: Agents utilize Large Language Models (LLMs) to generate responses. They are configured with system prompts, required output structures, and filters that specify which messages to use as context. Agents can use tools to accomplish a task. They receive a list of messages (full message history as default) as input and their output is always a dictionary with required fields. The library manages system prompts automatically so that the JSON responses from LLMs always conform with the required outputs.
 -   **`Tool`**: Tools perform specific actions (like API calls, database queries, etc.) and are typically used by agents. Tools receive predetermined input fields as a dictionary (typically from a specific agent that is using the tool) and produce an output dictionary, which can then be used by other agents, or it can be processed in some way.
--   **`Process`**: Processes perform data transformations, data loading, or any other kind of data manipulation. They can be used to insert any necessary code or processing that cannot be natively managed by the library. They receive a list of messages (although only the latest message is passed to them by default) and return an output dictionary which can then be used by other agents or tools.
+-   **`Process`**: Processes perform data transformations, data loading, or any other kind of data manipulation. They can be used to insert any necessary code or processing that cannot be natively managed by the library. They receive a list of messages and return an output dictionary which can then be used by other agents or tools.
 -   **`Automation`**: Automations are workflows that orchestrate the execution of other components (agents, tools and processes). They manage the sequence of steps and support branching and looping structures. Their input is directly passed to the first component in their structure and they return a dictionary with the output of the latest executed component.
 
-### Message History
+### Message History and the Block System
 
-All interactions between components are recorded in a database, providing context and a message history for agents, tools and processes. Each message includes:
+The heart of the `mas` library is its message history and block-based data system. This architecture serves as the central database for all components, ensuring that data, including complex multimodal content, is exchanged in a standardized, persistent, and universally understood format.
 
--   A unique identifier (ID).
--   A sequential message number (`msg_number`), stored chronologically and incremented with each new message.
--   The `type` of the component that was ran (agent, tool or process).
--   The `model` that was called, if `type` is 'agent' (in the format 'provider:model_alias').
--   A `role` that indicates the component that produced the message.
--   The `content` of the message, which is typically a dictionary as given by the corresponding component.
--   The `timestamp` indicating when the message was added to the conversation history, in the specified timezone (defaults to `UTC`).
+#### The Message History Database
 
-Each `user_id` has its own isolated message history.
+All interactions between components are recorded in a per-user SQLite database. This provides a complete, chronological record of the conversation or workflow. Each message in the history table includes:
+
+-   A unique identifier (`id`).
+-   A sequential message number (`msg_number`), which ensures chronological order.
+-   The `type` of the component that was run (e.g., `agent`, `tool`, `process`, `user`, `iterator`).
+-   The `model` that was called if `type` is `agent` (in the format `'provider:model_name'`).
+-   A `role` that indicates the name of the component that produced the message (e.g., `hello_agent`, `my_tool`).
+-   The `content` of the message, which is stored as a JSON string representing a **list of blocks**. This is the core of the data exchange system.
+-   The `timestamp` indicating when the message was added, in the specified timezone (defaults to `UTC`).
+
+Each `user_id` has its own isolated message history, allowing the manager to handle multiple concurrent and independent sessions.
+
+#### The Block System: A Universal Data Format
+
+To handle everything from simple text to images and complex data structures, `mas` normalizes all message content into a **list of blocks**. You rarely need to construct these blocks manually, as the library handles the conversion automatically. Understanding their structure is key to building advanced systems.
+
+##### Standard Block Types
+
+Here are the primary block types the system uses:
+
+-   **Text Block**: For plain text or JSON-serialized data.
+    ```json
+    {
+      "type": "text",
+      "content": "This can be a simple string or a JSON-encoded object."
+    }
+    ```
+
+-   **Image Block**: For visual content. The `content` is a dictionary specifying the image source.
+    ```json
+    {
+      "type": "image",
+      "content": {
+        "kind": "file" | "url" | "b64",
+
+        // Used when kind is "file". The path points to a file managed by the MAS library.
+        "path": "file:/path/to/mas/files/user_id/image_id.jpg",
+        
+        // Used when kind is "url".
+        "url": "https://example.com/some_image.png",
+
+        // Used when kind is "b64".
+        "b64": "iVBORw0KGgoAAAANSUhEUg...",
+
+        // (Optional) Image detail level for vision models, e.g., "low", "high", "auto".
+        "detail": "auto" 
+      }
+    }
+    ```
+
+-   **Audio Block**: For audio content, typically from speech-to-text or user uploads.
+    ```json
+    {
+      "type": "audio",
+      "content": {
+        "kind": "file",
+        "path": "file:/path/to/mas/files/user_id/audio_id.ogg"
+      }
+    }
+    ```
+
+#### Automatic Conversion to Blocks (`_to_blocks`)
+
+You don't need to worry about creating these structures yourself. When you call `manager.run(input=...)` or `manager.add_blocks(content=...)`, the library automatically converts your data into the appropriate block format based on these rules:
+
+1.  **If you provide a valid list of blocks**: It's used as-is.
+2.  **If you provide a mixed list** (e.g., `['Analyze this:', './img.png']`): Each element is processed individually and the resulting blocks are combined into a single list.
+3.  **A `str`**:
+    - If the string is a path to a valid local image file, it's read, saved internally, and converted into an `image` block.
+    - Otherwise, it's treated as plain text and becomes a `text` block.
+4.  **`bytes` or `bytearray`**: Assumed to be image or audio data. The bytes are saved to a file in the `files/` directory and wrapped in an `image` or `audio` block.
+5.  **A `dict`**: The object is serialized to a JSON string and placed inside a `text` block. If the object contains non-serializable data (like custom class instances), each such value is saved as a `.pkl` file and replaced with a `file:/...` reference.
+
+#### Consuming Data from Blocks
+
+Different components access data from the block system in different ways, tailored to their function:
+
+-   **Agents**: Agents receive the raw `List[Block]` for all relevant messages in their context. The library then automatically formats this list into the specific multimodal format required by the target LLM provider (e.g., OpenAI, Google Gemini, Anthropic Claude). This allows you to write provider-agnostic agent logic.
+
+-   **Tools**: Tools are designed to be simple Python functions that expect a dictionary of keyword arguments. Therefore, the manager extracts this dictionary for them by:
+    1.  Finding the **first `text` block** in the target message's content.
+    2.  Attempting to parse that block's content as a JSON dictionary.
+    3.  If successful, that dictionary is passed to the tool.
+    4.  If it's not a valid JSON dictionary, the raw string is passed in a `{"text_content": "..."}` wrapper.
+    *This means tools cannot directly process images or audio; they must be triggered by an agent that has analyzed the media and produced a structured `text` block as output.*
+
+-   **Processes**: Processes receive the most comprehensive input: a list of full message objects (`{"source": ..., "message": ..., ...}`). The `message` key within each object contains the complete `List[Block]` for that historical entry, giving the process full access to all past data in its original, structured form.
 
 ### Roles
 
-Each component is assigned a unique `role` when its output is stored in the database. Roles can simply be the name of the component, or they can also be `user` (messages directly from a user, when calling `run` with `input` string), `internal` (messages added by the developer, when calling `run` with `input` dict) or any other custom role defined by the developer when calling `manager.run()`.
+Each component is assigned a unique `role` when its output is stored in the database. Roles can simply be the name of the component, or they can also be `user` (messages directly from a user, when calling `run` with `input` string), or any other custom role defined by the developer when calling `manager.run()`.
 
 
 ### Default File Structure
@@ -223,6 +303,8 @@ import logging # only necessary if it is required to set a specific log level
 
 manager = AgentSystemManager(
     base_directory="path/to/your/base_dir",  # Default is the current working directory.
+    history_folder="path/to/your/history_folder", # defaults to <base_directory>/history
+    files_folder="path/to/your/files_folder", # defaults to <base_directory>/files
     api_keys_path="path/to/your/api_keys.env",  # Default is .env
     costs_path="path/to/your/costs.json", # default is costs.json in the base dir
     general_system_description="This is a description for the overall system.", # Default: "This is a multi agent system."
@@ -764,6 +846,8 @@ The special `case` value of `"default"` will catch any unmatched values.
 ]
 ```
 
+Note that for all conditionals and values in control flow statements, starting the string with a colon signals an input from a certain component, while not using a colon is assumed to refer to a specific key inside the first text block of the latest message. For example, in the case of the switch statement in this section's example system, `"value": ":selector?[action]"` is parsed correctly because the string starts with a colon and then refers to a component. The same effect could have been achieved by using the string `"action"`, since `selector` was the last component to be ran before the switch statement.
+
 
 ### Component Imports
 
@@ -1227,6 +1311,8 @@ def on_complete_function(messages, manager):
     # Print the content of the latest message
     if messages:
         latest_message = messages[-1]
+
+        # this prints the full list of blocks returned by the last component
         print("Assistant:", latest_message.get("message", "No message content."))
 ```
 
@@ -1386,80 +1472,106 @@ Telegram integration also supports image processing out of the box, with no extr
 
 The `mas` Telegram integration functionality handles speech-to-text transcription for audios and voice notes automatically. You can specify a provider (either `groq` or `openai`) as described above, or they will be used automatically if the API key is available (`groq` is tried first). You may also define your own `speech_to_text` function if you need to. This function must receive a single argument, a dictionary with keys for `manager`, the audio's `file_path`, and Telegram's `update` and `context`. The function must return the text as string.
 
-### Advanced Response Patterns
+#### Handling Responses in Telegram
 
-For more advanced use cases, `on_complete` and `on_update` can also return a dictionary to define various types of responses to be sent to the user. The system supports the following keys:
+When using `start_telegram_bot`, the `on_complete` and `on_update` callbacks handle how your system responds to the user.
 
--   **`text`**: A plain text message to be sent to the user.
--   **`markdown`**: A MarkdownV2-formatted message.
--   **`image`**: A URL or file representing an image to be sent.
--   **`audio`**: A URL or file representing an audio file to be sent.
--   **`voice_note`**: A URL or file representing a voice note to be sent.
--   **`document`**: A URL or file representing a document to be sent.
+- **Default Behavior**: If you do not provide an `on_complete` function, the system will automatically find the last message generated, look for a `"response"` field inside its content, and send that text to the user.
 
-The keys are processed in the order they appear in the dictionary, allowing the developer to define the sequence in which data is sent. For example:
+- **Custom Behavior**: You can define your own `on_complete` or `on_update` functions for full control. These functions should be defined to accept `(messages, manager, params)`. The function's return value determines what is sent to the user:
+    - **Return `None`**: Nothing is sent to the user.
+    - **Return a `str`**: The string is sent as a plain text message.
+    - **Return a `list` of blocks**: The system will iterate through the list and send each block as a separate message.
+        - A `text` block will be sent as a text message.
+        - An `image` block will be sent as a photo.
+        - An `audio` block will be sent as a voice message.
+    - **Return any other type**: The value will be converted to blocks using `manager._to_blocks()` and sent accordingly.
+
+This allows for simple text replies or complex, multi-part responses with images and audio.
+
+**Example `on_complete` function:**
 
 ```python
+# fns.py
 def my_on_complete(messages, manager, on_complete_params):
-    return {
-        "text": "Here's your data:",
-        "image": "https://example.com/image.jpg",
-        "document": "https://example.com/document.pdf"
-    }
+    # El wrapper devuelto por manager.get_messages() → último mensaje real
+    blocks = messages[-1]["message"]      # List[Block]
+
+    summary_text = None
+    image_path   = None
+
+    # 1. Buscar el primer bloque de texto y parsear su JSON
+    for block in blocks:
+        if block["type"] == "text":
+            try:
+                payload = json.loads(block["text"])
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            summary_text = payload.get("summary")
+            image_path   = payload.get("image_path")
+            break        # el dict siempre está en el primer text-block
+
+    # 2. Construir la respuesta en formato bloque
+    response_blocks = []
+    if summary_text:
+        response_blocks.append({
+            "type": "text",
+            "text": summary_text
+        })
+
+    if image_path:
+        response_blocks.append({
+            "type": "image",
+            "source": {"kind": "file", "path": image_path}
+        })
+
+    return response_blocks
 ```
 
-This will first send the text message, followed by the image, and then the document. This feature ensures flexibility while maintaining simplicity for the developer.
 
 ## Multimodal Message Support
 
-The library natively supports **multimodal** messages, allowing agents, tools and processes to exchange structured “blocks” of text and images without additional boilerplate. This section explains how to work with multimodal content.
+The library natively supports **multimodal** messages, allowing agents, tools, and processes to exchange structured “blocks” of text, images, and other data types without additional boilerplate. This section explains how to work with multimodal content.
 
 ### Block-based Message Format
 
-Agents represent each message as a list of blocks. Each block is a dictionary with a `type` field and additional metadata:
+The `mas` library normalizes all message content into a list of "blocks". Each block is a dictionary with a `type` and a `content` field.
 
-- **Text block**  
+- **Text block**:  
   ```json
-  { "type": "text", "text": "Hello, world!" }
+  { "type": "text", "content": "Hello, world!" }
   ```
-- **Image block**  
+- **Image block**:  
   ```json
   {
     "type": "image",
-    "source": {
-      "kind": "url" | "b64" | "file",
-      "url": "https://example.com/pic.jpg",     // for `kind: "url"`
-      "b64": "iVBORw0KGgoAAAANS...",             // for `kind: "b64"`
-      "path": "file:/.../images/1234.pkl",      // for `kind: "file"`
+    "content": {
+      "kind": "file" | "url" | "b64",
+      "path": "file:/path/to/files/user_id/1234.jpg",  // for `kind: "file"`
+      "url": "https://example.com/pic.jpg",             // for `kind: "url"`
+      "b64": "iVBORw0KGgoAAAANS...",                     // for `kind: "b64"`
       "detail": "auto"
     }
   }
   ```
-When your code calls `manager.run(input=blocks)`, `mas` will persist each block to the history table, and agents will receive the exact same list of blocks as their input context. If you call .run() with text directly, `mas` will create an appropriate text block behind the scenes.
-
-### Sending Images from User Code
-
-If you want to send an image from your script or from a Telegram bot, wrap it in a block list:
-
-```python
-blocks = [
-    { "type": "text", "text": "Here is the diagram:" },
-    {
-      "type": "image",
-      "source": { "kind": "file", "path": manager.save_file(open("diagram.png","rb").read()) }
+- **Audio block**:  
+  ```json
+  {
+    "type": "audio",
+    "content": {
+      "kind": "file",
+      "path": "file:/path/to/files/user_id/5678.ogg"
     }
-]
-output = manager.run(input=blocks)
-```
+  }
+  ```
 
-- `manager.save_file(...)` returns a `file:/...` URI that MAS uses to store and later load the bytes.
-- You can also send base64 or URL images by setting `kind: "b64"` or `"url"`.
+When you pass content to `manager.run()` or `manager.add_blocks()`, the library automatically converts it into this block format. Agents then receive this list of blocks as their input context.
 
 ### A Simpler Way to Add Multimodal Content: `add_blocks`
 
-While you can manually build the list of blocks to pass to `manager.run()`, the library includes the `add_blocks` method, which greatly simplifies this process. This method allows you to add text, images (from file paths or bytes), and dictionaries to the user's history, and it handles the conversion to the correct block format automatically.
+While you can manually build the list of blocks, the library includes the `add_blocks` method, which greatly simplifies this process. This method allows you to add text, images (from file paths or bytes), and dictionaries to the user's history, and it handles the conversion to the correct block format automatically.
 
-It is the recommended way to insert multimodal content into the history without running a component.
+It is the recommended way to programmatically insert content into the history.
 
 ## Input String Parsing
 
@@ -1529,7 +1641,7 @@ Ranges are well-defined for agents and processes, which receive lists of message
   ```
   Specifies multiple input components.
   - For agents: Receives message histories from both components, defaulting to full message histories from both in this case, combining all into one history which preserves conversation order.
-  - For processes: Builds a list of messages from each component just like agents, defaulting in this case to the latest message from each (unlike agents). Conversation history is preserved, and each message is wrapped into a dictionary which specifies "source" (the role) and "message" (the actual content) just like with agents.
+  - For processes: Builds a list of messages from each component just like agents, defaulting to full message histories, just like agents. Conversation history is preserved, and each message is wrapped into a dictionary which specifies "source" (the role) and "message" (the actual content) just like with agents.
   - For tools: Merges fetched messages from all components into a single dictionary. Developers must be careful not to merge input messages with fields named the same way, as they can overwrite each other. This is solved by carefully naming fields that will be used by the same tool at the same time.
 
 
@@ -1630,7 +1742,7 @@ The `mas` library is designed to be flexible and versatile, and you can use it t
 -  **`deepseek: deepseek-reasoner`**: State-of-the-art reasoning, cheaper than commonly used models, such as gpt-4o. Thinking time can take seconds or even minutes, but results are usually robust for high-complexity tasks.
 -  **`google: gemini-2.0-flash-exp`**: Free to use as of January 2025, good for its 1M token context window and its speed, quite good at reasoning as well.
 -  **`openai: gpt-4o`**: Usually taken as the default model for its reasonably good speed, intelligence and robustness. However, it's quite expensive compared to models such as deepseek's `deepseek-chat` or `deepseek-reasoner`.
--  **`openai: o1`**: State-of-the-art reasoning, but the most expensive model by far in this list, and not necessarily better than `deepseek-reasoner` in most cases.
+-  **`openai: o3`**: State-of-the-art reasoning, but the most expensive model by far in this list, and not necessarily better than `deepseek-reasoner` in most cases.
 
 ### Design Patterns
 

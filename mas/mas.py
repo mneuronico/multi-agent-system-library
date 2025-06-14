@@ -1605,7 +1605,7 @@ class Process(Component):
             return []
 
         if index is None:
-            return [subset[-1]]
+            return subset[:]
 
         if index == "~":
             # all
@@ -2637,6 +2637,8 @@ class AgentSystemManager:
     def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict, list], type = "user", model: Optional[str] = None):
         timestamp = datetime.now(self.timezone).isoformat()
 
+        content = self._to_blocks(content, user_id=self._current_user_id)
+
         if isinstance(content, (dict, list)):
             content_str = json.dumps(
                 self._persist_non_json_values(content, self._current_user_id),
@@ -2685,9 +2687,6 @@ class AgentSystemManager:
         if output_value is None:
             return  # nada que guardar
 
-        # ---- normalización a bloques ──────────────────────────
-        blocks = self._to_blocks(output_value, self._current_user_id)
-
         save_role      = component.name
         component_type = (
             "agent"      if isinstance(component, Agent)      else
@@ -2700,7 +2699,7 @@ class AgentSystemManager:
         self._save_message(
             db_conn,
             save_role,
-            blocks,
+            output_value,
             component_type,
             model_str
         )
@@ -2817,23 +2816,17 @@ class AgentSystemManager:
         *,
         role: str = "user",
         msg_type: str = "user",
-        user_id: Union[str, None] = None,
-        detail: str = "auto",
-        verbose: bool = False,
+        user_id: Union[str, None] = None
     ) -> int:
         """
         Normaliza *content* a List[Block] con _to_blocks() y lo guarda.
         Devuelve el msg_number asignado.
         """
-        blocks = self._to_blocks(content, user_id=user_id, detail=detail)
-
-        if verbose:
-            logger.debug(f"[MAS.add_blocks] role={role} type={msg_type} blocks={blocks}")
 
         self.ensure_user(user_id)
         conn = self._get_user_db()
         msg_number = self._get_next_msg_number(conn)
-        self._save_message(conn, role, blocks, msg_type)
+        self._save_message(conn, role, content, msg_type)
         return msg_number
     
     def _filter_blocks_by_fields(self, blocks, fields):
