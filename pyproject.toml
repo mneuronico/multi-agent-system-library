@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mas"
-version = "0.1.21"
+version = "0.2.1"
 description = "A powerful and flexible framework for creating and managing multi-agent systems."
 readme = "README.md"
 license = { text = "MIT" }
