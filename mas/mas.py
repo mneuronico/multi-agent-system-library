@@ -270,7 +270,14 @@ class Agent(Component):
         out = []
 
         # ---- helpers internos --------------------------------
+        def _clean_path(path_str):
+            # QUITA el prefijo "file:" si existe
+            if isinstance(path_str, str) and path_str.startswith("file:"):
+                return path_str[5:]
+            return path_str
+        
         def _image_to_datauri(path):
+            path = _clean_path(path)
             mime = mimetypes.guess_type(path)[0] or "image/jpeg"
             with open(path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode()
@@ -316,7 +323,8 @@ class Agent(Component):
                     elif blk["type"] == "image":
                         src = blk["content"]
                         if src["kind"] == "file":
-                            data = open(src["path"],"rb").read()
+                            
+                            data = open(_clean_path(src["path"]),"rb").read()
                         elif src["kind"] == "url":
                             data = requests.get(src["url"]).content
                         else:
@@ -341,7 +349,7 @@ class Agent(Component):
                     elif blk["type"] == "image":
                         src = blk["content"]
                         if src["kind"] == "file":
-                            data = open(src["path"],"rb").read()
+                            data = open(_clean_path(src["path"]),"rb").read()
                             mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
                             b64  = base64.b64encode(data).decode()
                             c_blocks.append({"type":"image",
@@ -4073,7 +4081,7 @@ class AgentSystemManager:
 
             blocks.append({                                  # bloque de audio (siempre)
                 "type": "audio",
-                "source": {"kind": "file", "path": file_ref, "detail": "auto"}
+                "content": {"kind": "file", "path": file_ref, "detail": "auto"}
             })
 
             await handle_system_text(update, blocks, file_ref)
@@ -4097,7 +4105,7 @@ class AgentSystemManager:
 
             blocks.append({
                 "type": "image",
-                "source": {"kind": "file", "path": img_ref, "detail": "auto"}
+                "content": {"kind": "file", "path": img_ref, "detail": "auto"}
             })
 
             await handle_system_text(update, blocks)
@@ -4267,6 +4275,9 @@ class AgentSystemManager:
                 "groq": "whisper-large-v3-turbo",
                 "openai": "whisper-1"
             }.get(provider)
+
+        if isinstance(file_path, str) and file_path.startswith("file:"):
+            file_path = file_path[5:]
 
         # Read audio file
         try:
