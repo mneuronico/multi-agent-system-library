@@ -10,6 +10,7 @@ The `mas` library is a powerful and flexible framework designed for creating and
 - **API Orchestrators**: Seamlessly integrate multiple APIs through tools managed by intelligent agents.
 - **Data Processing Pipelines**: Build processes to transform, analyze, and deliver data efficiently.
 - **Decision-Making Systems**: Implement branching logic and dynamic workflows to enable adaptive decision-making.
+- **Zero-Config Bootstrap**: Give `mas` nothing but a plain-English description of what you want and it will auto-generate a system for you.
 
 ### Why Choose the `mas` Library?
 
@@ -133,7 +134,7 @@ Use the JSON configuration to initialize and run the system:
 from mas import AgentSystemManager
 
 # Load the system from the JSON configuration
-manager = AgentSystemManager(config_json="config.json")
+manager = AgentSystemManager(config="config.json")
 
 # Run the system with user input
 output = manager.run(input="Hello world!")
@@ -150,6 +151,54 @@ You can check the interaction history for the current user:
 manager.show_history()
 ```
 ---
+
+## Fast Track: Build a System from Plain Text
+
+If you just have an idea and don’t feel like writing JSON yet, pass the idea straight into the `config` parameter.  
+
+The manager will:
+
+1.  Read this very README to learn about the MAS framework.  
+2.  Spin up an *internal* agent called **`system_writer`** (running on the best
+    available model chain – `o3`, `gemini-2.5-pro`, `claude-4`, `deepseek-r1`,
+    `llama-4@groq`).
+3.  Ask that agent to turn your description into:
+    * `general_parameters`
+    * a full **components** list
+    * any helper python functions (`fns.py`)
+4.  Persist everything under your `base_directory`.
+5.  Delete the temporary bootstrap file and continue as if you had written the
+    JSON yourself.
+
+```python
+from mas import AgentSystemManager
+
+description = (
+    "I want a system that finds a YouTube video by keyword, "
+    "downloads its transcript, then summarizes it for the user."
+)
+
+mgr = AgentSystemManager(
+    config=description,            # <--     just the text!
+)
+
+# now run it exactly as if you had hand-crafted config.json
+result = mgr.run(input="Latest Veritasium video?")
+print(result)
+```
+
+After the first run you’ll find:
+
+```
+yt_summarizer/
+├── config.json   # generated
+├── fns.py        # generated helper functions
+├── history/…     # per-user DB appears automatically
+└── files/…
+```
+
+You can open & tweak those files at will – and then you can create the manager from `config.json` like any other explicit configuration.
+
 
 # Multi-Agent System (mas) Library Documentation
 
@@ -302,6 +351,7 @@ from mas import AgentSystemManager
 import logging # only necessary if it is required to set a specific log level
 
 manager = AgentSystemManager(
+    config="config.json" # Defaults to config.json in your base directory
     base_directory="path/to/your/base_dir",  # Default is the current working directory.
     history_folder="path/to/your/history_folder", # defaults to <base_directory>/history
     files_folder="path/to/your/files_folder", # defaults to <base_directory>/files
@@ -324,6 +374,7 @@ manager = AgentSystemManager(
 
 The `AgentSystemManager` manages your system’s components, user histories, and general settings.
 
+-   **`config`**: Path to a JSON file or a plain-English description (triggers automatic bootstrap of system).
 -   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
 -   **`history_folder`**: Path for storing per-user SQLite databases. Defaults to `<base_directory>/history`.
 -   **`files_folder`**: Path for storing serialized object files. Defaults to `<base_directory>/files`.
@@ -1240,7 +1291,7 @@ Below is a minimal example which runs an automation from a multi agent system de
 
 ```python
 from mas import AgentSystemManager
-manager = AgentSystemManager(config_json="<config_file_name>.json")
+manager = AgentSystemManager(config="<config_file_name>.json")
 output = manager.run(input="Hey, how are you today?")
 manager.show_history()
 ```
@@ -1248,10 +1299,10 @@ manager.show_history()
 For maximum brevity, the whole system can be ran in only one line:
 
 ```python
-AgentSystemManager(config_json="<config_file_name>.json").run("Hey, how are you today?")
+AgentSystemManager(config="<config_file_name>.json").run("Hey, how are you today?")
 ```
 
-This builds the system from a JSON configuration file specified using the `config_json` parameter, creates all components if the configuration is valid and runs an automation (either a specified one or a default linear automation) with the provided user input (or starting with no input if none is provided).
+This builds the system from a JSON configuration file specified using the `config` parameter, creates all components if the configuration is valid and runs an automation (either a specified one or a default linear automation) with the provided user input (or starting with no input if none is provided).
 
 ### Defining Functions
 Functions for `Tool` and `Process` components must be defined in any of the Python files included in the `functions` parameter (or the default `fns.py`). They can also be referenced directly from any other `.py` file as explained earlier. When using the library only programatically and not using function syntax (i.e. `"fn:"`) it is possible to define functions elsewhere and use them as callables directly.
@@ -1262,7 +1313,7 @@ The `run` method can be used in a loop to implement a simple interactive chat sy
 
 ```python
 # Initialize the manager
-manager = AgentSystemManager(config_json="config.json") 
+manager = AgentSystemManager(config="config.json") 
 
 # Chat Loop
 while True:
@@ -1461,7 +1512,7 @@ manager.start_telegram_bot(
 After defining the system through JSON and writing the necessary functions, it's possible to run a full Telegram bot with just one line of code:
 
 ```python
-AgentSystemManager(config_json="config.json").start_telegram_bot()
+AgentSystemManager(config="config.json").start_telegram_bot()
 ```
 
 Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can return a string (which will be sent to the correct user by the system), `None` to send nothing, or a dict for more advanced response patterns, as described below.

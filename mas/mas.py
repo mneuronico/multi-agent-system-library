@@ -21,6 +21,7 @@ from datetime import datetime
 import imghdr, mimetypes, shutil
 from importlib import resources
 import logging
+import base64
 
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -34,6 +35,26 @@ logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(handler)
+
+def get_readme(owner: str, repo: str, branch: str = None,
+               token: str = None) -> str:
+    """
+    Download the README of a GitHub repo and return it as UTF-8 text.
+    Uses the GitHub REST API v3 so it always picks the canonical README,
+    regardless of file name or branch.
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/readme"
+    if branch:
+        url += f"?ref={branch}"
+
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return base64.b64decode(data["content"]).decode("utf-8")
 
 class Component:
     def __init__(self, name: str):
@@ -2192,7 +2213,7 @@ class AgentSystemManager:
 
     def __init__(
         self,
-        config_json: str = None,
+        config: str = None,
         imports: List[str] = None,
         base_directory: str = os.getcwd(),
         api_keys_path: Optional[str] = None,
@@ -2207,7 +2228,19 @@ class AgentSystemManager:
         include_timestamp: bool = False,
         timezone: str = "UTC",
         log_level=None
-    ):
+    ):  
+        
+        description_mode = (
+            isinstance(config, str)
+            and not config.lower().endswith(".json")
+            and not os.path.exists(config)
+        )
+
+        if description_mode:
+            config = self._bootstrap_from_description(
+                description    = config,
+                base_directory = base_directory
+            )
         
         if log_level is not None:
             logger.setLevel(log_level)
@@ -2252,9 +2285,9 @@ class AgentSystemManager:
         else:
             self.functions = self.functions
         
-        if config_json and config_json.endswith(".json"):
+        if config and config.endswith(".json"):
             try:
-                self.build_from_json(config_json)
+                self.build_from_json(config)
             except (FileNotFoundError, json.JSONDecodeError) as e:
                 logger.exception(f"System build failed: {e}")
                 raise
@@ -2307,6 +2340,123 @@ class AgentSystemManager:
             if getattr(self, "files_folder", None) is None:
                 self.files_folder = os.path.join(self.base_directory, "files")
         os.makedirs(self.files_folder, exist_ok=True)
+
+
+    def _bootstrap_from_description(self, *, description: str,
+                                    base_directory: str) -> str:
+        """
+        1. Fetch README.
+        2. Build a *temporary* system with ONE agent (system_writer).
+        3. Feed the agent a single input containing:
+             – the MAS README
+             – the user's description
+           and instruct it to output:
+             • general_parameters
+             • components
+             • fns  (list of python functions as raw strings)
+        4. Persist those outputs into <base_directory>/config.json
+           and <base_directory>/fns.py.
+        5. Return the path to the new config so __init__ can proceed.
+        """
+        import json, textwrap, os, uuid
+
+        # ---------- 1. README + combined input ------------------------
+        readme_text = get_readme("mneuronico", "multi-agent-system-library")
+
+        combined_input = textwrap.dedent(f"""\
+            ## MAS Library README
+            {readme_text}
+
+            ## USER REQUIREMENT
+            {description}
+
+            """)
+
+        # 2 minimal config with ONE agent
+        default_models = [
+            {"provider": "google",     "model": "gemini-2.5-pro-preview-06-05"},
+            {"provider": "openai",     "model": "o3"},
+            {"provider": "deepseek",   "model": "deepseek-reasoner"},
+            {"provider": "anthropic",  "model": "claude-sonnet-4-20250514"},
+            {"provider": "groq",       "model": "meta-llama/llama-4-maverick-17b-128e-instruct"}
+        ]
+
+        bootstrap_cfg = {
+            "general_parameters": {
+                "base_directory": base_directory,
+                "default_models": default_models
+            },
+            "components": [
+                {
+                    "type": "agent",
+                    "name": "system_writer",
+                    "system": (
+                        "You are `system_writer`, an expert MAS engineer.\n"
+                        "Your job is to read the single user message you will receive "
+                        "(it contains the MAS README followed by the user's requirement) "
+                        "and OUTPUT **ONE** JSON object with exactly these keys:\n"
+                        "  general_parameters → dict that will go verbatim into config.json\n"
+                        "  components         → list of MAS components\n"
+                        "  fns                → list[str]  each string is full Python "
+                        "source code for a helper function (include imports INSIDE the "
+                        "function!).\n"
+                        "Return NOTHING ELSE, no markdown, no explanations."
+                    ),
+                    "required_outputs": {
+                        "general_parameters": "Block for config.json",
+                        "components": "Component list",
+                        "fns": "Python functions"
+                    }
+                }
+            ]
+        }
+        bootstrap_cfg_path = os.path.join(base_directory,
+                                          "_bootstrap_config.json")
+        with open(bootstrap_cfg_path, "w", encoding="utf-8") as fp:
+            json.dump(bootstrap_cfg, fp, indent=2)
+
+        # ---------- 3. run bootstrap ----------------------------------
+        sub_mgr = AgentSystemManager(config=bootstrap_cfg_path,
+                                     base_directory=base_directory)
+
+        blocks = sub_mgr.run(
+            component_name="system_writer",
+            input=combined_input
+        )
+
+        # ----------- extract the JSON object from the first text block ---
+        agent_payload = None
+        for blk in blocks:
+            if blk.get("type") == "text":
+                raw = blk.get("content")
+                try:
+                    agent_payload = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    pass
+                break
+
+        if not isinstance(agent_payload, dict):
+            raise RuntimeError("system_writer did not return the expected JSON object")
+        
+        gp       = agent_payload["general_parameters"]
+        comps    = agent_payload["components"]
+        fns_list = agent_payload["fns"]
+
+        # ---------- 4. persist final system ---------------------------
+        final_cfg_path = os.path.join(base_directory, "config.json")
+        with open(final_cfg_path, "w", encoding="utf-8") as fp:
+            json.dump({"general_parameters": gp, "components": comps}, fp, indent=2)
+
+        final_fns_path = os.path.join(base_directory, "fns.py")
+        with open(final_fns_path, "w", encoding="utf-8") as fp:
+            fp.write("\n\n".join(fns_list))
+
+        try:
+            os.remove(bootstrap_cfg_path)
+        except FileNotFoundError:
+            pass
+
+        return final_cfg_path
 
     def _resolve_api_keys_path(self, api_keys_path):
         if api_keys_path is None:
@@ -2379,7 +2529,7 @@ class AgentSystemManager:
             raise FileNotFoundError(f"Could not locate JSON file for '{file_part}' "
                                     f"locally or in GitHub 'lib' folder.")
 
-        temp_manager = AgentSystemManager(config_json=resolved_json_path)
+        temp_manager = AgentSystemManager(config=resolved_json_path)
         self._merge_imported_components(temp_manager, components)
 
     def _load_local_json_if_exists(self, filename_no_ext: str) -> str:
@@ -3411,9 +3561,17 @@ class AgentSystemManager:
                     on_complete(self.get_messages(user_id), self)
 
         if blocking:
-            result = self._run_internal(
+            self._run_internal(
                 component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
             )
+
+            db_conn = self._get_user_db()
+            cur = db_conn.cursor()
+            cur.execute("SELECT content FROM message_history ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            
+            last_content_str = row[0]
+            final_blocks = json.loads(last_content_str)
 
             if return_token_count and prev_usage is not None:
                 _uid = user_id or self._current_user_id
@@ -3443,15 +3601,16 @@ class AgentSystemManager:
                     )
 
                 # Y lo devolvemos embebido en el dict resultado
-                if isinstance(result, dict):
-                    result.setdefault("metadata", {})["usage_summary"] = usage_summary
+                if final_blocks and isinstance(final_blocks, list):
+                    final_blocks[0].setdefault("metadata", {})
+                    final_blocks[0]["metadata"]["usage_summary"] = usage_summary
 
             if on_complete:
                 if on_complete_params:
                     on_complete(self.get_messages(user_id), self, on_complete_params)
                 else:
                     on_complete(self.get_messages(user_id), self)
-            return result
+            return final_blocks
         else:
             thread = threading.Thread(target=task)
             thread.daemon = True  # Ensures thread exits when the main program exits
