@@ -2374,8 +2374,8 @@ class AgentSystemManager:
 
         # 2 minimal config with ONE agent
         default_models = [
-            {"provider": "google",     "model": "gemini-2.5-pro-preview-06-05"},
             {"provider": "openai",     "model": "o3"},
+            {"provider": "google",     "model": "gemini-2.5-pro-preview-06-05"},
             {"provider": "deepseek",   "model": "deepseek-reasoner"},
             {"provider": "anthropic",  "model": "claude-sonnet-4-20250514"},
             {"provider": "groq",       "model": "meta-llama/llama-4-maverick-17b-128e-instruct"}
