@@ -2216,6 +2216,8 @@ class AgentSystemManager:
         config: str = None,
         imports: List[str] = None,
         base_directory: str = os.getcwd(),
+        verbose: bool = False,
+        bootstrap_models: Optional[List[Dict[str, str]]] = None,
         api_keys_path: Optional[str] = None,
         costs_path: str = None,
         history_folder: Optional[str] = None,
@@ -2241,7 +2243,9 @@ class AgentSystemManager:
         if description_mode:
             config = self._bootstrap_from_description(
                 description    = config,
-                base_directory = base_directory
+                base_directory = base_directory,
+                default_models = bootstrap_models,
+                verbose = verbose
             )
         
         if log_level is not None:
@@ -2344,7 +2348,9 @@ class AgentSystemManager:
 
 
     def _bootstrap_from_description(self, *, description: str,
-                                    base_directory: str) -> str:
+                                    base_directory: str,
+                                    default_models: List[Dict[str, str]],
+                                    verbose: bool = False) -> str:
         """
         1. Fetch README.
         2. Build a *temporary* system with ONE agent (system_writer).
@@ -2372,15 +2378,17 @@ class AgentSystemManager:
             {description}
 
             """)
-
-        # 2 minimal config with ONE agent
-        default_models = [
-            {"provider": "openai",     "model": "o3"},
-            {"provider": "google",     "model": "gemini-2.5-pro-preview-06-05"},
-            {"provider": "deepseek",   "model": "deepseek-reasoner"},
-            {"provider": "anthropic",  "model": "claude-sonnet-4-20250514"},
-            {"provider": "groq",       "model": "meta-llama/llama-4-maverick-17b-128e-instruct"}
-        ]
+        
+        if default_models is None:
+            default_models = [
+                {"provider": "openai",     "model": "o3"},
+                {"provider": "google",     "model": "gemini-2.5-pro-preview-06-05"},
+                {"provider": "deepseek",   "model": "deepseek-reasoner"},
+                {"provider": "anthropic",  "model": "claude-sonnet-4-20250514"},
+                {"provider": "groq",       "model": "meta-llama/llama-4-maverick-17b-128e-instruct"}
+            ]
+        elif isinstance(default_models, dict):
+            default_models = [default_models]
 
         bootstrap_cfg = {
             "general_parameters": {
@@ -2422,7 +2430,8 @@ class AgentSystemManager:
 
         blocks = sub_mgr.run(
             input=combined_input,
-            component_name="system_writer"
+            component_name="system_writer",
+            verbose = verbose
         )
 
         # ----------- extract the JSON object from the first text block ---
