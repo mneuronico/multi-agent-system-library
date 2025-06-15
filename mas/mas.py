@@ -2230,6 +2230,8 @@ class AgentSystemManager:
         log_level=None
     ):  
         
+        self.base_directory = os.path.abspath(base_directory)
+        
         description_mode = (
             isinstance(config, str)
             and not config.lower().endswith(".json")
@@ -2292,7 +2294,6 @@ class AgentSystemManager:
                 logger.exception(f"System build failed: {e}")
                 raise
         else:
-            self.base_directory = base_directory
             self.general_system_description = general_system_description
             self.on_update = self._resolve_callable(on_update)
             self.on_complete = self._resolve_callable(on_complete)
@@ -3637,7 +3638,7 @@ class AgentSystemManager:
 
         general_params = system_definition.get("general_parameters", {})
 
-        self.base_directory = general_params.get("base_directory", os.getcwd())
+        self.base_directory = general_params.get("base_directory", self.base_directory)
         self.general_system_description = general_params.get("general_system_description", "This is a multi-agent system.")
         self.functions = general_params.get("functions", "fns.py")
         self.default_models = general_params.get("default_models", self.default_models)
