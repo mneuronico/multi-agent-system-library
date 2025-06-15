@@ -2461,6 +2461,20 @@ class AgentSystemManager:
         with open(final_fns_path, "w", encoding="utf-8") as fp:
             fp.write("\n\n".join(fns_list))
 
+        # ---------- 4-bis. clean bootstrap artefacts ------------------
+        # Close the sub-manager’s DB so Windows lets us delete the folder
+        try:
+            if getattr(sub_mgr, "_current_db_conn", None):
+                sub_mgr._current_db_conn.close()
+        except Exception:
+            pass
+
+        # Remove history/ and files/ produced by the bootstrap run
+        for folder in ("history", "files"):
+            path = os.path.join(base_directory, folder)
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)        
+
         try:
             os.remove(bootstrap_cfg_path)
         except FileNotFoundError:
