@@ -187,6 +187,15 @@ result = mgr.run(input="Latest Veritasium video?")
 print(result)
 ```
 
+Or in the most succint way possible:
+
+```python
+from mas import AgentSystemManager as ASM
+
+ASM("I want a system that gets a youtube video from a link sent by user, gets the transcript from that video, and summarizes it. Use google's gemini-2.0-flash model.").run("www.youtube.com/watch?v=some-video")
+```
+
+
 After the first run you’ll find:
 
 ```
@@ -1026,8 +1035,8 @@ Note that these examples are incomplete. You would need to define the inputs and
 
 ```python
 output = manager.run(
-    component_name="myagent",  # Optional - component to run
     input="Some user input",    # Optional input to add to the message history
+    component_name="myagent",  # Optional - component to run
     user_id="user123",        # Optional - which database to use
     role="my_custom_role",      # Optional - role to save the input, overrides defaults
     verbose=True,              # Optional: show debug info
@@ -1053,9 +1062,8 @@ output = manager.run(
 )
 print(output)
 ```
-
--   **`component_name`**: The name of the component to run. If not specified it uses the latest created automation, or creates a linear automation if one does not exist using all components available in their order of creation.
 -   **`input`**: Optional string or dict to store in the message history. If it's a string, it will be stored with the role `"user"`. If it's a dictionary, it will be stored with the role `"internal"`, assumed to be information added by the developer.
+-   **`component_name`**: The name of the component to run. If not specified it uses the latest created automation, or creates a linear automation if one does not exist using all components available in their order of creation.
 -   **`user_id`**: The ID of the user whose database should be used. If not specified, the current user is used, or created if not set.
 -   **`role`**: Role to use when saving the input, defaults to `"user"` if the input is a string, or `"internal"` if input is a dictionary, but can be overriden by developer.
 -   **`verbose`**: Boolean to enable verbose mode.

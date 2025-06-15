@@ -2421,8 +2421,8 @@ class AgentSystemManager:
                                      base_directory=base_directory)
 
         blocks = sub_mgr.run(
-            component_name="system_writer",
-            input=combined_input
+            input=combined_input,
+            component_name="system_writer"
         )
 
         # ----------- extract the JSON object from the first text block ---
@@ -3514,8 +3514,8 @@ class AgentSystemManager:
 
     def run(
         self,
-        component_name: Optional[str] = None,
         input: Optional[Any] = None,
+        component_name: Optional[str] = None,
         user_id: Optional[str] = None,
         role: Optional[str] = None,
         verbose: bool = False,
@@ -4375,8 +4375,8 @@ class AgentSystemManager:
 
             def run_manager_thread():
                 self.run(
+                    input=input,
                     component_name = component_name,
-                    input=input, 
                     user_id=chat_id,
                     role= "user",
                     verbose=verbose,
