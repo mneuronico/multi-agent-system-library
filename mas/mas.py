@@ -3202,11 +3202,9 @@ class AgentSystemManager:
 
         prompt += (
             "In this system, messages are exchanged between different components (users, agents, tools, etc.).\n"
-            "To help you understand the origin of each message, they are wrapped in a JSON structure with two fields:\n"
-            "- 'source': This indicates the originator of the message (e.g., 'user', 'my_agent', 'my_tool').\n"
-            "- 'message': This contains the actual content of the message.\n"
+            "To help you understand the origin of each message, they include a 'source', which indicates the originator of the message (e.g., 'user', 'my_agent', 'my_tool').\n"
             "When you receive a message, remember that the 'source' tells you who sent it.\n"
-            "You do not need to include the 'source' and 'message' wrapper in your output, since they will be added by the system. Focus solely on producing the JSON structure with the required fields defined above.\n\n"
+            "You do not need to include the 'source' in your output, since they will be added by the system. Focus solely on producing the JSON structure with the required fields defined above.\n\n"
         )
 
         return prompt
