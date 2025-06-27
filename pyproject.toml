@@ -25,6 +25,7 @@ classifiers = [
 
 dependencies = [
     "python-telegram-bot",
+    "Flask>=3,<4",
     "requests",
     "python-dotenv",
     'backports.zoneinfo; python_version < "3.9"',

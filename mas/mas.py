@@ -22,6 +22,7 @@ import imghdr, mimetypes, shutil
 from importlib import resources
 import logging
 import base64
+from flask import Flask, request, jsonify
 
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -229,7 +230,14 @@ class Agent(Component):
                 else:
                     response_str = response
 
+
+                print("RESPONSE STRING")
+                print(response_str)
+
                 response_dict = self._extract_and_parse_json(response_str)
+
+                print("RESPONSE DICT")
+                print(response_dict)
 
                 if response_dict is None:
                     response_dict = {"response": response_str}
@@ -474,6 +482,15 @@ class Agent(Component):
             chosen = subset[:] # Fallback to all if index is not recognized
 
         return chosen
+    
+    def _strip_metadata(self, blocks: list) -> list:
+        cleaned = []
+        for blk in blocks:
+            if isinstance(blk, dict):
+                blk = blk.copy()
+                blk.pop("metadata", None)
+            cleaned.append(blk)
+        return cleaned
 
     def _transform_to_conversation(self, msg_tuples: List[tuple], fields: Optional[list] = None, include_message_number: Optional[bool] = False) -> List[Dict[str, str]]:
         conversation = []
@@ -485,8 +502,10 @@ class Agent(Component):
             else:
                 blocks = self._as_blocks(data)
 
+            blocks = self._strip_metadata(blocks)
+
             if fields:
-                data = self.manager._filter_blocks_by_fields(
+                blocks = self.manager._filter_blocks_by_fields(
                     data, fields
                 )
 
@@ -570,19 +589,23 @@ class Agent(Component):
             return conversation
     
     def _handle_fields(self, msg_tuples, fields):
-        conversation = []
-
+        processed_tuples = []
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
-            data = content
+            # First, parse the JSON string from the DB into a list of blocks.
+            try:
+                blocks = json.loads(content) if isinstance(content, str) else content
+            except (json.JSONDecodeError, TypeError):
+                # If it's not valid JSON, treat it as a single text block
+                blocks = [{"type": "text", "content": str(content)}]
 
+            # Now, if fields are specified, filter the parsed blocks.
             if fields:
-                data = self.manager._filter_blocks_by_fields(
-                    self._as_blocks(data), fields
-                )
-
-            conversation.append((role, data, msg_number, msg_type, timestamp))
-
-        return conversation
+                blocks = self.manager._filter_blocks_by_fields(blocks, fields)
+            
+            # Append the processed tuple. The `blocks` variable is now a Python object.
+            processed_tuples.append((role, blocks, msg_number, msg_type, timestamp))
+            
+        return processed_tuples
 
 
     def _build_conversation_from_target(
@@ -675,24 +698,60 @@ class Agent(Component):
         }
     
     def _extract_and_parse_json(self, text):
-        """
-        Extracts and parses the first valid JSON object or array from a string.
 
-        :param text: The input text containing JSON and possibly extra markup.
-        :return: Parsed JSON as a Python object, or None if no valid JSON is found.
-        """
-        text = text.strip()  # Remove leading/trailing whitespace
-        for start in range(len(text)):
-            if text[start] in ('{', '['):  # JSON must start with { or [
-                for end in range(len(text), start, -1):
+        if isinstance(text, (dict, list)):
+            return text
+
+        text = text.strip()
+        # 1) Quitar fences ```json ... ```
+        text = re.sub(r"^```json\s*|```$", "", text, flags=re.I).strip()
+        # 2) Quitar comillas exteriores
+        if (text.startswith('"') and text.endswith('"')) or \
+        (text.startswith("'") and text.endswith("'")):
+            text = text[1:-1].strip()
+
+        # 3) Localizar primer {; si no hay, primer [
+        brace   = text.find('{')
+        bracket = text.find('[')
+        if brace == bracket == -1:
+            return None
+        if brace != -1 and (brace < bracket or bracket == -1):
+            opener, closer, start = '{', '}', brace
+        else:
+            opener, closer, start = '[', ']', bracket
+
+        # 4) Recorrer con stack para aislar bloque
+        depth = 0
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    chunk = text[start:i+1]
                     try:
-                        # Attempt to parse substring as JSON
-                        potential_json = text[start:end]
-                        return json.loads(potential_json)
+                        return json.loads(chunk)
                     except json.JSONDecodeError:
-                        continue  # Keep shrinking the window
-        return None  # No valid JSON found
-    
+                        # intento de saneamiento de saltos de línea
+                        chunk2 = re.sub(r'(?<!\\)\n', r'\\n', chunk)
+                        try:
+                            return json.loads(chunk2)
+                        except json.JSONDecodeError:
+                            return None
+
+        # 5) Si nunca cerró (depth > 0), auto-cerrar y reintentar
+        if depth > 0:
+            candidate = text[start:] + closer * depth
+            # saneamos saltos de línea no escapados
+            candidate = re.sub(r'(?<!\\)\n', r'\\n', candidate)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                return None
+
+        return None
+            
     def _flatten_system_content(self, blocks):
         # puede venir string o lista de bloques
         if isinstance(blocks, str):
@@ -961,9 +1020,8 @@ class Agent(Component):
             raise
 
 
-
-
         response_json = response.json()
+
         
         content = response_json["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -4429,6 +4487,266 @@ class AgentSystemManager:
             logger.info("[Manager] Bot running...")
 
         application.run_polling()
+
+    # ──────────────────────────────────────────────────────────────────────
+    #   WhatsApp Cloud-API integration  (drop into AgentSystemManager)
+    # ──────────────────────────────────────────────────────────────────────
+    def start_whatsapp_bot(
+        self,
+        *,
+        # WhatsApp Cloud credentials  ─────────────────────────────────────
+        whatsapp_token: str = None,
+        phone_number_id: str = None,
+        webhook_verify_token: str = None,
+        # MAS run-options  ────────────────────────────────────────────────
+        component_name: str = None,
+        verbose: bool = False,
+        on_update: Callable = None,
+        on_complete: Callable = None,
+        return_token_count: bool = False,
+        # multimodal helpers
+        speech_to_text: Callable = None,
+        whisper_provider: str = None,
+        whisper_model: str = None,
+        # command replies (mirror Telegram defaults)  ─────────────────────
+        on_start_msg: str = "Hey! Talk to me or type '/clear' to erase your message history.",
+        on_clear_msg: str = "Message history deleted.",
+        # server opts
+        host: str = "0.0.0.0",
+        port: int = 5000,
+        base_path: str = "/webhook",
+    ):
+        """
+        Launch a tiny Flask server that bridges WhatsApp Cloud API  ⇄  MAS.
+
+        * multimodal: images, audio (with optional STT), plain text
+        * same callback semantics & defaults as start_telegram_bot()
+        * supports '/start' and '/clear' commands
+        """
+
+        # ──────────────────── credentials / helper vars ──────────────────
+        whatsapp_token       = whatsapp_token       or self.get_key("whatsapp_token")
+        phone_number_id      = phone_number_id      or self.get_key("whatsapp_phone_number_id")
+        webhook_verify_token = webhook_verify_token or self.get_key("webhook_verify_token")
+
+        if not (whatsapp_token and phone_number_id and webhook_verify_token):
+            raise ValueError(
+                "Missing WhatsApp credentials. Provide WHATSAPP_ACCESS_TOKEN, "
+                "WHATSAPP_PHONE_NUMBER_ID and WEBHOOK_VERIFY_TOKEN."
+            )
+        
+        
+        log = logging.getLogger(__name__)
+        log.debug("[Whatsapp Bot] WA-bot starting – phone_id=%s  base_path=%s", phone_number_id, base_path)
+
+        GRAPH_MSG_URL = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
+        HDR_JSON  = {"Authorization": f"Bearer {whatsapp_token}",
+                    "Content-Type":  "application/json"}
+        HDR_AUTH  = {"Authorization": f"Bearer {whatsapp_token}"}
+
+        # choose callbacks from system defaults if not overridden
+        on_update   = on_update   or self.on_update
+        on_complete = on_complete or self.on_complete
+
+        
+
+        # ─────────────────── outbound helpers (send to WA) ───────────────
+        def _send_text(to: str, txt: str):
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"body": txt}
+            }
+            r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
+            log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "text", r.status_code, to)
+
+        def _upload_media(path: str, mime: str) -> str:
+            url = f"https://graph.facebook.com/v18.0/{phone_number_id}/media"
+            with open(path, "rb") as fh:
+                files = {"file": (os.path.basename(path), fh, mime)}
+                r = requests.post(url, headers=HDR_AUTH,
+                                data={"messaging_product": "whatsapp"},
+                                files=files, timeout=60)
+            if r.ok:
+                return r.json().get("id")
+            log.error("Media upload failed: %s", r.text)
+            return None
+
+        def _send_image(to: str, path: str, caption: str = None):
+            mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+            mid  = _upload_media(path, mime)
+            if not mid:
+                return
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "image",
+                "image": {"id": mid, **({"caption": caption} if caption else {})}
+            }
+            r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
+            log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "image", r.status_code, to)
+
+        def _send_audio(to: str, path: str):
+            mime = "audio/mpeg"
+            mid  = _upload_media(path, mime)
+            if not mid:
+                return
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "audio",
+                "audio": {"id": mid}
+            }
+            r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
+            log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "audio", r.status_code, to)
+
+        # ───────────── MAS blocks → WhatsApp messages ────────────────────
+        def blocks_to_whatsapp(to: str, blocks: list[dict]):
+            for blk in blocks:
+                if blk["type"] == "text":
+                    raw = blk["content"]
+                    try:
+                        obj = json.loads(raw) if isinstance(raw, str) else raw
+                        txt = obj.get("response", raw) if isinstance(obj, dict) else raw
+                    except json.JSONDecodeError:
+                        txt = raw
+                    _send_text(to, txt)
+
+                elif blk["type"] == "image":
+                    src = blk["content"]
+                    if src.get("kind") == "file":
+                        local = src["path"][5:] if src["path"].startswith("file:") else src["path"]
+                        _send_image(to, local)
+                    elif src.get("kind") == "url":
+                        _send_text(to, src["url"])          # fallback: just send url
+                elif blk["type"] == "audio":
+                    src = blk["content"]
+                    if src.get("kind") == "file":
+                        local = src["path"][5:] if src["path"].startswith("file:") else src["path"]
+                        _send_audio(to, local)
+
+        # ───────────────── Flask webhook server ──────────────────────────
+        app = Flask(__name__)
+
+        @app.route(base_path, methods=["GET"])
+        def verify():
+            if request.args.get("hub.verify_token") == webhook_verify_token:
+                return request.args.get("hub.challenge", ""), 200
+            return "Forbidden", 403
+
+        @app.route(base_path, methods=["POST"])
+        def inbox():
+            data = request.get_json(force=True, silent=True) or {}
+            log.debug("[Whatsapp Bot] WEBHOOK RAW ⇢ %s ...", json.dumps(data)[:800])
+            try:
+                for entry in data.get("entry", []):
+                    for change in entry.get("changes", []):
+                        for msg in change.get("value", {}).get("messages", []):
+                            threading.Thread(target=_handle_msg, args=(msg,), daemon=True).start()
+            except Exception:
+                log.exception("Error processing webhook payload")
+            return "OK", 200
+
+        # ───────────────── message dispatcher ────────────────────────────
+        def _handle_msg(msg: dict):
+            log.debug("[Whatsapp Bot] HANDLE %s id=%s from=%s", mtype, msg.get('id'), wa_id)
+            wa_id  = msg.get("from")
+            mtype  = msg.get("type")
+            blocks = []
+
+            # ── text / commands ───────────────────────────────────────────
+            if mtype == "text":
+                body = msg["text"]["body"].strip()
+                if body.lower() == "/start":
+                    _send_text(wa_id, on_start_msg)
+                    return
+                if body.lower() == "/clear":
+                    self.clear_message_history(wa_id)
+                    _send_text(wa_id, on_clear_msg)
+                    return
+                blocks = self._to_blocks(body, user_id=wa_id)
+
+            # ── images ───────────────────────────────────────────────────
+            elif mtype == "image":
+                media_id = msg["image"]["id"]
+                media_url = requests.get(
+                    f"https://graph.facebook.com/v18.0/{media_id}",
+                    headers=HDR_AUTH, timeout=60).json().get("url")
+                img_bytes = requests.get(media_url, headers=HDR_AUTH, timeout=60).content
+                img_ref   = self.save_file(img_bytes, wa_id)
+                caption   = msg["image"].get("caption", "")
+                if caption:
+                    blocks.extend(self._to_blocks(caption, user_id=wa_id))
+                blocks.append({"type": "image",
+                            "content": {"kind": "file", "path": img_ref, "detail": "auto"}})
+
+            # ── audio / voice ─────────────────────────────────────────────
+            elif mtype in ("audio", "voice"):
+                media_id = msg[mtype]["id"]
+                media_url = requests.get(
+                    f"https://graph.facebook.com/v18.0/{media_id}",
+                    headers=HDR_AUTH, timeout=60).json().get("url")
+                audio_bytes = requests.get(media_url, headers=HDR_AUTH, timeout=60).content
+                audio_ref   = self.save_file(audio_bytes, wa_id)
+
+                transcript = None
+                if callable(speech_to_text):
+                    transcript = speech_to_text({"manager": self, "file_path": audio_ref[5:]})
+                else:
+                    try:
+                        transcript = self.stt(audio_ref, whisper_provider, whisper_model)
+                    except Exception as e:
+                        log.error("STT failed: %s", e)
+
+                if transcript:
+                    blocks.extend(self._to_blocks(transcript, user_id=wa_id))
+                blocks.append({"type": "audio",
+                            "content": {"kind": "file", "path": audio_ref, "detail": "auto"}})
+
+            else:
+                _send_text(wa_id, "Unsupported message type.")
+                return
+
+            # ── runner callbacks ─────────────────────────────────────────
+            cb_params = {"wa_id": wa_id}
+
+            def _cb_update(messages, manager, _):
+                if on_update:
+                    custom = on_update(messages, manager, cb_params)
+                    if custom is not None:
+                        blocks_to_whatsapp(wa_id, manager._to_blocks(custom, user_id=wa_id))
+
+            def _cb_complete(messages, manager, _):
+                if on_complete:
+                    custom = on_complete(messages, manager, cb_params)
+                    if custom is not None:
+                        blocks_to_whatsapp(wa_id, manager._to_blocks(custom, user_id=wa_id))
+                        return
+                if messages:
+                    blocks_to_whatsapp(wa_id, messages[-1]["message"])
+
+            # ── run MAS (thread keeps webhook snappy) ─────────────────────
+            def _run():
+                log.debug("[Whatsapp Bot] MAS RUN user=%s  blocks=%s", wa_id, blocks[:1])
+                self.run(
+                    input=blocks,
+                    component_name=component_name,
+                    user_id=wa_id,
+                    role="user",
+                    verbose=verbose,
+                    blocking=True,
+                    on_update=_cb_update,
+                    on_complete=_cb_complete,
+                    return_token_count=return_token_count
+                )
+            threading.Thread(target=_run, daemon=True).start()
+
+        # ────────────────────────── launch ───────────────────────────────
+        if verbose:
+            log.info("[Whatsapp Bot] WhatsApp bot up at http://%s:%d%s", host, port, base_path)
+        app.run(host=host, port=port, threaded=True)
+
 
     def stt(self, file_path, provider=None, model=None):
         # Determine which provider to use
