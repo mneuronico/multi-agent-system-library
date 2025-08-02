@@ -153,7 +153,7 @@ class Agent(Component):
             conversation = self._build_default_conversation(filtered_msgs, verbose)
 
         if verbose:
-            logger.debug(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2)}\n")
+            logger.debug(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2, ensure_ascii=False)}\n")
 
         # Now we call each model in self.models in order:
         for model_info in self.models:
@@ -230,14 +230,7 @@ class Agent(Component):
                 else:
                     response_str = response
 
-
-                print("RESPONSE STRING")
-                print(response_str)
-
                 response_dict = self._extract_and_parse_json(response_str)
-
-                print("RESPONSE DICT")
-                print(response_dict)
 
                 if response_dict is None:
                     response_dict = {"response": response_str}
@@ -311,19 +304,25 @@ class Agent(Component):
             with open(path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode()
             return f"data:{mime};base64,{b64}"
+        
+        def _text_as_string(content):
+            # dict/list → json, str → tal cual
+            if isinstance(content, (dict, list)):
+                return json.dumps(content, ensure_ascii=False)
+            return str(content)
 
         # ---- conversión --------------------------------------
         for msg in conversation:
             role   = msg["role"]
             blocks = self._as_blocks(msg["content"])
 
-            if provider in {"openai", "groq", "deepseek"}:
+            if provider in {"openai", "groq", "deepseek", "lmstudio"}:
                 # OpenAI / Groq style: user puede ser multimodal, system/assistant solo texto
                 if role == "user":
                     parts = []
                     for blk in blocks:
                         if blk["type"] == "text":
-                            parts.append({"type": "text", "text": blk["content"]})
+                            parts.append({"type": "text", "text": _text_as_string(blk["content"])})
                         elif blk["type"] == "image":
                             src = blk["content"]
                             if src["kind"] == "file":
@@ -338,7 +337,7 @@ class Agent(Component):
                     out.append({"role": role, "content": parts})
                 else:   # assistant / system
                     text = "\n".join(
-                        blk["content"] if blk["type"] == "text"
+                        _text_as_string(blk["content"]) if blk["type"] == "text"
                         else "[image omitted]"
                         for blk in blocks
                     )
@@ -348,11 +347,10 @@ class Agent(Component):
                 gem_parts = []
                 for blk in blocks:
                     if blk["type"] == "text":
-                        gem_parts.append({"text": blk["content"]})
+                        gem_parts.append({"text": _text_as_string(blk["content"])})
                     elif blk["type"] == "image":
                         src = blk["content"]
                         if src["kind"] == "file":
-                            
                             data = open(_clean_path(src["path"]),"rb").read()
                         elif src["kind"] == "url":
                             data = requests.get(src["url"]).content
@@ -374,7 +372,7 @@ class Agent(Component):
                 c_blocks = []
                 for blk in blocks:
                     if blk["type"] == "text":
-                        c_blocks.append({"type":"text", "text": blk["content"]})
+                        c_blocks.append({"type":"text", "text": _text_as_string(blk["content"])})
                     elif blk["type"] == "image":
                         src = blk["content"]
                         if src["kind"] == "file":
@@ -506,7 +504,7 @@ class Agent(Component):
 
             if fields:
                 blocks = self.manager._filter_blocks_by_fields(
-                    data, fields
+                    blocks, fields
                 )
 
             final_blocks = []
@@ -526,7 +524,7 @@ class Agent(Component):
 
                 source_block = {
                     "type": "text",
-                    "content": json.dumps(source_obj, ensure_ascii=False)
+                    "content": source_obj
                 }
                 final_blocks.append(source_block)
 
@@ -634,9 +632,9 @@ class Agent(Component):
             return [{"role": "system", "content": self.system_prompt}]
 
         if target_index is not None:
-            if len(subset) < abs(target_index):
-                raise IndexError(f"Requested index={target_index} but only {len(subset)} messages available.")
-            subset = [subset[target_index]]
+            subset = self._handle_index(target_index, subset)
+            if not subset: # _handle_index puede devolver una lista vacía si el índice está fuera de rango
+                 raise IndexError(f"Requested index/range={target_index} resulted in zero messages from a subset of size {len(filtered_msgs)}.")
 
         conversation = self._transform_to_conversation(subset, target_fields)
         conversation = [{"role": "system", "content": self.system_prompt}] + conversation
@@ -697,68 +695,214 @@ class Agent(Component):
             }
         }
     
-    def _extract_and_parse_json(self, text):
+    def _extract_and_parse_json(self, value):
+        """
+        Parser robusto para contenidos de agentes.
+        - Acepta dict/list/str.
+        - Quita code fences (``` y ```json).
+        - Puede extraer el PRIMER bloque JSON embebido en un string más largo.
+        - Desanida el caso 'doble response': {"response": {"response": ...}} o
+        {"response": "```json {\"response\": ... } ```"}.
+        - Nunca devuelve la cadena 'None' por errores de parseo.
 
-        if isinstance(text, (dict, list)):
-            return text
+        Retorna:
+        * dict/list si se pudo parsear JSON
+        * str original (posiblemente sin fences) si NO es JSON
+        * None si el input no es str/dict/list
+        """
+        import json, re
 
-        text = text.strip()
-        # 1) Quitar fences ```json ... ```
-        text = re.sub(r"^```json\s*|```$", "", text, flags=re.I).strip()
-        # 2) Quitar comillas exteriores
-        if (text.startswith('"') and text.endswith('"')) or \
-        (text.startswith("'") and text.endswith("'")):
-            text = text[1:-1].strip()
+        JSON_FENCE_RE = re.compile(r"^\s*```[\w-]*\s*([\s\S]*?)\s*```\s*$", re.IGNORECASE)
 
-        # 3) Localizar primer {; si no hay, primer [
-        brace   = text.find('{')
-        bracket = text.find('[')
-        if brace == bracket == -1:
-            return None
-        if brace != -1 and (brace < bracket or bracket == -1):
-            opener, closer, start = '{', '}', brace
-        else:
-            opener, closer, start = '[', ']', bracket
+        def strip_code_fences(s: str) -> str:
+            if not isinstance(s, str):
+                return s
+            m = JSON_FENCE_RE.match(s)
+            return m.group(1).strip() if m else s
 
-        # 4) Recorrer con stack para aislar bloque
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == opener:
-                depth += 1
-            elif ch == closer:
-                depth -= 1
-                if depth == 0:
-                    chunk = text[start:i+1]
-                    try:
-                        return json.loads(chunk)
-                    except json.JSONDecodeError:
-                        # intento de saneamiento de saltos de línea
-                        chunk2 = re.sub(r'(?<!\\)\n', r'\\n', chunk)
-                        try:
-                            return json.loads(chunk2)
-                        except json.JSONDecodeError:
-                            return None
+        def looks_jsonish(s: str) -> bool:
+            if not isinstance(s, str):
+                return False
+            t = strip_code_fences(s).lstrip()
+            return t.startswith("{") or t.startswith("[")
 
-        # 5) Si nunca cerró (depth > 0), auto-cerrar y reintentar
-        if depth > 0:
-            candidate = text[start:] + closer * depth
-            # saneamos saltos de línea no escapados
-            candidate = re.sub(r'(?<!\\)\n', r'\\n', candidate)
+        def json_unwrap_once(s: str):
+            """Intenta una sola capa de json.loads sobre s o s sin fences."""
+            if not isinstance(s, str):
+                return s
+            t = s.strip()
+            if not t:
+                return s
+            # quita comillas completas si viniera entrecomillado
+            if (t.startswith("'") and t.endswith("'")) or (t.startswith('"') and t.endswith('"')):
+                t = t[1:-1].strip()
+            # intento directo
             try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                return None
+                return json.loads(t)
+            except Exception:
+                pass
+            # intento sin fences
+            t2 = strip_code_fences(t)
+            if t2 != t:
+                try:
+                    return json.loads(t2)
+                except Exception:
+                    pass
+            return s  # no parsea, devolver string original
 
+        def extract_first_json_lenient(s: str):
+            """Intenta json.loads tolerante sobre un fragmento que ya parece JSON."""
+            if not isinstance(s, str):
+                return None
+            t = strip_code_fences(s).strip()
+            # intento directo
+            try:
+                return json.loads(t)
+            except Exception:
+                pass
+            # tolerancia: escapar saltos de línea no escapados
+            t2 = re.sub(r'(?<!\\)\n', r'\\n', t)
+            try:
+                return json.loads(t2)
+            except Exception:
+                pass
+            # tolerancia especial para {"response":"(multilínea)"}
+            m = re.match(r'^\s*\{\s*"response"\s*:\s*"(.*)"\s*\}\s*$', t, flags=re.DOTALL)
+            if m:
+                inner = m.group(1).replace('\\"', '"').replace('\\n', '\n')
+                return {"response": inner}
+            return None
+
+        def extract_first_json_anywhere(s: str):
+            """Busca el primer bloque {...} o [...] balanceado dentro de s y lo parsea."""
+            if not isinstance(s, str):
+                return None
+            t = strip_code_fences(s)
+            brace = t.find('{'); bracket = t.find('[')
+            if brace == bracket == -1:
+                return None
+            if brace != -1 and (brace < bracket or bracket == -1):
+                opener, closer, start = '{', '}', brace
+            else:
+                opener, closer, start = '[', ']', bracket
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(t)):
+                ch = t[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                    continue
+                if ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        chunk = t[start:i+1]
+                        return extract_first_json_lenient(chunk)
+            # si quedó abierto, intentamos cerrar de forma conservadora
+            if depth > 0:
+                candidate = t[start:] + closer * depth
+                return extract_first_json_lenient(candidate)
+            return None
+
+        def flatten_double_response(obj):
+            """
+            Si obj = {"response": {"response": ...}} => devuelve el interno.
+            Si obj = {"response": <string-jsonish>} => parsea y, si es dict con 'response', devuelve ese interno.
+            De lo contrario, preserva lo que haya en 'response'.
+            """
+            if not isinstance(obj, dict) or "response" not in obj:
+                return obj
+
+            inner = obj["response"]
+
+            # Caso 1: inner dict con 'response' -> quedarnos con el interno
+            if isinstance(inner, dict) and "response" in inner:
+                return inner
+
+            # Caso 2: inner dict/list (sin 'response'): mantener tal cual
+            if isinstance(inner, (dict, list)):
+                obj["response"] = inner
+                return obj
+
+            # Caso 3: inner string que parece JSON -> intentar parsear
+            if isinstance(inner, str) and looks_jsonish(inner):
+                unwrapped = json_unwrap_once(inner)
+                if isinstance(unwrapped, dict) and "response" in unwrapped:
+                    return unwrapped
+                if isinstance(unwrapped, (dict, list)):
+                    obj["response"] = unwrapped
+                    return obj
+                if isinstance(unwrapped, str):
+                    parsed = extract_first_json_anywhere(unwrapped)
+                    if isinstance(parsed, dict) and "response" in parsed:
+                        return parsed
+                    if isinstance(parsed, (dict, list)):
+                        obj["response"] = parsed
+                        return obj
+
+            return obj
+
+        # ---- lógica principal ----
+
+        # 1) ya es objeto
+        if isinstance(value, (dict, list)):
+            return flatten_double_response(value) if isinstance(value, dict) else value
+
+        # 2) si no es str/dict/list
+        if not isinstance(value, str):
+            return None
+
+        s = value.strip()
+        # quita fences sueltos de apertura/cierre si vinieran
+        s = re.sub(r"^```json\s*|```$", "", s, flags=re.IGNORECASE).strip()
+
+        # 3) intentar desempaquetar una capa (json.loads o sin fences)
+        unwrapped = json_unwrap_once(s)
+
+        # a) dict/list -> posible aplanado
+        if isinstance(unwrapped, dict):
+            return flatten_double_response(unwrapped)
+        if isinstance(unwrapped, list):
+            return unwrapped
+
+        # b) sigue siendo string: intentar extraer primer JSON embebido
+        if isinstance(unwrapped, str):
+            extracted = extract_first_json_anywhere(unwrapped)
+            if isinstance(extracted, dict):
+                return flatten_double_response(extracted)
+            if isinstance(extracted, list):
+                return extracted
+            # No se pudo parsear a objeto: devolver string (¡nunca "None"!)
+            return unwrapped
+
+        # c) cualquier otro caso raro
         return None
+
             
     def _flatten_system_content(self, blocks):
         # puede venir string o lista de bloques
         if isinstance(blocks, str):
             return blocks
         if isinstance(blocks, list):
-            return "\n".join(b["content"] for b in blocks if b.get("type") == "text")
-        # fallback
+            chunks = []
+            for b in blocks:
+                if b.get("type") == "text":
+                    c = b.get("content")
+                    if isinstance(c, (dict, list)):
+                        chunks.append(json.dumps(c, ensure_ascii=False))
+                    else:
+                        chunks.append(str(c))
+            return "\n".join(chunks)
         return str(blocks)
     
     def _call_openai_api(
@@ -2409,21 +2553,7 @@ class AgentSystemManager:
                                     base_directory: str,
                                     default_models: List[Dict[str, str]],
                                     verbose: bool = False) -> str:
-        """
-        1. Fetch README.
-        2. Build a *temporary* system with ONE agent (system_writer).
-        3. Feed the agent a single input containing:
-             – the MAS README
-             – the user's description
-           and instruct it to output:
-             • general_parameters
-             • components
-             • fns  (list of python functions as raw strings)
-        4. Persist those outputs into <base_directory>/config.json
-           and <base_directory>/fns.py.
-        5. Return the path to the new config so __init__ can proceed.
-        """
-        import json, textwrap, os, uuid
+        import textwrap
 
         # ---------- 1. README + combined input ------------------------
         readme_text = get_readme("mneuronico", "multi-agent-system-library")
@@ -2497,10 +2627,13 @@ class AgentSystemManager:
         for blk in blocks:
             if blk.get("type") == "text":
                 raw = blk.get("content")
-                try:
-                    agent_payload = json.loads(raw)
-                except (TypeError, json.JSONDecodeError):
-                    pass
+                if isinstance(raw, dict):
+                    agent_payload = raw
+                else:
+                    try:
+                        agent_payload = json.loads(raw)
+                    except (TypeError, json.JSONDecodeError):
+                        agent_payload = None
                 break
 
         if not isinstance(agent_payload, dict):
@@ -2874,7 +3007,8 @@ class AgentSystemManager:
         if isinstance(content, (dict, list)):
             content_str = json.dumps(
                 self._persist_non_json_values(content, self._current_user_id),
-                indent=2
+                indent=2,
+                ensure_ascii=False
             )
         else:
             content_str = str(content)
@@ -2943,7 +3077,7 @@ class AgentSystemManager:
         Then return the JSON representation of the modified dictionary.
         """
         data_copy = self._persist_non_json_values(data, user_id)
-        return json.dumps(data_copy, indent=2)
+        return json.dumps(data_copy, indent=2, ensure_ascii=False)
 
     def _persist_non_json_values(self, value: Any, user_id: str) -> Any:
         if isinstance(value, dict):
@@ -3062,11 +3196,7 @@ class AgentSystemManager:
         return msg_number
     
     def _filter_blocks_by_fields(self, blocks, fields):
-        """
-        • Si no hay bloque text ⇒ devuelve blocks sin tocar.
-        • Si hay → decodifica JSON, filtra campos, vuelve a serializar.
-        """
-        import json, copy
+        import copy
         if not fields:
             return blocks
 
@@ -3074,13 +3204,20 @@ class AgentSystemManager:
         for b in new_blocks:
             if b.get("type") == "text":
                 raw = b["content"]
-                try:
-                    obj = json.loads(raw) if isinstance(raw, str) else raw
-                except Exception:
-                    break                                   # no es JSON
-                if isinstance(obj, dict):
-                    sub = {k: obj[k] for k in fields if k in obj}
-                    b["content"] = json.dumps(sub, ensure_ascii=False)
+
+                if isinstance(raw, dict):
+                    sub = {k: raw[k] for k in fields if k in raw}
+                    b["content"] = sub
+                    continue
+
+                if isinstance(raw, str):
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+                    if isinstance(obj, dict):
+                        sub = {k: obj[k] for k in fields if k in obj}
+                        b["content"] = sub
         return new_blocks
     
     def _get_all_messages(self, conn: sqlite3.Connection, include_model = False) -> List[tuple]:
@@ -3141,13 +3278,10 @@ class AgentSystemManager:
         Devuelve el dict metadata que guarda MAS dentro del primer bloque con ella.
         Si no hay, devuelve {}.
         """
-        import json
 
-        # Caso antiguo: ya era dict con metadata en la raíz
         if isinstance(content, dict):
             return content.get("metadata", {})
 
-        # Caso nuevo: lista de bloques
         if isinstance(content, list):
             for blk in content:
                 if not isinstance(blk, dict):
@@ -3158,7 +3292,9 @@ class AgentSystemManager:
 
                 # 2) bloque type=text con JSON serializado
                 if blk.get("type") == "text":
-                    raw = blk.get("content") or blk.get("text")
+                    raw = blk.get("content")
+                    if isinstance(raw, dict) and "metadata" in raw:
+                        return raw["metadata"]
                     if isinstance(raw, str):
                         try:
                             obj = json.loads(raw)
@@ -3285,7 +3421,8 @@ class AgentSystemManager:
             "In this system, messages are exchanged between different components (users, agents, tools, etc.).\n"
             "To help you understand the origin of each message, they include a 'source', which indicates the originator of the message (e.g., 'user', 'my_agent', 'my_tool').\n"
             "When you receive a message, remember that the 'source' tells you who sent it.\n"
-            "You do not need to include the 'source' in your output, since they will be added by the system. Focus solely on producing the JSON structure with the required fields defined above.\n\n"
+            "You do not need to include the 'source' in your output, since they will be added by the system. Focus solely on producing the JSON structure with the required fields defined above.\n"
+            "You never need to include things like '```json' or anything else. Just the bare object: {'required_output_name': 'required_output_value', ...}, with one field per required output, is enough for the system to parse it correctly. If you do something differently, the system will fail.\n"
         )
 
         return prompt
@@ -3720,6 +3857,14 @@ class AgentSystemManager:
         self.base_directory = general_params.get("base_directory", self.base_directory)
         self.general_system_description = general_params.get("general_system_description", "This is a multi-agent system.")
         self.functions = general_params.get("functions", "fns.py")
+
+        if isinstance(self.functions, str):
+            self.functions = [self.functions]
+        elif isinstance(self.functions, list):
+            self.functions = self.functions
+        else:
+            self.functions = []
+
         self.default_models = general_params.get("default_models", self.default_models)
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
@@ -3757,13 +3902,6 @@ class AgentSystemManager:
             self.imports = imports
         else:
             raise ValueError(f"Imports must be list or string")
-
-        if isinstance(self.functions, str):
-            self.functions = [self.functions]
-        elif isinstance(self.functions, list):
-            self.functions = self.functions
-        else:
-            self.functions = []
         
         self._resolve_api_keys_path(general_params.get("api_keys_path"))
         self._load_api_keys()
@@ -4082,18 +4220,6 @@ class AgentSystemManager:
         return mime and mime.startswith("image/") and os.path.isfile(p)
 
     def _to_blocks(self, value, user_id=None, detail="auto"):
-        """
-        Convierte *cualquier* valor Python a List[Block] con schema:
-            { "type": "text"|"image", "content": … }
-
-        Reglas:
-          • Si ya es lista de bloques válidos → la devuelve intacta.
-          • Si ya es bloque único  → lo envuelve en lista.
-          • bytes / imagen → bloque image.
-          • dict / list / str / cualquier otro → bloque text (json-dump si ≠str).
-        """
-        import json
-
         # Aseguramos user_id para guardar archivos cuando haga falta
         self.ensure_user(user_id)
         user_id = user_id or self._current_user_id
@@ -4129,21 +4255,26 @@ class AgentSystemManager:
                 "content": {"kind": "file", "path": file_ref, "detail": detail}
             }]
 
-        # 4) dict / list → serializamos si no son ya bloques
-        if isinstance(value, dict) or isinstance(value, list):
-            try:
-                dumped = json.dumps(value, ensure_ascii=False)
-            except TypeError:
-                # Fallback: persist non-serializable values into files
-                if isinstance(value, dict):
-                    dumped = self._dict_to_json_with_file_persistence(value, user_id)
-                else:
-                    data_copy = self._persist_non_json_values(value, user_id)
-                    dumped = json.dumps(data_copy, ensure_ascii=False)
+        # 4) dict → bloque text con el objeto en content
+        if isinstance(value, dict):
+            data_copy = self._persist_non_json_values(value, user_id)
             return [{
                 "type": "text",
-                "content": dumped
+                "content": data_copy
             }]
+            # try:
+            #     dumped = json.dumps(value, ensure_ascii=False)
+            # except TypeError:
+            #     # Fallback: persist non-serializable values into files
+            #     if isinstance(value, dict):
+            #         dumped = self._dict_to_json_with_file_persistence(value, user_id)
+            #     else:
+            #         data_copy = self._persist_non_json_values(value, user_id)
+            #         dumped = json.dumps(data_copy, ensure_ascii=False)
+            # return [{
+            #     "type": "text",
+            #     "content": dumped
+            # }]
 
         # 5) todo lo demás (str, int, float, …)
         return [{
@@ -4185,6 +4316,9 @@ class AgentSystemManager:
         if raw is None:
             raise ValueError("Input must contain at least one text block")
         
+        if isinstance(raw, dict):
+            return raw
+        
         if isinstance(raw, str):
             try:
                 obj = json.loads(raw)
@@ -4195,9 +4329,6 @@ class AgentSystemManager:
             # texto plano → envolvemos
             return {"text_content": raw}
 
-        # raro: el campo 'content' ya era un obj
-        if isinstance(raw, dict):
-            return raw
 
         # cualquier otro tipo lo envolvemos igual
         return {"text_content": str(raw)}
@@ -4236,6 +4367,56 @@ class AgentSystemManager:
         
         # If not found in any source
         return None
+    
+    def _json_unwrap(self, value, max_depth: int = 3):
+        """
+        Intenta aplicar json.loads repetidamente para convertir:
+        '"Hola\\nMundo"'         -> 'Hola\nMundo'
+        '"{\\"response\\":...}"' -> '{"response":...}' -> {...}
+        Si deja de ser str o falla, devuelve el valor actual.
+        """
+        cur = value
+        for _ in range(max_depth):
+            if not isinstance(cur, str):
+                break
+            s = cur.strip()
+            if not s:
+                break
+            try:
+                cur = json.loads(s)
+            except Exception:
+                break
+        return cur
+    
+    def _block_to_plain_text(self, blk) -> str:
+        """
+        Convierte un bloque a texto para transporte:
+        - Prioriza 'response' si el content es dict y existe.
+        - Dict/List → JSON pretty.
+        - Str → tal cual (desempaquetando niveles de JSON si hiciera falta).
+        """
+        import json
+        if blk.get("type") != "text":
+            return ""
+        raw = blk.get("content")
+
+        # Si ya es dict/list
+        if isinstance(raw, dict):
+            if "response" in raw and isinstance(raw["response"], str):
+                return raw["response"]
+            return json.dumps(raw, ensure_ascii=False, indent=2)
+        if isinstance(raw, list):
+            return json.dumps(raw, ensure_ascii=False, indent=2)
+
+        # String → intenta "desempacar" niveles JSON
+        val = self._json_unwrap(raw)
+        if isinstance(val, dict):
+            if "response" in val and isinstance(val["response"], str):
+                return val["response"]
+            return json.dumps(val, ensure_ascii=False, indent=2)
+        if isinstance(val, list):
+            return json.dumps(val, ensure_ascii=False, indent=2)
+        return str(val)
     
     def start_telegram_bot(self, telegram_token=None, component_name = None, verbose = False,
               on_complete = None, on_update = None, speech_to_text=None,
@@ -4349,24 +4530,27 @@ class AgentSystemManager:
             • image ⇒ envía la foto referenciada.
             Se envía cada bloque en un mensaje separado.
             """
-            import json
 
             if not blocks:
                 return
 
             for blk in blocks:
                 if blk["type"] == "text":
-                    raw = blk["content"]
-                    try:
-                        # intentamos interpretar como JSON por si es objeto
-                        parsed = json.loads(raw)
-                        # contrato MAS: por defecto los agentes/tools guardan 'response'
-                        txt = parsed.get("response", raw) if isinstance(parsed, dict) else raw
-                    except json.JSONDecodeError:
-                        txt = raw
-                    await update.message.reply_text(txt)
-                    #value = self.escape_markdown(value)
-                    #await update.message.reply_text(value, parse_mode="MarkdownV2")
+                    txt = self._block_to_plain_text(blk)
+                    if txt:
+                        await update.message.reply_text(txt)
+
+                    # raw = blk["content"]
+                    # try:
+                    #     # intentamos interpretar como JSON por si es objeto
+                    #     parsed = json.loads(raw)
+                    #     # contrato MAS: por defecto los agentes/tools guardan 'response'
+                    #     txt = parsed.get("response", raw) if isinstance(parsed, dict) else raw
+                    # except json.JSONDecodeError:
+                    #     txt = raw
+                    # await update.message.reply_text(txt)
+                    # #value = self.escape_markdown(value)
+                    # #await update.message.reply_text(value, parse_mode="MarkdownV2")
 
                 elif blk["type"] == "image":
                     path = blk["content"]["path"]
@@ -4392,12 +4576,12 @@ class AgentSystemManager:
         def on_complete_fn(messages, manager, params):
 
             blocks = None
-            if on_complete is not None:
+            if on_complete:
                 response = on_complete(messages, manager, params)
-                blocks = self._to_blocks(response, user_id=str(params["update"].message.chat.id))
-            
-            if blocks is None:
-                blocks = messages[-1]["message"] if messages else []
+                if response is not None:
+                    blocks = self._to_blocks(response, user_id=str(params["update"].message.chat.id))
+            else:
+                blocks = messages[-1]["message"] if messages else None
 
             if blocks is None:
                 return
@@ -4413,11 +4597,12 @@ class AgentSystemManager:
         def on_update_fn(messages, manager, params):
             
             blocks = None
-            if on_update is not None:
+            if on_update:
                 response = on_update(messages, manager, params)
-                blocks = self._to_blocks(response, user_id=str(params["update"].message.chat.id))
-            
-            if blocks is None:
+                if response is not None:
+                    blocks = self._to_blocks(response, user_id=str(params["update"].message.chat.id))
+
+            if not blocks:
                 return
 
             update = params["update"]
@@ -4605,13 +4790,17 @@ class AgentSystemManager:
         def blocks_to_whatsapp(to: str, blocks: list[dict]):
             for blk in blocks:
                 if blk["type"] == "text":
-                    raw = blk["content"]
-                    try:
-                        obj = json.loads(raw) if isinstance(raw, str) else raw
-                        txt = obj.get("response", raw) if isinstance(obj, dict) else raw
-                    except json.JSONDecodeError:
-                        txt = raw
-                    _send_text(to, txt)
+                    txt = self._block_to_plain_text(blk)
+                    if txt:
+                        _send_text(to, txt)
+
+                    # raw = blk["content"]
+                    # try:
+                    #     obj = json.loads(raw) if isinstance(raw, str) else raw
+                    #     txt = obj.get("response", raw) if isinstance(obj, dict) else raw
+                    # except json.JSONDecodeError:
+                    #     txt = raw
+                    # _send_text(to, txt)
 
                 elif blk["type"] == "image":
                     src = blk["content"]
@@ -4638,7 +4827,7 @@ class AgentSystemManager:
         @app.route(base_path, methods=["POST"])
         def inbox():
             data = request.get_json(force=True, silent=True) or {}
-            log.debug("[Whatsapp Bot] WEBHOOK RAW ⇢ %s ...", json.dumps(data)[:800])
+            #log.debug("[Whatsapp Bot] WEBHOOK RAW ⇢ %s ...", json.dumps(data)[:800])
             try:
                 for entry in data.get("entry", []):
                     for change in entry.get("changes", []):
@@ -4650,10 +4839,13 @@ class AgentSystemManager:
 
         # ───────────────── message dispatcher ────────────────────────────
         def _handle_msg(msg: dict):
-            log.debug("[Whatsapp Bot] HANDLE %s id=%s from=%s", mtype, msg.get('id'), wa_id)
+
             wa_id  = msg.get("from")
             mtype  = msg.get("type")
             blocks = []
+
+            log.debug("[Whatsapp Bot] HANDLE %s id=%s from=%s", mtype, msg.get('id'), wa_id)
+            
 
             # ── text / commands ───────────────────────────────────────────
             if mtype == "text":
@@ -4711,19 +4903,19 @@ class AgentSystemManager:
             # ── runner callbacks ─────────────────────────────────────────
             cb_params = {"wa_id": wa_id}
 
-            def _cb_update(messages, manager, _):
+            def _cb_update(messages, manager, params=None):
                 if on_update:
                     custom = on_update(messages, manager, cb_params)
                     if custom is not None:
                         blocks_to_whatsapp(wa_id, manager._to_blocks(custom, user_id=wa_id))
 
-            def _cb_complete(messages, manager, _):
+            def _cb_complete(messages, manager, params=None):
                 if on_complete:
                     custom = on_complete(messages, manager, cb_params)
                     if custom is not None:
                         blocks_to_whatsapp(wa_id, manager._to_blocks(custom, user_id=wa_id))
                         return
-                if messages:
+                elif messages:
                     blocks_to_whatsapp(wa_id, messages[-1]["message"])
 
             # ── run MAS (thread keeps webhook snappy) ─────────────────────
