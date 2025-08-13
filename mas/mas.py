@@ -2655,8 +2655,7 @@ class AgentSystemManager:
         # ---------- 4-bis. clean bootstrap artefacts ------------------
         # Close the sub-manager’s DB so Windows lets us delete the folder
         try:
-            if getattr(sub_mgr, "_current_db_conn", None):
-                sub_mgr._current_db_conn.close()
+            sub_mgr._close_all_db_conns()
         except Exception:
             pass
 
@@ -2917,12 +2916,30 @@ class AgentSystemManager:
         return os.path.join(self.history_folder, f"{user_id}.sqlite")
 
     def _ensure_user_db(self, user_id: str) -> sqlite3.Connection:
+        if not hasattr(self, "_db_pool"):
+            self._db_pool = {}
+        user_id = str(user_id)
+        if user_id in self._db_pool:
+            return self._db_pool[user_id]
         db_path = self._get_db_path_for_user(user_id)
         needs_init = not os.path.exists(db_path)
-        conn = sqlite3.connect(db_path,  check_same_thread=False)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        # Mejor concurrencia en SQLite
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
         if needs_init:
             self._create_table(conn)
+        self._db_pool[user_id] = conn
         return conn
+    
+    def _active_user_id(self) -> Optional[str]:
+        if hasattr(self, "_tls") and getattr(self._tls, "current_user_id", None):
+            return self._tls.current_user_id
+        return getattr(self, "_current_user_id", None)
+
     
     def export_history(self, user_id: str) -> bytes:
         """
@@ -2980,18 +2997,42 @@ class AgentSystemManager:
 
     def set_current_user(self, user_id: str):
         self._current_user_id = str(user_id)
-        self._current_db_conn = self._ensure_user_db(user_id)
+        # Thread-local holder (no requiere tocar __init__)
+        if not hasattr(self, "_tls"):
+            self._tls = threading.local()
+        # Conexión por usuario (reutilizable)
+        conn = self._ensure_user_db(self._current_user_id)
+        # Fija el contexto SOLO para este hilo
+        self._tls.current_user_id = self._current_user_id
+        self._tls.db_conn = conn
+
 
     def ensure_user(self, user_id: Optional[str] = None) -> None:
         if user_id:
             self.set_current_user(user_id)
-        elif not self._current_user_id:
+            return
+        # Si este hilo no tiene usuario aún, crea uno
+        if not hasattr(self, "_tls"):
+            self._tls = threading.local()
+        if getattr(self._tls, "current_user_id", None) is None:
             new_user = str(uuid.uuid4())
             self.set_current_user(new_user)
 
+
     def _get_user_db(self) -> sqlite3.Connection:
+        if not hasattr(self, "_tls"):
+            self._tls = threading.local()
+        conn = getattr(self._tls, "db_conn", None)
+        if conn is not None:
+            return conn
+        # Fallback: si hay un _current_user_id global, úsalo para este hilo
+        if getattr(self, "_current_user_id", None):
+            self.set_current_user(self._current_user_id)
+            return self._tls.db_conn
+        # Como último recurso, crea usuario para este hilo
         self.ensure_user()
-        return self._current_db_conn
+        return self._tls.db_conn
+
 
     def _get_next_msg_number(self, conn: sqlite3.Connection) -> int:
         cur = conn.cursor()
@@ -3835,10 +3876,10 @@ class AgentSystemManager:
             return None
 
     def save_file(self, obj: Any, user_id = None) -> str:
-        # Asegura que haya un usuario activo
-        self.ensure_user(user_id)
-        # Ahora lo guarda con el mismo user_id
-        return self._store_file(obj, self._current_user_id)
+        # Usa el user_id explícito o el del hilo actual
+        uid = str(user_id) if user_id is not None else str(self._active_user_id() or "unknown")
+        self.ensure_user(uid)
+        return self._store_file(obj, uid)
 
 
     def build_from_json(self, json_path: str):
@@ -5129,17 +5170,27 @@ class AgentSystemManager:
 
     def _save_tts_file(self, audio_bytes: bytes) -> str:
         """
-        Helper function to save the audio file (mp3) in the files/tts folder.
-        The file is named as <user_id>_<random_hash>.mp3.
+        Helper to save MP3 in files/tts as <user_id>_<random>.mp3, thread-safe.
         """
         tts_folder = os.path.join(self.files_folder, "tts")
         os.makedirs(tts_folder, exist_ok=True)
-        user_id = self._current_user_id if self._current_user_id else "unknown"
-        filename = f"{user_id}_{uuid.uuid4().hex}.mp3"
+        uid = str(self._active_user_id() or self._current_user_id or "unknown")
+        filename = f"{uid}_{uuid.uuid4().hex}.mp3"
         file_path = os.path.join(tts_folder, filename)
         with open(file_path, "wb") as f:
             f.write(audio_bytes)
         return file_path
+    
+    def _close_all_db_conns(self):
+        """Cierra todas las conexiones SQLite abiertas en el pool interno."""
+        if hasattr(self, "_db_pool"):
+            for _uid, conn in list(self._db_pool.items()):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._db_pool.clear()
+
 
 class Parser:
     """
