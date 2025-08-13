@@ -2431,8 +2431,10 @@ class AgentSystemManager:
         on_complete: Optional[Callable] = None,
         include_timestamp: bool = False,
         timezone: str = "UTC",
-        log_level=None
-    ):  
+        log_level=None,
+        admin_user_id: Optional[str] = None
+    ):
+
         
         self.base_directory = os.path.abspath(base_directory)
         
@@ -2478,6 +2480,8 @@ class AgentSystemManager:
             raise ValueError(f"Imports must be list or string")
 
         self._processed_imports = set()
+
+        self.admin_user_id = str(admin_user_id) if admin_user_id is not None else None
 
         self.include_timestamp = include_timestamp
         self.timezone = timezone
@@ -3914,6 +3918,9 @@ class AgentSystemManager:
         self.include_timestamp = general_params.get("include_timestamp", False)
         self.timezone = general_params.get("timezone", 'UTC')
 
+        admin_from_cfg = general_params.get("admin_user_id", None)
+        self.admin_user_id = str(admin_from_cfg) if admin_from_cfg is not None else getattr(self, "admin_user_id", None)
+
         # Resolve history folder from JSON:
         history_folder = general_params.get("history_folder")
         if history_folder:
@@ -4240,6 +4247,74 @@ class AgentSystemManager:
         cur.execute("DELETE FROM message_history")
         conn.commit()
         logger.info(f"Message history cleared for user ID: {self._current_user_id}")
+
+    def clear_global_history(self) -> int:
+        """
+        Borra el historial de TODOS los usuarios (deja los archivos .sqlite y sus tablas vacías).
+        No hace chequeos de admin. Pensado para ser llamado por el developer.
+        Retorna la cantidad de bases tocadas.
+        """
+        self._close_all_db_conns()
+        os.makedirs(self.history_folder, exist_ok=True)
+
+        cleared = 0
+        for fname in os.listdir(self.history_folder):
+            if not fname.endswith(".sqlite"):
+                continue
+            db_path = os.path.join(self.history_folder, fname)
+            try:
+                conn = sqlite3.connect(db_path, check_same_thread=False)
+                cur = conn.cursor()
+                # Garantiza que la tabla exista
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS message_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        msg_number INTEGER NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        model TEXT
+                    )
+                """)
+                # Limpia
+                cur.execute("DELETE FROM message_history")
+                conn.commit()
+                conn.close()
+                cleared += 1
+            except Exception:
+                logger.exception(f"Error clearing history for DB: {db_path}")
+        logger.info(f"[Manager] Cleared history in {cleared} sqlite DB(s).")
+        return cleared
+
+    def reset_system(self) -> None:
+        """
+        Resetea el sistema:
+        - Cierra conexiones a DBs
+        - Elimina TODAS las bases sqlite (history/) y TODOS los archivos en files/
+        - Recrea carpetas vacías y limpia caches internas
+        NO hace chequeos de admin. Pensado para el developer.
+        """
+        self._close_all_db_conns()
+        # Borra history
+        try:
+            shutil.rmtree(self.history_folder, ignore_errors=True)
+        except Exception:
+            logger.exception("Failed to remove history folder.")
+        # Borra files
+        try:
+            shutil.rmtree(self.files_folder, ignore_errors=True)
+        except Exception:
+            logger.exception("Failed to remove files folder.")
+        # Recrea carpetas
+        os.makedirs(self.history_folder, exist_ok=True)
+        os.makedirs(self.files_folder, exist_ok=True)
+        # Limpia caches internas
+        if hasattr(self, "_db_pool"):
+            self._db_pool.clear()
+        self._file_cache = {}
+        logger.info("[Manager] System reset completed (history/ and files/ wiped).")
+
 
     def escape_markdown(self, text: str) -> str:
         """
@@ -4665,6 +4740,33 @@ class AgentSystemManager:
             self.clear_message_history(update.message.chat.id)
             await update.message.reply_text(on_clear_msg)
 
+        async def clear_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            # Requiere admin_user_id configurado y que el emisor coincida
+            if not self.admin_user_id:
+                await update.message.reply_text("Comando deshabilitado: no hay admin configurado.")
+                return
+            if str(update.message.chat.id) != str(self.admin_user_id):
+                await update.message.reply_text("No autorizado.")
+                return
+            count = self.clear_global_history()
+            await update.message.reply_text(f"Historiales de todos los usuarios borrados ({count} DBs).")
+
+        async def reset_system_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            # Solo habilitado si hay admin configurado y coincide con el emisor
+            if not self.admin_user_id:
+                await update.message.reply_text("Comando deshabilitado: no hay admin configurado.")
+                return
+            if str(update.message.chat.id) != str(self.admin_user_id):
+                await update.message.reply_text("No autorizado.")
+                return
+            try:
+                self.reset_system()
+                await update.message.reply_text("Sistema reseteado: se eliminaron todos los historiales y archivos, y se recrearon las carpetas vacías.")
+            except Exception as e:
+                logger.exception("Error en /reset_system:", exc_info=e)
+                await update.message.reply_text("Ocurrió un error al resetear el sistema.")
+
+
         async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """Handle direct text input from user"""
             text = update.message.text
@@ -4705,6 +4807,8 @@ class AgentSystemManager:
         # Add command and message handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("clear", clear))
+        application.add_handler(CommandHandler("clear_all_users", clear_all_users))
+        application.add_handler(CommandHandler("reset_system", reset_system_cmd))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text))
         application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
         application.add_handler(MessageHandler(filters.VOICE, handle_audio))
@@ -4900,6 +5004,32 @@ class AgentSystemManager:
                     self.clear_message_history(wa_id)
                     _send_text(wa_id, on_clear_msg)
                     return
+                if body.lower() == "/clear_all_users":
+                    if not self.admin_user_id:
+                        _send_text(wa_id, "Comando deshabilitado: no hay admin configurado.")
+                        return
+                    if str(wa_id) != str(self.admin_user_id):
+                        _send_text(wa_id, "No autorizado.")
+                        return
+                    count = self.clear_global_history()
+                    _send_text(wa_id, f"Historiales de todos los usuarios borrados ({count} DBs).")
+                    return
+                if body.lower() == "/reset_system":
+                    if not self.admin_user_id:
+                        _send_text(wa_id, "Comando deshabilitado: no hay admin configurado.")
+                        return
+                    if str(wa_id) != str(self.admin_user_id):
+                        _send_text(wa_id, "No autorizado.")
+                        return
+                    try:
+                        self.reset_system()
+                        _send_text(wa_id, "Sistema reseteado: se eliminaron todos los historiales y archivos, y se recrearon las carpetas vacías.")
+                    except Exception as e:
+                        logger.exception("Error en /reset_system:", exc_info=e)
+                        _send_text(wa_id, "Ocurrió un error al resetear el sistema.")
+                    return
+
+
                 blocks = self._to_blocks(body, user_id=wa_id)
 
             # ── images ───────────────────────────────────────────────────
