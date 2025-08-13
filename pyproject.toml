@@ -27,6 +27,7 @@ dependencies = [
     "python-telegram-bot",
     "Flask>=3,<4",
     "requests",
+    "pandas",
     "python-dotenv",
     'backports.zoneinfo; python_version < "3.9"',
     'tzdata; python_version < "3.9"'
