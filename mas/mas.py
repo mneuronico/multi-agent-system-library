@@ -32,10 +32,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# Optionally, add a handler just for your logger
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(message)s"))
-logger.addHandler(handler)
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_h)
 
 def get_readme(owner: str, repo: str, branch: str = None,
                token: str = None) -> str:
@@ -3040,30 +3040,33 @@ class AgentSystemManager:
         max_num = cur.fetchone()[0]
         return max_num + 1
 
-    def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict, list], type = "user", model: Optional[str] = None):
+    def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict, list], type="user", model: Optional[str] = None):
         timestamp = datetime.now(self.timezone).isoformat()
 
         content = self._to_blocks(content, user_id=self._current_user_id)
-
         if isinstance(content, (dict, list)):
             content_str = json.dumps(
                 self._persist_non_json_values(content, self._current_user_id),
-                indent=2,
-                ensure_ascii=False
+                indent=2, ensure_ascii=False
             )
         else:
             content_str = str(content)
 
-        msg_number = self._get_next_msg_number(conn)
         cur = conn.cursor()
+        # Bloquea para evitar carreras con MAX(msg_number)
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
+        next_num = cur.fetchone()[0]
         cur.execute(
             """
             INSERT INTO message_history (msg_number, role, content, type, model, timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (msg_number, role, content_str, type, model, timestamp)
+            (next_num, role, content_str, type, model, timestamp)
         )
         conn.commit()
+        return next_num
+
 
     def add_message(self, role: str, content: Union[str, dict], msg_type: str = "developer") -> None:
         db_conn = self._get_user_db()
@@ -3227,14 +3230,13 @@ class AgentSystemManager:
     ) -> int:
         """
         Normaliza *content* a List[Block] con _to_blocks() y lo guarda.
-        Devuelve el msg_number asignado.
+        Devuelve el msg_number asignado (atómico).
         """
-
         self.ensure_user(user_id)
         conn = self._get_user_db()
-        msg_number = self._get_next_msg_number(conn)
-        self._save_message(conn, role, content, msg_type)
+        msg_number = self._save_message(conn, role, content, msg_type)
         return msg_number
+
     
     def _filter_blocks_by_fields(self, blocks, fields):
         import copy
