@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mas"
-version = "0.2.1"
+version = "0.2.2"
 description = "A powerful and flexible framework for creating and managing multi-agent systems."
 readme = "README.md"
 license = { text = "MIT" }
@@ -29,9 +29,13 @@ dependencies = [
     "requests",
     "pandas",
     "python-dotenv",
+    "mutagen>=1.46",
     'backports.zoneinfo; python_version < "3.9"',
     'tzdata; python_version < "3.9"'
 ]
+
+[project.optional-dependencies]
+ffmpeg = ["ffmpeg-python>=0.2.0"]
 
 [project.urls]
 Homepage = "https://github.com/mneuronico/multi-agent-system-library"

@@ -17,11 +17,12 @@ import tempfile
 import requests
 from dotenv import load_dotenv
 import inspect
-from datetime import datetime
+from datetime import datetime, timezone
 import imghdr, mimetypes, shutil
 from importlib import resources
 import logging
 import base64
+import collections
 from flask import Flask, request, jsonify
 
 try:
@@ -2432,11 +2433,13 @@ class AgentSystemManager:
         include_timestamp: bool = False,
         timezone: str = "UTC",
         log_level=None,
-        admin_user_id: Optional[str] = None
+        admin_user_id: Optional[str] = None,
+        usage_logging: bool = False
     ):
 
         
         self.base_directory = os.path.abspath(base_directory)
+        self._usage_logging_enabled = bool(usage_logging)
         
         description_mode = (
             isinstance(config, str)
@@ -2551,6 +2554,12 @@ class AgentSystemManager:
             if getattr(self, "files_folder", None) is None:
                 self.files_folder = os.path.join(self.base_directory, "files")
         os.makedirs(self.files_folder, exist_ok=True)
+
+        if self._usage_logging_enabled:
+            self.logs_folder = os.path.join(self.base_directory, "logs")
+            os.makedirs(self.logs_folder, exist_ok=True)
+            self._usage_log_path   = os.path.join(self.logs_folder, "usage.log")
+            self._summary_log_path = os.path.join(self.logs_folder, "summary.log")
 
 
     def _bootstrap_from_description(self, *, description: str,
@@ -2909,12 +2918,169 @@ class AgentSystemManager:
     def _price_for_tool(self, tool_name: str):
         return self.costs.get("tools", {}).get(tool_name, {}).get("per_call", 0.0)
 
+    def _price_for_stt(self, provider: str, model: str):
+        return (
+            self.costs.get("stt", {})           # top-level bucket
+                    .get(provider.lower(), {})
+                    .get(model, {})
+                    .get("per_minute", 0.0)    # $ per audio minute
+        )
+    
+    def _log_stt_call(self,
+                      provider: str,
+                      model: str,
+                      seconds: float,
+                      transcription: str):
+        usd = round(self._price_for_stt(provider, model) *
+                    (seconds / 60.0), 10)      # pro-rate by duration
+
+        blocks = self._to_blocks({"transcription": transcription},
+                                 user_id=self._active_user_id())
+        blocks[0].setdefault("metadata", {})
+        md = blocks[0]["metadata"]
+        md["usd_cost"] = usd
+        md["seconds"]  = seconds
+
+        self._save_message(
+            self._get_user_db(),
+            role   = f"stt_{provider.lower()}",
+            content= blocks,
+            type   = "tool",
+            model  = f"stt:{provider}:{model}"
+        )
+
     def cost_model_call(self, provider, model, in_tokens, out_tokens):
         in_pp, out_pp = self._price_for_model(provider, model)
         return round(in_tokens * in_pp + out_tokens * out_pp, 10)
 
     def cost_tool_call(self, tool_name):
         return self._price_for_tool(tool_name)
+    
+    def _now_iso(self):
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _write_usage_entry(self, entry: dict, force_summary: bool = False):
+        """Append one JSON-line to usage.log and regenerate the summary."""
+        entry["ts"] = self._now_iso()
+        with open(self._usage_log_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        lines_since = getattr(self, "_lines_since_refresh", 0) + 1
+        self._lines_since_refresh = lines_since
+
+        if force_summary or lines_since >= 100:
+            self._refresh_cost_summary()
+            self._lines_since_refresh = 0
+
+    def _iter_usage_rows(self):
+        if not os.path.isfile(self._usage_log_path):
+            return
+        with open(self._usage_log_path, encoding="utf-8") as fp:
+            for line in fp:
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    continue
+
+    def _bucket_for(self, ts_iso, span):
+        """Return True if timestamp is inside the given window span."""
+        ts = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        delta = now - ts
+        return {
+            "minute":  delta.total_seconds() <= 60,
+            "hour":    delta.total_seconds() <= 3600,
+            "day":     delta.total_seconds() <= 86400,
+            "week":    delta.total_seconds() <= 604800,
+            "month":   delta.total_seconds() <= 2_592_000,   # 30d
+            "year":    delta.total_seconds() <= 31_536_000   # 365d
+        }[span]
+
+    def _refresh_cost_summary(self):
+        """Recompute aggregates and overwrite summary.log."""
+        spans = ["minute", "hour", "day", "week", "month", "year", "lifetime"]
+        agg   = {s: collections.defaultdict(lambda: {
+                    "calls":0, "input_tokens":0, "output_tokens":0,
+                    "seconds":0, "usd_cost":0.0}) for s in spans}
+
+        for row in self._iter_usage_rows():
+            for span in spans:
+                if span == "lifetime" or self._bucket_for(row["ts"], span):
+                    key = row["id"]        # provider:model  OR  tool_name  OR  stt_model
+                    bucket = agg[span][key]
+                    bucket["calls"]         += 1
+                    bucket["usd_cost"]      += row.get("cost", 0.0)
+                    bucket["input_tokens"]  += row.get("in_toks", 0)
+                    bucket["output_tokens"] += row.get("out_toks", 0)
+                    bucket["seconds"]       += row.get("seconds", 0)
+
+        # totals & per-user averages
+        summary = {}
+        for span, data in agg.items():
+            total_cost = sum(v["usd_cost"] for v in data.values())
+            users      = {row["user"] for row in self._iter_usage_rows()
+                        if span == "lifetime" or self._bucket_for(row["ts"], span)}
+            avg_per_user = total_cost / max(len(users), 1)
+
+            summary[span] = {
+                "overall_cost": round(total_cost, 6),
+                "avg_cost_per_user": round(avg_per_user, 6),
+                "by_id": {k: {**v, "usd_cost": round(v["usd_cost"], 6)} for k, v in data.items()}
+            }
+
+        with open(self._summary_log_path, "w", encoding="utf-8") as fp:
+            json.dump(summary, fp, indent=2, ensure_ascii=False)
+
+    def _log_if_enabled(self, entry: dict):
+        if self._usage_logging_enabled:
+            self._write_usage_entry(entry)
+
+    def get_cost_report(self, span="lifetime", user=None, model_or_tool=None):
+        """
+        Return an in-memory dict with the same structure that lives in summary.log.
+        Optional filters:
+            span            one of minute/hour/day/week/month/year/lifetime
+            user            restrict to a single user_id
+            model_or_tool   restrict to a single id (provider:model, toolname, stt-model)
+        """
+        if not os.path.isfile(self._summary_log_path):
+            self._refresh_cost_summary()
+        with open(self._summary_log_path, encoding="utf-8") as fp:
+            data = json.load(fp)
+        span_data = data.get(span, {})
+        if user or model_or_tool:
+            # build filtered ad-hoc from raw lines
+            result = {"overall_cost": 0, "avg_cost_per_user": 0, "by_id": {}}
+            users_set = set()
+            for row in self._iter_usage_rows():
+                if span != "lifetime" and not self._bucket_for(row["ts"], span):
+                    continue
+                if user and row["user"] != str(user):
+                    continue
+                if model_or_tool and row["id"] != model_or_tool:
+                    continue
+                bucket = result["by_id"].setdefault(row["id"], {
+                    "calls":0,"input_tokens":0,"output_tokens":0,"seconds":0,"usd_cost":0.0})
+                bucket["calls"]        += 1
+                bucket["usd_cost"]     += row.get("cost", 0.0)
+                bucket["input_tokens"] += row.get("in_toks", 0)
+                bucket["output_tokens"]+= row.get("out_toks",0)
+                bucket["seconds"]      += row.get("seconds",0)
+                result["overall_cost"] += row.get("cost", 0.0)
+                users_set.add(row["user"])
+            if users_set:
+                result["avg_cost_per_user"] = round(result["overall_cost"]/len(users_set),6)
+            result["overall_cost"] = round(result["overall_cost"],6)
+            for v in result["by_id"].values():
+                v["usd_cost"] = round(v["usd_cost"],6)
+            return result
+        return span_data
+
+
+
+
+
+
 
     def _get_db_path_for_user(self, user_id: str) -> str:
         return os.path.join(self.history_folder, f"{user_id}.sqlite")
@@ -3118,6 +3284,20 @@ class AgentSystemManager:
             model_str
         )
 
+        meta = self._extract_metadata_from_blocks(output_value)
+        if not meta:
+            return                                      # nada que loggear
+
+        entry = {
+            "user":   self._active_user_id(),
+            "type":   component_type,                   # "agent" | "tool" | …
+            "id":     model_str or save_role,           # p.e.  "openai:gpt-4o"
+            "in_toks":  meta.get("input_tokens", 0),
+            "out_toks": meta.get("output_tokens", 0),
+            "seconds": meta.get("seconds", 0),          # STT deja esto en 0
+            "cost":    meta.get("usd_cost", 0.0)
+        }
+        self._log_if_enabled(entry)
         
     def _dict_to_json_with_file_persistence(self, data: dict, user_id: str) -> str:
         """
@@ -3774,6 +3954,7 @@ class AgentSystemManager:
                     on_update(self.get_messages(user_id), self)
 
         self._save_component_output(db_conn, comp, output_dict, verbose=verbose)
+        self._refresh_cost_summary()
         return output_dict
 
 
@@ -3916,6 +4097,7 @@ class AgentSystemManager:
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
         self.include_timestamp = general_params.get("include_timestamp", False)
+        self._usage_logging_enabled  = general_params.get("usage_logging", self._usage_logging_enabled)
         self.timezone = general_params.get("timezone", 'UTC')
 
         admin_from_cfg = general_params.get("admin_user_id", None)
@@ -5114,39 +5296,105 @@ class AgentSystemManager:
 
 
     def stt(self, file_path, provider=None, model=None):
-        # Determine which provider to use
         if provider:
             provider = provider.lower()
         else:
-            # Auto-detect provider based on available keys
-            if self.get_key("groq"):
-                provider = "groq"
-            elif self.get_key("openai"):
-                provider = "openai"
-            else:
-                raise ValueError("No supported speech-to-text API keys found")
+            provider = ("groq" if self.get_key("groq")
+                        else "openai" if self.get_key("openai")
+                        else None)
+        if not provider:
+            raise ValueError("No supported STT provider API key found")
 
-        # Set default model if not specified
         if not model:
             model = {
-                "groq": "whisper-large-v3-turbo",
+                "groq":  "whisper-large-v3-turbo",
                 "openai": "whisper-1"
-            }.get(provider)
+            }[provider]
 
         if isinstance(file_path, str) and file_path.startswith("file:"):
             file_path = file_path[5:]
 
-        # Read audio file
-        try:
-            with open(file_path, "rb") as audio_file:
-                if provider == "groq":
-                    return self._transcribe_groq(audio_file, model)
-                elif provider == "openai":
-                    return self._transcribe_openai(audio_file, model)
-                else:
-                    raise ValueError(f"Unsupported provider: {provider}")
-        except OSError as e:
-            logger.error(f"Error reading audio file at {file_path}: {e}")
+        def _audio_duration_sec(path: str):
+            """
+            Return length in seconds for *any* common audio file.
+            Strategy:
+            1) .wav/.wave → use Python's wave module (no deps)
+            2) If FFmpeg/ffprobe present → use it (handles mp3, ogg, m4a…)
+            3) If mutagen installed → use it
+            4) Give up → None  (caller decides fallback price)
+
+            Works with absolute paths or our internal 'file:...' refs.
+            """
+            import os, subprocess, json
+
+            if path.startswith("file:"):
+                path = path[5:]
+
+            if not os.path.isfile(path):
+                return None
+
+            # --- 1 · plain WAV via stdlib ------------------------------------
+            ext = os.path.splitext(path)[1].lower()
+            if ext in (".wav", ".wave"):
+                import wave
+                with wave.open(path, "rb") as w:
+                    return w.getnframes() / w.getframerate()
+
+            # --- 2 · ffprobe if available -----------------------------------
+            try:
+                ffprobe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "format=duration", "-of", "json", path],
+                    capture_output=True, text=True, timeout=5)
+                if ffprobe.returncode == 0:
+                    j = json.loads(ffprobe.stdout)
+                    dur = float(j["format"]["duration"])
+                    if dur > 0:
+                        return dur
+            except Exception:
+                pass
+
+            # --- 3 · mutagen fallback (pure-python) -------------------------
+            try:
+                from mutagen import File as mutagen_file
+                m = mutagen_file(path)
+                if m is not None and m.info.length:
+                    return float(m.info.length)
+            except Exception:
+                pass
+
+            # couldn't figure it out
+            return None
+
+
+        seconds = _audio_duration_sec(file_path) or 60.0   # flat 1-min if unknown
+
+        # 3) call the real HTTP endpoint
+        with open(file_path, "rb") as audio_file:
+            if provider == "groq":
+                transcript = self._transcribe_groq(audio_file, model)
+            elif provider == "openai":
+                transcript = self._transcribe_openai(audio_file, model)
+            else:
+                raise ValueError(f"Unsupported provider: {provider}")
+
+        # 4) log the cost so get_usage_stats() can see it
+        self._log_stt_call(provider, model, seconds, transcript)
+
+        rate_pm = self._price_for_stt(provider, model)
+        cost    = round(rate_pm * (seconds / 60.0), 6)
+
+        self._log_if_enabled({
+            "user":  self._active_user_id(),
+            "type":  "stt",
+            "id":    f"{provider}:{model}",
+            "seconds": seconds,
+            "in_toks": 0,
+            "out_toks": 0,
+            "cost":  cost
+        })
+
+        return transcript
 
     def _transcribe_groq(self, audio_file, model):
         api_key = self.get_key("groq")
