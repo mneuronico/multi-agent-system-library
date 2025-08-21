@@ -5138,6 +5138,27 @@ class AgentSystemManager:
             r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
             log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "audio", r.status_code, to)
 
+        def _send_document(to: str, path: str, filename: str, caption: str):
+            import mimetypes
+            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            mid  = _upload_media(path, mime)
+            if not mid:
+                return
+            doc = {"id": mid}
+            if filename:
+                doc["filename"] = filename
+            if caption:
+                doc["caption"] = caption
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "document",
+                "document": doc
+            }
+            r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
+            log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "document", r.status_code, to)
+
+
         # ───────────── MAS blocks → WhatsApp messages ────────────────────
         def blocks_to_whatsapp(to: str, blocks: list[dict]):
             for blk in blocks:
@@ -5242,6 +5263,42 @@ class AgentSystemManager:
                     except Exception as e:
                         logger.exception("Error en /reset_system:", exc_info=e)
                         _send_text(wa_id, "Ocurrió un error al resetear el sistema.")
+                    return
+                if body.lower() == "/logs":
+                    if not self.admin_user_id:
+                        _send_text(wa_id, "Comando deshabilitado: no hay admin configurado.")
+                        return
+                    if str(wa_id) != str(self.admin_user_id):
+                        _send_text(wa_id, "No autorizado.")
+                        return
+
+                    logs_dir = getattr(self, "logs_folder", None)
+                    if not logs_dir:
+                        _send_text(wa_id, "usage_logging está deshabilitado.")
+                        return
+
+                    usage_p = os.path.join(logs_dir, "usage.log")
+                    summary_p = os.path.join(logs_dir, "summary.log")
+
+                    # Refresca summary si corresponde
+                    if getattr(self, "_usage_logging_enabled", False):
+                        try:
+                            self._refresh_cost_summary()
+                        except Exception:
+                            pass
+
+                    sent = 0
+                    if os.path.isfile(usage_p):
+                        _send_document(wa_id, usage_p, filename="usage.log")
+                        sent += 1
+                    if os.path.isfile(summary_p):
+                        _send_document(wa_id, summary_p, filename="summary.json")
+                        sent += 1
+
+                    if sent == 0:
+                        _send_text(wa_id, "No hay logs para enviar.")
+                    else:
+                        _send_text(wa_id, f"Enviados {sent} archivo(s) de logs.")
                     return
 
 
