@@ -5138,11 +5138,15 @@ class AgentSystemManager:
             r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
             log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "audio", r.status_code, to)
 
-        def _send_document(to: str, path: str, filename: str, caption: str):
-            import mimetypes
+        def _send_document(to: str, path: str, filename: Optional[str] = None, caption: Optional[str] = None):
+            import os, mimetypes
             mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            if not os.path.isfile(path):
+                log.error("[Whatsapp Bot] document not found: %s", path)
+                return
             mid  = _upload_media(path, mime)
             if not mid:
+                log.error("[Whatsapp Bot] media upload failed for: %s", path)
                 return
             doc = {"id": mid}
             if filename:
