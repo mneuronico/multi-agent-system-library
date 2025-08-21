@@ -17,7 +17,7 @@ import tempfile
 import requests
 from dotenv import load_dotenv
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import imghdr, mimetypes, shutil
 from importlib import resources
 import logging
@@ -33,10 +33,26 @@ except ImportError:
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+
 if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
     _h = logging.StreamHandler()
     _h.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(_h)
+
+
+MESSAGE_MAX_AGE_SEC = 120 
+
+def _is_too_old(msg_dt, *, max_age=MESSAGE_MAX_AGE_SEC) -> bool:
+    """
+    Return True iff *msg_dt* (a datetime) is older than *max_age* seconds.
+    Works with naïve or TZ-aware UTC datetimes.
+    """
+    if not isinstance(msg_dt, datetime):
+        return False
+    if msg_dt.tzinfo is None:
+        msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - msg_dt) > timedelta(seconds=max_age)
+
 
 def get_readme(owner: str, repo: str, branch: str = None,
                token: str = None) -> str:
@@ -4958,6 +4974,10 @@ class AgentSystemManager:
             await handle_system_text(update, text)
 
         async def handle_system_text(update: Update, input, file_ref=None):
+            if _is_too_old(update.message.date):
+                logging.getLogger(__name__).debug("[Whatsapp Bot] Message ignored because it is too old.")
+                return
+            
             params = {
                 "update": update,
                 "event_loop": asyncio.get_running_loop(),
@@ -5177,6 +5197,16 @@ class AgentSystemManager:
             blocks = []
 
             log.debug("[Whatsapp Bot] HANDLE %s id=%s from=%s", mtype, msg.get('id'), wa_id)
+
+            # ⏰ timeout check
+            try:
+                msg_epoch = int(msg.get("timestamp", "0"))
+            except ValueError:
+                msg_epoch = 0
+            msg_dt = datetime.fromtimestamp(msg_epoch, timezone.utc)
+            if _is_too_old(msg_dt):
+                log.debug("[Whatsapp Bot] Message ignored because it is too old.")
+                return
             
 
             # ── text / commands ───────────────────────────────────────────
