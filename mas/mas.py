@@ -4908,8 +4908,8 @@ class AgentSystemManager:
             update = params["update"]
             loop = params["event_loop"]
 
-            def callback():
-                asyncio.create_task(send_telegram_response(update, blocks))
+            def callback(_upd=update, _blks=blocks):
+                asyncio.create_task(send_telegram_response(_upd, _blks))
 
             loop.call_soon_threadsafe(callback)
 
@@ -4927,8 +4927,8 @@ class AgentSystemManager:
             update = params["update"]
             loop = params["event_loop"]
 
-            def callback():
-                asyncio.create_task(send_telegram_response(update, blocks))
+            def callback(_upd=update, _blks=blocks):
+                asyncio.create_task(send_telegram_response(_upd, _blks))
 
             loop.call_soon_threadsafe(callback)
 
@@ -5289,22 +5289,21 @@ class AgentSystemManager:
                 return
 
             # ── runner callbacks ─────────────────────────────────────────
-            cb_params = {"wa_id": wa_id}
 
-            def _cb_update(messages, manager, params=None):
+            def _cb_update(messages, manager, params=None, _wa_id=wa_id):
                 if on_update:
-                    custom = on_update(messages, manager, cb_params)
+                    custom = on_update(messages, manager, params)
                     if custom is not None:
-                        blocks_to_whatsapp(wa_id, manager._to_blocks(custom, user_id=wa_id))
+                        blocks_to_whatsapp(_wa_id, manager._to_blocks(custom, user_id=_wa_id))
 
-            def _cb_complete(messages, manager, params=None):
+            def _cb_complete(messages, manager, params=None, _wa_id=wa_id):
                 if on_complete:
-                    custom = on_complete(messages, manager, cb_params)
+                    custom = on_complete(messages, manager, params)
                     if custom is not None:
-                        blocks_to_whatsapp(wa_id, manager._to_blocks(custom, user_id=wa_id))
+                        blocks_to_whatsapp(_wa_id, manager._to_blocks(custom, user_id=_wa_id))
                         return
                 elif messages:
-                    blocks_to_whatsapp(wa_id, messages[-1]["message"])
+                    blocks_to_whatsapp(_wa_id, messages[-1]["message"])
 
             # ── run MAS (thread keeps webhook snappy) ─────────────────────
             def _run():
