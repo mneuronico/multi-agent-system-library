@@ -3954,7 +3954,10 @@ class AgentSystemManager:
                     on_update(self.get_messages(user_id), self)
 
         self._save_component_output(db_conn, comp, output_dict, verbose=verbose)
-        self._refresh_cost_summary()
+
+        if self._usage_logging_enabled:
+            self._refresh_cost_summary()
+
         return output_dict
 
 
