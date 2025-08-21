@@ -253,7 +253,7 @@ class Agent(Component):
                     response_dict = {"response": response_str}
 
                 response_blocks = self.manager._to_blocks(
-                    response_dict, self.manager._current_user_id
+                    response_dict, self.manager._active_user_id()
                 )
 
                 self._last_used_model = {"provider": provider, "model": model_name}
@@ -2060,9 +2060,9 @@ class Automation(Component):
 
             if on_update:
                 if on_update_params:
-                    on_update(self.manager.get_messages(self.manager._current_user_id), self.manager, on_update_params)
+                    on_update(self.manager.get_messages(self.manager._active_user_id()), self.manager, on_update_params)
                 else:
-                    on_update(self.manager.get_messages(self.manager._current_user_id), self.manager)
+                    on_update(self.manager.get_messages(self.manager._active_user_id()), self.manager)
             return step_output
 
         elif isinstance(step, dict):
@@ -2474,9 +2474,6 @@ class AgentSystemManager:
         if log_level is not None:
             logger.setLevel(log_level)
 
-        self._current_user_id: Optional[str] = None
-        self._current_db_conn: Optional[sqlite3.Connection] = None
-
         self._file_cache = {}
         self._component_order: List[str] = []
 
@@ -2722,6 +2719,10 @@ class AgentSystemManager:
         for import_str in self.imports:
             self._process_single_import(import_str)
 
+    def _uid(self):
+        """User-id vigente para *este* hilo (o None)."""
+        return getattr(self._tls, "current_user_id", None)
+    
     def _process_single_import(self, import_str: str):
         if import_str in self._processed_imports:
             return
@@ -2871,7 +2872,7 @@ class AgentSystemManager:
         return (
             f"AgentSystemManager(\n"
             f"  Base Directory: {self.base_directory}\n"
-            f"  Current User ID: {self._current_user_id}\n"
+            f"  Current User ID: {self._uid()}\n"
             f"  General System Description: {self.general_system_description}\n\n"
             f"Components:\n"
             f"{components_summary}\n"
@@ -3124,7 +3125,7 @@ class AgentSystemManager:
     def _active_user_id(self) -> Optional[str]:
         if hasattr(self, "_tls") and getattr(self._tls, "current_user_id", None):
             return self._tls.current_user_id
-        return getattr(self, "_current_user_id", None)
+        return None
 
     
     def export_history(self, user_id: str) -> bytes:
@@ -3182,15 +3183,18 @@ class AgentSystemManager:
     
 
     def set_current_user(self, user_id: str):
-        self._current_user_id = str(user_id)
-        # Thread-local holder (no requiere tocar __init__)
+        user_id = str(user_id)
+
         if not hasattr(self, "_tls"):
             self._tls = threading.local()
-        # Conexión por usuario (reutilizable)
-        conn = self._ensure_user_db(self._current_user_id)
-        # Fija el contexto SOLO para este hilo
-        self._tls.current_user_id = self._current_user_id
-        self._tls.db_conn = conn
+
+        # Si el hilo ya estaba usando ese mismo usuario, nada que hacer
+        if getattr(self._tls, "current_user_id", None) == user_id:
+            return
+
+        # Conexión sqlite específica de ese usuario
+        self._tls.current_user_id = user_id
+        self._tls.db_conn         = self._ensure_user_db(user_id)
 
 
     def ensure_user(self, user_id: Optional[str] = None) -> None:
@@ -3211,11 +3215,7 @@ class AgentSystemManager:
         conn = getattr(self._tls, "db_conn", None)
         if conn is not None:
             return conn
-        # Fallback: si hay un _current_user_id global, úsalo para este hilo
-        if getattr(self, "_current_user_id", None):
-            self.set_current_user(self._current_user_id)
-            return self._tls.db_conn
-        # Como último recurso, crea usuario para este hilo
+
         self.ensure_user()
         return self._tls.db_conn
 
@@ -3229,10 +3229,10 @@ class AgentSystemManager:
     def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict, list], type="user", model: Optional[str] = None):
         timestamp = datetime.now(self.timezone).isoformat()
 
-        content = self._to_blocks(content, user_id=self._current_user_id)
+        content = self._to_blocks(content, user_id=self._uid())
         if isinstance(content, (dict, list)):
             content_str = json.dumps(
-                self._persist_non_json_values(content, self._current_user_id),
+                self._persist_non_json_values(content, self._uid()),
                 indent=2, ensure_ascii=False
             )
         else:
@@ -3478,7 +3478,7 @@ class AgentSystemManager:
 
         conn = self._get_user_db()
         rows = self._get_all_messages(conn, include_model = True)
-        logger.info(f"=== Message History for user [{self._current_user_id}] ===")
+        logger.info(f"=== Message History for user [{self._uid()}] ===")
         for i, (role, content, msg_number, msg_type, model, timestamp) in enumerate(rows, start=1):
             model_str = f" ({model})" if model else ""
             role_str = f"{msg_number}. {msg_type} - {role}{model_str}" if role != "user" else f"{msg_number}. {role}{model_str}"
@@ -3880,7 +3880,7 @@ class AgentSystemManager:
 
         if user_id:
             self.set_current_user(user_id)
-        elif not self._current_user_id:
+        elif not self._uid():
             new_user = str(uuid.uuid4())
             self.set_current_user(new_user)
 
@@ -4002,14 +4002,14 @@ class AgentSystemManager:
         on_update = on_update or self.on_update
         on_complete = on_complete or self.on_complete
 
-        run_user_id = user_id or self._current_user_id
+        run_user_id = user_id or self._uid()
         if not run_user_id:
             # Si todavía no hay usuario, créalo y establécelo ahora.
             run_user_id = str(uuid.uuid4())
             self.set_current_user(run_user_id)
 
         if return_token_count and blocking:
-            _uid = user_id or self._current_user_id
+            _uid = user_id or self._uid()
             prev_usage = self.get_usage_stats(_uid)
         else:
             prev_usage = None
@@ -4038,7 +4038,7 @@ class AgentSystemManager:
             final_blocks = json.loads(last_content_str)
 
             if return_token_count and prev_usage is not None:
-                _uid = user_id or self._current_user_id
+                _uid = user_id or self._uid()
                 post_usage = self.get_usage_stats(_uid)
 
                 delta_in   = post_usage["models"]["overall"]["input_tokens"]   - prev_usage["models"]["overall"]["input_tokens"]
@@ -4439,7 +4439,7 @@ class AgentSystemManager:
         if user_id is not None:
             self.set_current_user(user_id)
 
-        if not self._current_user_id:
+        if not self._uid():
             logger.warning("No user ID provided or set. Message history not cleared.")
             return
 
@@ -4447,7 +4447,7 @@ class AgentSystemManager:
         cur = conn.cursor()
         cur.execute("DELETE FROM message_history")
         conn.commit()
-        logger.info(f"Message history cleared for user ID: {self._current_user_id}")
+        logger.info(f"Message history cleared for user ID: {self._uid()}")
 
     def clear_global_history(self) -> int:
         """
@@ -4541,7 +4541,7 @@ class AgentSystemManager:
     def _to_blocks(self, value, user_id=None, detail="auto"):
         # Aseguramos user_id para guardar archivos cuando haga falta
         self.ensure_user(user_id)
-        user_id = user_id or self._current_user_id
+        user_id = user_id or self._uid()
 
         # 1) lista de bloques válida
         if isinstance(value, list) and value and all(self._is_block(b) for b in value):
@@ -5586,7 +5586,7 @@ class AgentSystemManager:
         """
         tts_folder = os.path.join(self.files_folder, "tts")
         os.makedirs(tts_folder, exist_ok=True)
-        uid = str(self._active_user_id() or self._current_user_id or "unknown")
+        uid = str(self._active_user_id() or self._uid() or "unknown")
         filename = f"{uid}_{uuid.uuid4().hex}.mp3"
         file_path = os.path.join(tts_folder, filename)
         with open(file_path, "wb") as f:
