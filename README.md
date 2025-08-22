@@ -160,7 +160,7 @@ The manager will:
 
 1.  Read this very README to learn about the MAS framework.  
 2.  Spin up an *internal* agent called **`system_writer`** (running on the best
-    available model chain – `o3`, `gemini-2.5-pro`, `claude-4`, `deepseek-r1`,
+    available model chain – `o3`, `gemini-2.5-pro`, `deepseek-r1`, `claude-4`,
     `llama-4@groq`).
 3.  Ask that agent to turn your description into:
     * `general_parameters`
@@ -427,8 +427,7 @@ You can accomplish the same thing when defining the system from a JSON file:
             {"provider": "groq", "model": "llama-3.3-70b-versatile"}
         ],
     "imports": [
-        "common_tools.json",
-        "external_agents.json->research_agent+analysis_tool"
+        "common_tools.json"
     ],
     "on_update": "fn:on_update_function", 
     "on_complete": "fn:on_complete_function",
@@ -1592,24 +1591,28 @@ This allows for simple text replies or complex, multi-part responses with images
 ```python
 # fns.py
 def my_on_complete(messages, manager, on_complete_params):
-    # El wrapper devuelto por manager.get_messages() → último mensaje real
-    blocks = messages[-1]["message"]      # List[Block]
+    blocks = messages[-1]["message"]  # List[Block]
 
     summary_text = None
-    image_path   = None
+    image_path = None
 
-    # 1. Buscar el primer bloque de texto y parsear su JSON
+    # 1. Buscar el primer bloque de texto y obtener sus datos
     for block in blocks:
-        if block["type"] == "text":
-            try:
-                payload = json.loads(block["content"])
-            except (json.JSONDecodeError, TypeError):
-                payload = {}
-            summary_text = payload.get("summary")
-            image_path   = payload.get("image_path")
-            break        # el dict siempre está en el primer text-block
+        if block.get("type") == "text":
+            content = block.get("content", {})
+            # El contenido puede ser un dict directamente o un string JSON
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    content = {"response": content} # Tratar como texto plano si no es JSON
+            
+            if isinstance(content, dict):
+                summary_text = content.get("summary")
+                image_path = content.get("image_path")
+            break # El diccionario principal suele estar en el primer bloque de texto
 
-    # 2. Construir la respuesta en formato bloque
+    # 2. Construir la respuesta usando el formato de bloque correcto
     response_blocks = []
     if summary_text:
         response_blocks.append({
