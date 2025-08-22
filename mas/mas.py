@@ -4507,14 +4507,29 @@ class AgentSystemManager:
             shutil.rmtree(self.files_folder, ignore_errors=True)
         except Exception:
             logger.exception("Failed to remove files folder.")
+        # Borra logs (si existen)
+        try:
+            if hasattr(self, "logs_folder") and self.logs_folder:
+                shutil.rmtree(self.logs_folder, ignore_errors=True)
+        except Exception:
+            logger.exception("Failed to remove logs folder.")
+
         # Recrea carpetas
         os.makedirs(self.history_folder, exist_ok=True)
         os.makedirs(self.files_folder, exist_ok=True)
+        if hasattr(self, "logs_folder") and self.logs_folder:
+            os.makedirs(self.logs_folder, exist_ok=True)
+            # reestablece rutas (por si cambió logs_folder)
+            self._usage_log_path   = os.path.join(self.logs_folder, "usage.log")
+            self._summary_log_path = os.path.join(self.logs_folder, "summary.log")
+            # limpia contador interno
+            if hasattr(self, "_lines_since_refresh"):
+                self._lines_since_refresh = 0
         # Limpia caches internas
         if hasattr(self, "_db_pool"):
             self._db_pool.clear()
         self._file_cache = {}
-        logger.info("[Manager] System reset completed (history/ and files/ wiped).")
+        logger.info("[Manager] System reset completed (history/, files/, logs/ wiped).")
 
 
     def escape_markdown(self, text: str) -> str:
@@ -4967,6 +4982,46 @@ class AgentSystemManager:
                 logger.exception("Error en /reset_system:", exc_info=e)
                 await update.message.reply_text("Ocurrió un error al resetear el sistema.")
 
+        async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            # Solo admin
+            if not self.admin_user_id:
+                await update.message.reply_text("Comando deshabilitado: no hay admin configurado.")
+                return
+            if str(update.message.chat.id) != str(self.admin_user_id):
+                print(update.message.chat.id, self.admin_user_id)
+                await update.message.reply_text("No autorizado.")
+                return
+
+            logs_dir = getattr(self, "logs_folder", None)
+            if not logs_dir:
+                await update.message.reply_text("usage_logging está deshabilitado.")
+                return
+
+            usage_p = os.path.join(logs_dir, "usage.log")
+            summary_p = os.path.join(logs_dir, "summary.log")
+
+            # Refresca summary por las dudas
+            if getattr(self, "_usage_logging_enabled", False):
+                try:
+                    self._refresh_cost_summary()
+                except Exception:
+                    pass
+
+            sent_any = False
+            if os.path.isfile(usage_p):
+                with open(usage_p, "rb") as fp:
+                    await update.message.reply_document(fp, filename="usage.log")
+                sent_any = True
+            if os.path.isfile(summary_p):
+                with open(summary_p, "rb") as fp:
+                    # lo mandamos como summary.json para que el cliente lo trate como JSON
+                    await update.message.reply_document(fp, filename="summary.json")
+                sent_any = True
+
+            if not sent_any:
+                await update.message.reply_text("No hay logs para enviar.")
+
+
 
         async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """Handle direct text input from user"""
@@ -5014,6 +5069,7 @@ class AgentSystemManager:
         application.add_handler(CommandHandler("clear", clear))
         application.add_handler(CommandHandler("clear_all_users", clear_all_users))
         application.add_handler(CommandHandler("reset_system", reset_system_cmd))
+        application.add_handler(CommandHandler("logs", logs_cmd))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text))
         application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
         application.add_handler(MessageHandler(filters.VOICE, handle_audio))
