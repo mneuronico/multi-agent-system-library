@@ -15,7 +15,7 @@ The `mas` library is a powerful and flexible framework designed for creating and
 ### Why Choose the `mas` Library?
 
 - **Minimal Setup**: Define agents, tools, and workflows using JSON configurations or Python scripts. Start with simple setups and expand as needed.
-- **Seamless LLM Integration**: Manage interactions with multiple LLM providers (e.g., OpenAI, Google, Groq) without adapting your code or message history for each one.
+- **Seamless LLM Integration**: Manage interactions with multiple LLM providers (e.g., OpenAI, Google, Groq, Anthropic, DeepSeek, and local models via LM Studio) without adapting your code or message history for each one.
 - **Automated System Prompts**: Automatically generate and manage system prompts to reduce the need for complex prompt engineering, ensuring consistent and reliable agent behavior.
 - **Error-Tolerant JSON Parsing**: Includes a robust JSON parser that can recognize and correct malformed JSON structures, even when LLMs produce imperfect outputs.
 - **Scalability**: Add or modify components like agents, tools, and processes, expanding the capabilities of a system with minimal refactoring.
@@ -318,7 +318,7 @@ Different components access data from the block system in different ways, tailor
     4.  If it's not a valid JSON dictionary, the raw string is passed in a `{"text_content": "..."}` wrapper.
     *This means tools cannot directly process images or audio; they must be triggered by an agent that has analyzed the media and produced a structured `text` block as output.*
 
--   **Processes**: Processes receive the most comprehensive input: a list of full message objects (`{"source": ..., "message": ..., ...}`). The `message` key within each object contains the complete `List[Block]` for that historical entry, giving the process full access to all past data in its original, structured form.
+-   **Processes**: Processes receive the most comprehensive input: a list of full message objects (`{"content": ..., "message": ..., ...}`). The `message` key within each object contains the complete `List[Block]` for that historical entry, giving the process full access to all past data in its original, structured form.
 
 ### Roles
 
@@ -360,24 +360,23 @@ from mas import AgentSystemManager
 import logging # only necessary if it is required to set a specific log level
 
 manager = AgentSystemManager(
-    config="config.json" # Defaults to config.json in your base directory
-    base_directory="path/to/your/base_dir",  # Default is the current working directory.
-    history_folder="path/to/your/history_folder", # defaults to <base_directory>/history
-    files_folder="path/to/your/files_folder", # defaults to <base_directory>/files
-    api_keys_path="path/to/your/api_keys.env",  # Default is .env
-    costs_path="path/to/your/costs.json", # default is costs.json in the base dir
-    general_system_description="This is a description for the overall system.", # Default: "This is a multi agent system."
-    functions="my_fns_file.py", # Default: "fns.py"
+    config="config.json",
+    base_directory="path/to/your/base_dir",
+    history_folder="path/to/your/history_folder",
+    files_folder="path/to/your/files_folder",
+    api_keys_path="path/to/your/api_keys.env",
+    costs_path="path/to/your/costs.json",
+    general_system_description="A description for the overall system.",
+    functions="my_fns_file.py",
     default_models=[{"provider": "groq", "model": "llama-3.1-8b-instant"}],
-    imports=[
-        "common_tools.json",  # Import all components from file
-        "external_agents.json?[research_agent, analysis_tool]"  # Import specific components
-    ],
-    on_update=on_update, # Default: none
-    on_complete=on_complete, # Default: none
-    include_timestamp=False, # Default is False
-    timezone="UTC" # Default is UTC,
-    log_level=logging.INFO # Default is logging.DEBUG
+    imports=["common_tools.json"],
+    on_update=on_update,
+    on_complete=on_complete,
+    include_timestamp=False,
+    timezone="UTC",
+    log_level=logging.INFO,
+    admin_user_id="your_telegram_or_whatsapp_id",
+    usage_logging=False
 )
 ```
 
@@ -398,6 +397,8 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 -   **`include_timestamp`**: Whether the agents receive the `timestamp` for each message in the conversation history. False by default. This is overriden by the `include_timestamp` parameter associated with each agent, if specified. 
 -   **`timezone`**: String defining what timezone should the `timestamp` information be saved in. Defaults to `UTC`.
 -   **`log_level`**: Logging level for the library. Defaults to `logging.DEBUG`.
+-   **`admin_user_id`**: A specific user ID (e.g., your Telegram chat ID) granted access to administrative commands.
+-   **`usage_logging`**: If `True`, enables the persistent usage and cost logging system. Defaults to `False`.
 
 `on_update` and `on_complete` can be defined as callables directly, or they can be strings referring to the name of the function to use, located in one of the `functions` files. To accomplish this, _function syntax_ must be used.
 
@@ -1435,6 +1436,30 @@ Create a `costs.json` file in your `base_directory` with the following structure
 *   **`models`**: Prices are nested by `provider` and then `model` name. Prices should be specified per million tokens (`input_per_1m` and `output_per_1m`).
 *   **`tools`**: Prices are specified per execution (`per_call`).
 
+### Persistent Usage Logging and Reporting
+
+For production environments or detailed analysis, the MAS library provides a persistent usage logging system that tracks every billable API call.
+
+**Enabling Logging:**
+To enable this feature, set `usage_logging=True` when initializing the `AgentSystemManager`. This will create a `logs/` directory in your `base_directory` containing two files:
+
+*   **`usage.log`**: A raw, line-by-line JSON log of every model call, tool call, and STT transcription, including tokens, costs (only for runs where `return_token_count=True`), and timestamps.
+*   **`summary.log`**: An aggregated JSON summary of costs and usage across different time spans (hour, day, week, etc.). This file is updated periodically.
+
+**Reporting with `get_cost_report`:**
+You can programmatically access the aggregated data using the `get_cost_report` method.
+
+#### Method Signature
+```python
+manager.get_cost_report(span="lifetime", user=None, model_or_tool=None) -> dict
+```
+#### Parameters
+*   **`span`** (Optional): The time window for the report. Can be `"minute"`, `"hour"`, `"day"`, `"week"`, `"month"`, `"year"`, or `"lifetime"` (default).
+*   **`user`** (Optional): Filter the report for a specific user ID.
+*   **`model_or_tool`** (Optional): Filter for a specific model (`"openai:gpt-4o"`) or tool (`"my_tool"`).
+
+This method returns a dictionary with the same structure as `summary.log`, allowing for detailed, real-time cost analysis.
+
 
 ### Retrieving Usage Statistics: `get_usage_stats`
 
@@ -1563,7 +1588,7 @@ def my_on_complete(messages, manager, on_complete_params):
     for block in blocks:
         if block["type"] == "text":
             try:
-                payload = json.loads(block["text"])
+                payload = json.loads(block["content"])
             except (json.JSONDecodeError, TypeError):
                 payload = {}
             summary_text = payload.get("summary")
@@ -1575,17 +1600,59 @@ def my_on_complete(messages, manager, on_complete_params):
     if summary_text:
         response_blocks.append({
             "type": "text",
-            "text": summary_text
+            "content": summary_text
         })
 
     if image_path:
         response_blocks.append({
             "type": "image",
-            "source": {"kind": "file", "path": image_path}
+            "content": {"kind": "file", "path": image_path}
         })
 
     return response_blocks
 ```
+
+#### Administrative Commands
+
+If you initialize the `AgentSystemManager` with an `admin_user_id` (e.g., your personal Telegram or WhatsApp chat ID), that user gains access to powerful administrative commands in bot integrations:
+
+*   **/clear\_all\_users**: Clears the message history for **every** user of the bot.
+*   **/reset\_system**: A destructive command that **deletes all data**: all history databases (`history/`), all saved files (`files/`), and all usage logs (`logs/`). Use with caution.
+*   **/logs**: Sends the `usage.log` and `summary.log` files directly to the admin user for inspection.
+
+These commands are protected and can only be executed by the configured admin user.
+
+
+### WhatsApp Integration
+
+The library offers seamless integration with the WhatsApp Cloud API, allowing you to deploy your multi-agent system as a WhatsApp bot. This is handled by the `start_whatsapp_bot` method, which launches a Flask-based web server to handle WhatsApp webhooks.
+
+```python
+manager.start_whatsapp_bot(
+  whatsapp_token=None,
+  phone_number_id=None,
+  webhook_verify_token=None,
+  component_name="my_automation",
+  verbose=False,
+  on_complete=None,
+  on_update=None,
+  speech_to_text=None,
+  host="0.0.0.0",
+  port=5000,
+  base_path="/webhook"
+)
+```
+
+**Parameters:**
+
+*   **`whatsapp_token`**: Your WhatsApp Cloud API access token.
+*   **`phone_number_id`**: The Phone Number ID from your WhatsApp App settings.
+*   **`webhook_verify_token`**: The custom verify token you set up for your webhook.
+    *(These three credentials can be provided directly or sourced from your API keys file/environment variables).*
+*   **`component_name`, `verbose`, `on_complete`, `on_update`, `speech_to_text`**: These parameters function identically to their counterparts in `start_telegram_bot`.
+*   **`host`, `port`, `base_path`**: Standard Flask server configuration for hosting the webhook endpoint.
+
+The WhatsApp bot supports text, images, and audio (voice notes), with automatic STT transcription. It also supports the same administrative commands as the Telegram bot (`/clear`, `/start`, `/clear_all_users`, `/reset_system`, `/logs`), provided an `admin_user_id` is configured in the manager.
 
 
 ## Multimodal Message Support
