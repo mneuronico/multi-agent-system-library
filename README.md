@@ -441,13 +441,27 @@ You can accomplish the same thing when defining the system from a JSON file:
 
 ### Setting the Current User
 
-Each user has its own message history, saved as an isolated SQLite database file (.sqlite). This is important because the exact same system manager, with identical structure, can handle many independent conversation histories seamlessly. To specify the user whose history you want to use, call:
+The `mas` library is designed for multi-user and concurrent applications. To manage this safely, the concept of the "current user" is **thread-specific**. This means each execution thread maintains its own user context, preventing data from different users from getting mixed up in environments like web servers or bots.
+
+#### Explicitly Setting the User
+
+To specify which user's history you want to work with in the current thread, you must call `set_current_user()`. This is the recommended approach, especially in web applications where each request is handled by a different thread.
 
 ```python
-manager.set_current_user("user123")  # Creates a new DB for "user123" if it does not exist.
+# In a web request handler or a new thread, always set the user first.
+manager.set_current_user("user_id_from_request")
 ```
 
-If no user is set, a new UUID will be automatically created and the current user will be set to that UUID, which will the be subsequently used until explicitely changed by the developer.
+Calling this method associates the current thread with the specified user's database. All subsequent calls to methods like `run()`, `get_messages()`, or `show_history()` from the same thread will automatically use that user's history.
+
+#### Automatic User Management
+
+If you call a method that requires a user context (like `run()`) without first setting a user for the current thread, the manager will automatically create a new user with a unique UUID and set it for that thread.
+
+Because the user context is thread-local, you **cannot** set the user once and expect it to apply to all future operations across your application. You **must** call `set_current_user(user_id)` at the beginning of every task that needs to be associated with a specific user (e.g., at the start of each web request handler or when processing a new bot message).
+
+Failure to do so will result in a new, anonymous user (with an empty history) being created for each new thread, which is likely not the desired behavior.
+
 
 ### Creating Components
 
