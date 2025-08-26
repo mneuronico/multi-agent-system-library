@@ -4742,7 +4742,9 @@ class AgentSystemManager:
               whisper_provider=None, whisper_model=None,
               on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.",
               on_clear_msg = "Message history deleted.",
-              return_token_count = False):
+              return_token_count = False, start_polling = True):
+        
+        logger = logging.getLogger(__name__)
 
         # Get Telegram token from API keys if not provided
         if telegram_token is None:
@@ -4806,12 +4808,11 @@ class AgentSystemManager:
             audio = update.message.audio or update.message.voice
             transcript, file_ref = await process_audio_message(update, context, audio.file_id)
 
-            # Armamos la lista de bloques que se grabará en el historial
             blocks = []
-            if transcript:                                   # bloque de texto si hubo STT
+            if transcript:
                 blocks.extend(self._to_blocks(transcript, user_id=str(update.message.chat.id)))
 
-            blocks.append({                                  # bloque de audio (siempre)
+            blocks.append({
                 "type": "audio",
                 "content": {"kind": "file", "path": file_ref, "detail": "auto"}
             })
@@ -4819,18 +4820,13 @@ class AgentSystemManager:
             await handle_system_text(update, blocks, file_ref)
 
         async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            # telegram manda varias resoluciones -> agarramos la mayor
             photo = update.message.photo[-1]
             file = await context.bot.get_file(photo.file_id)
             img_bytes = await file.download_as_bytearray()
-            # guardamos en MAS
             user_id = str(update.message.chat.id)
             img_ref = self._store_file(bytes(img_bytes), user_id)
-
-            # Recogemos el texto que el usuario escribió como caption (si lo hubo)
             caption = update.message.caption or ""
     
-            # Armamos una lista de bloques: primero el texto (si existe), luego la imagen
             blocks: List[dict] = []
             if caption:
                 blocks.extend(self._to_blocks(caption, user_id=str(update.message.chat.id)))
@@ -4843,13 +4839,6 @@ class AgentSystemManager:
             await handle_system_text(update, blocks)
 
         async def send_telegram_response(update, blocks):
-            """
-            blocks: List[Block] normalizados.
-            • text ⇒ envía el campo 'response' si existe, si no el content tal cual.
-            • image ⇒ envía la foto referenciada.
-            Se envía cada bloque en un mensaje separado.
-            """
-
             if not blocks:
                 return
 
@@ -4858,28 +4847,14 @@ class AgentSystemManager:
                     txt = self._block_to_plain_text(blk)
                     if txt:
                         await update.message.reply_text(txt)
-
-                    # raw = blk["content"]
-                    # try:
-                    #     # intentamos interpretar como JSON por si es objeto
-                    #     parsed = json.loads(raw)
-                    #     # contrato MAS: por defecto los agentes/tools guardan 'response'
-                    #     txt = parsed.get("response", raw) if isinstance(parsed, dict) else raw
-                    # except json.JSONDecodeError:
-                    #     txt = raw
-                    # await update.message.reply_text(txt)
-                    # #value = self.escape_markdown(value)
-                    # #await update.message.reply_text(value, parse_mode="MarkdownV2")
-
                 elif blk["type"] == "image":
                     path = blk["content"]["path"]
                     if path.startswith("file:"):
                         local_path = path[5:]
                         with open(local_path, "rb") as fp:
                             await update.message.reply_photo(fp)
-                    else:                       # ya es URL http://  o file_id
+                    else:
                         await update.message.reply_photo(path)
-
                 elif blk["type"] == "audio":
                     path = blk["content"]["path"]
                     if path.startswith("file:"):
@@ -4888,9 +4863,6 @@ class AgentSystemManager:
                             await update.message.reply_voice(fp)
                     else:
                         await update.message.reply_voice(path)
-
-                
-
 
         def on_complete_fn(messages, manager, params):
 
@@ -4910,11 +4882,9 @@ class AgentSystemManager:
 
             def callback(_upd=update, _blks=blocks):
                 asyncio.create_task(send_telegram_response(_upd, _blks))
-
             loop.call_soon_threadsafe(callback)
 
         def on_update_fn(messages, manager, params):
-            
             blocks = None
             if on_update:
                 response = on_update(messages, manager, params)
@@ -4932,9 +4902,7 @@ class AgentSystemManager:
 
             loop.call_soon_threadsafe(callback)
 
-        # Define async handlers
         async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            # Use await for async operations like reply_text
             await update.message.reply_text(on_start_msg)
 
         async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4942,7 +4910,6 @@ class AgentSystemManager:
             await update.message.reply_text(on_clear_msg)
 
         async def clear_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            # Requiere admin_user_id configurado y que el emisor coincida
             if not self.admin_user_id:
                 await update.message.reply_text("Comando deshabilitado: no hay admin configurado.")
                 return
@@ -4953,7 +4920,6 @@ class AgentSystemManager:
             await update.message.reply_text(f"Historiales de todos los usuarios borrados ({count} DBs).")
 
         async def reset_system_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            # Solo habilitado si hay admin configurado y coincide con el emisor
             if not self.admin_user_id:
                 await update.message.reply_text("Comando deshabilitado: no hay admin configurado.")
                 return
@@ -4967,9 +4933,7 @@ class AgentSystemManager:
                 logger.exception("Error en /reset_system:", exc_info=e)
                 await update.message.reply_text("Ocurrió un error al resetear el sistema.")
 
-
         async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            """Handle direct text input from user"""
             text = update.message.text
             await handle_system_text(update, text)
 
@@ -5008,8 +4972,6 @@ class AgentSystemManager:
             thread.start()
         
         application = Application.builder().token(telegram_token).build()
-
-        # Add command and message handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("clear", clear))
         application.add_handler(CommandHandler("clear_all_users", clear_all_users))
@@ -5019,11 +4981,15 @@ class AgentSystemManager:
         application.add_handler(MessageHandler(filters.VOICE, handle_audio))
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-        # Run the bot
         if verbose:
-            logger.info("[Manager] Bot running...")
+            logger.info("[Manager] Telegram application ready.")
 
-        application.run_polling()
+        if start_polling:
+            if verbose:
+                logger.info("[Manager] Bot running...")
+            application.run_polling()
+        
+        return application
 
     # ──────────────────────────────────────────────────────────────────────
     #   WhatsApp Cloud-API integration  (drop into AgentSystemManager)
