@@ -3142,11 +3142,13 @@ class AgentSystemManager:
             return b""
         
     def import_history(self, user_id: str, sqlite_bytes: bytes):
-        """
-        Imports a sqlite database for the given user_id.
-        It saves the sqlite file into the history folder (using the user_id as filename).
-        If a history file already exists, it overwrites it (logging a warning).
-        """
+        if hasattr(self, "_db_pool") and user_id in self._db_pool:
+            try:
+                self._db_pool[user_id].close()
+            except Exception as e:
+                logger.warning(f"Error al cerrar la conexión existente para el usuario {user_id} antes de importar: {e}")
+            del self._db_pool[user_id]
+            
         db_path = self._get_db_path_for_user(user_id)
         if os.path.exists(db_path):
             # Log a warning that an existing DB is being overwritten
