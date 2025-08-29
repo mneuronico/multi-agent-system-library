@@ -3106,16 +3106,24 @@ class AgentSystemManager:
         if user_id in self._db_pool:
             return self._db_pool[user_id]
         db_path = self._get_db_path_for_user(user_id)
-        needs_init = not os.path.exists(db_path)
+
         conn = sqlite3.connect(db_path, check_same_thread=False)
-        # Mejor concurrencia en SQLite
+
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='message_history';")
+        table_exists = cur.fetchone()
+
+        if not table_exists:
+            self._create_table(conn)
+            # Optional but helpful logging:
+            print(f"INFO: 'message_history' table did not exist. Initializing it now for user {user_id}.")
+        
+
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
         except Exception:
             pass
-        if needs_init:
-            self._create_table(conn)
         self._db_pool[user_id] = conn
         return conn
     
