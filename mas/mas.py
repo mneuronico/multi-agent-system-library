@@ -2189,17 +2189,14 @@ class Automation(Component):
 
     def _case_matches(self, switch_value, case_value, verbose):
         """Compare switch/case values more flexibly."""
-        # ── NEW: unwrap single-element lists ─────────────────────────────
         if isinstance(switch_value, list) and len(switch_value) == 1:
             switch_value = switch_value[0]
         if isinstance(case_value, list) and len(case_value) == 1:
             case_value = case_value[0]
-        # ── NEW: normalise strings (trim + case-fold) ───────────────────
         if isinstance(switch_value, str):
             switch_value = switch_value.strip().lower()
         if isinstance(case_value, str):
             case_value = case_value.strip().lower()
-        # ── ORIGINAL numeric check + strict equality ────────────────────
         try:
             if isinstance(switch_value, (int, float)) and isinstance(case_value, (int, float)):
                 return float(switch_value) == float(case_value)
@@ -3127,20 +3124,24 @@ class AgentSystemManager:
             return self._tls.current_user_id
         return None
 
-    
+
     def export_history(self, user_id: str) -> bytes:
-        """
-        Exports the full sqlite database for the given user_id.
-        Returns the file's bytes.
-        """
         db_path = self._get_db_path_for_user(user_id)
         if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.close()
+                logger.info(f"Successfully checkpointed database for user {user_id} before export.")
+            except Exception as e:
+                logger.warning(f"Could not checkpoint database for user {user_id} before export: {e}")
+
             with open(db_path, "rb") as f:
                 return f.read()
         else:
-            # If no DB exists, return empty bytes (or you could raise an error)
+            # If no DB exists, return empty bytes
             return b""
-        
+    
     def import_history(self, user_id: str, sqlite_bytes: bytes):
         if hasattr(self, "_db_pool") and user_id in self._db_pool:
             try:
