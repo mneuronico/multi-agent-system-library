@@ -4762,6 +4762,8 @@ class AgentSystemManager:
         if isinstance(val, list):
             return json.dumps(val, ensure_ascii=False, indent=2)
         return str(val)
+
+    
     
     def start_telegram_bot(self, telegram_token=None, component_name = None, verbose = False,
               on_complete = None, on_update = None, speech_to_text=None,
@@ -5006,7 +5008,7 @@ class AgentSystemManager:
 
         async def handle_system_text(update: Update, input, file_ref=None):
             if _is_too_old(update.message.date):
-                logging.getLogger(__name__).debug("[Whatsapp Bot] Message ignored because it is too old.")
+                logging.getLogger(__name__).debug("[Telegram Bot] Message ignored because it is too old.")
                 return
             
             params = {
