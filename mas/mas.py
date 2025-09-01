@@ -2450,7 +2450,7 @@ class AgentSystemManager:
         usage_logging: bool = False
     ):
 
-        
+        self._tls = threading.local()
         self.base_directory = os.path.abspath(base_directory)
         self._usage_logging_enabled = bool(usage_logging)
         
