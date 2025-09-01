@@ -4770,7 +4770,8 @@ class AgentSystemManager:
               whisper_provider=None, whisper_model=None,
               on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.",
               on_clear_msg = "Message history deleted.",
-              return_token_count = False, start_polling = True):
+              return_token_count = False, start_polling = True,
+              ensure_delivery: bool = False, delivery_timeout: float = 5.0):
         
         logger = logging.getLogger(__name__)
 
@@ -4908,9 +4909,15 @@ class AgentSystemManager:
             update = params["update"]
             loop = params["event_loop"]
 
-            def callback(_upd=update, _blks=blocks):
-                asyncio.create_task(send_telegram_response(_upd, _blks))
-            loop.call_soon_threadsafe(callback)
+            fut = asyncio.run_coroutine_threadsafe(
+                send_telegram_response(update, blocks),
+                loop
+            )
+            if ensure_delivery:
+                try:
+                    fut.result(timeout=delivery_timeout)
+                except Exception:
+                    logger.exception("Telegram delivery failed or timed out in on_complete_fn")
 
         def on_update_fn(messages, manager, params):
             blocks = None
@@ -4925,10 +4932,15 @@ class AgentSystemManager:
             update = params["update"]
             loop = params["event_loop"]
 
-            def callback(_upd=update, _blks=blocks):
-                asyncio.create_task(send_telegram_response(_upd, _blks))
-
-            loop.call_soon_threadsafe(callback)
+            fut = asyncio.run_coroutine_threadsafe(
+                send_telegram_response(update, blocks),
+                loop
+            )
+            if ensure_delivery:
+                try:
+                    fut.result(timeout=delivery_timeout)
+                except Exception:
+                    logger.exception("Telegram delivery failed or timed out in on_update_fn")
 
         async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(on_start_msg)
@@ -5022,7 +5034,7 @@ class AgentSystemManager:
             if verbose:
                 logger.debug(f"[Manager] Processing input for user {chat_id}: {input}")
 
-            def run_manager_thread():
+            def run_manager_sync():
                 self.run(
                     input=input,
                     component_name = component_name,
@@ -5037,8 +5049,8 @@ class AgentSystemManager:
                     return_token_count=return_token_count
                 )
 
-            thread = threading.Thread(target=run_manager_thread, daemon=True)
-            thread.start()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, run_manager_sync)
         
         application = Application.builder().token(telegram_token).build()
         application.add_handler(CommandHandler("start", start))
