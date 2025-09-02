@@ -3156,6 +3156,16 @@ class AgentSystemManager:
             except Exception as e:
                 logger.warning(f"Error al cerrar la conexión existente para el usuario {user_id} antes de importar: {e}")
             del self._db_pool[user_id]
+
+        if hasattr(self, "_tls") and getattr(self._tls, "current_user_id", None) == user_id:
+            if hasattr(self._tls, "db_conn") and self._tls.db_conn is not None:
+                try:
+                    # Intenta cerrar la conexión por si acaso, no da error si ya está cerrada
+                    self._tls.db_conn.close()
+                except Exception: pass
+            # Forzamos a que la caché del hilo se vacíe.
+            self._tls.db_conn = None
+            logger.debug(f"Cleared thread-local DB connection for user {user_id}.")
             
         db_path = self._get_db_path_for_user(user_id)
         if os.path.exists(db_path):
@@ -3197,10 +3207,6 @@ class AgentSystemManager:
 
         if not hasattr(self, "_tls"):
             self._tls = threading.local()
-
-        # Si el hilo ya estaba usando ese mismo usuario, nada que hacer
-        if getattr(self._tls, "current_user_id", None) == user_id:
-            return
 
         # Conexión sqlite específica de ese usuario
         self._tls.current_user_id = user_id
