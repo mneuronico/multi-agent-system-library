@@ -3135,12 +3135,11 @@ class AgentSystemManager:
 
     def export_history(self, user_id: str) -> bytes:
         db_path = self._get_db_path_for_user(user_id)
-        if os.path.exists(db_path):
+
+        if hasattr(self, "_db_pool") and user_id in self._db_pool:
+            conn = self._db_pool[user_id]
             try:
-                conn = sqlite3.connect(db_path)
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                conn.close()
-                logger.info(f"Successfully checkpointed database for user {user_id} before export.")
             except Exception as e:
                 logger.warning(f"Could not checkpoint database for user {user_id} before export: {e}")
 
