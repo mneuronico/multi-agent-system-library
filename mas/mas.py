@@ -40,18 +40,7 @@ if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
     logger.addHandler(_h)
 
 
-MESSAGE_MAX_AGE_SEC = 120 
 
-def _is_too_old(msg_dt, *, max_age=MESSAGE_MAX_AGE_SEC) -> bool:
-    """
-    Return True iff *msg_dt* (a datetime) is older than *max_age* seconds.
-    Works with naïve or TZ-aware UTC datetimes.
-    """
-    if not isinstance(msg_dt, datetime):
-        return False
-    if msg_dt.tzinfo is None:
-        msg_dt = msg_dt.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - msg_dt) > timedelta(seconds=max_age)
 
 
 def get_readme(owner: str, repo: str, branch: str = None,
@@ -4569,6 +4558,163 @@ class AgentSystemManager:
         mime, _ = mimetypes.guess_type(p)
         return mime and mime.startswith("image/") and os.path.isfile(p)
 
+    def list_agents(self) -> list[str]:
+        return sorted(self.agents.keys())
+
+    def list_tools(self) -> list[str]:
+        return sorted(self.tools.keys())
+
+    def list_processes(self) -> list[str]:
+        return sorted(self.processes.keys())
+
+    def list_automations(self) -> list[str]:
+        return sorted(self.automations.keys())
+
+    def list_components(
+        self, *, types: Optional[List[str]] = None,
+        name_contains: Optional[str] = None,
+        regex: Optional[str] = None
+    ) -> list[str]:
+        import re
+        registries = []
+        if not types:
+            registries = [
+                ("agent", self.agents),
+                ("tool", self.tools),
+                ("process", self.processes),
+                ("automation", self.automations),
+            ]
+        else:
+            m = {
+                "agent": self.agents, "tool": self.tools,
+                "process": self.processes, "automation": self.automations
+            }
+            registries = [(t, m[t]) for t in types if t in m]
+
+        out = []
+        for _t, reg in registries:
+            for name in reg.keys():
+                if name_contains and name_contains not in name:
+                    continue
+                if regex and not re.search(regex, name):
+                    continue
+                out.append(name)
+        return sorted(out)
+
+    def read(
+        self,
+        messages: Optional[Union[Dict, List[Dict]]] = None,
+        user_id: Optional[str] = None,
+        *,
+        source: Optional[Union[str, List[str]]] = None,
+        index: Optional[Union[int, tuple]] = -1,
+        get_full_dict: bool = False,
+        block_type: Optional[str] = None,
+        block_index: Optional[Union[int, None]] = None
+    ) -> Any:
+
+        if source is not None and not isinstance(source, (str, list, tuple)):
+            raise ValueError("source debe ser None, str o lista/tupla de str.")
+        if isinstance(source, (list, tuple)) and not all(isinstance(s, str) for s in source):
+            raise ValueError("Todos los elementos de source deben ser str.")
+        if block_type not in (None, "text", "image", "audio"):
+            raise ValueError("block_type debe ser None, 'text', 'image' o 'audio'.")
+        if block_index is not None and not isinstance(block_index, int):
+            raise ValueError("block_index debe ser None o int.")
+        if messages is not None and not isinstance(messages, (dict, list)):
+            raise ValueError("messages debe ser None, dict o list[dict].")
+            
+        source_messages = []
+        if messages is not None:
+            source_messages = [messages] if isinstance(messages, dict) else list(messages)
+        else:
+            active_user = user_id or self._uid()
+            if active_user:
+                source_messages = self.get_messages(active_user)
+        
+        if not source_messages:
+            return None
+
+        import copy
+        source_messages = copy.deepcopy(source_messages)
+
+        if source:
+            sources_to_match = [source] if isinstance(source, str) else source
+            source_messages = [msg for msg in source_messages if msg.get("source") in sources_to_match]
+
+        selected_messages = []
+        if index is None:
+            selected_messages = source_messages
+        elif isinstance(index, int):
+            try:
+                selected_messages = [source_messages[index]]
+            except IndexError:
+                return None
+        elif isinstance(index, tuple) and len(index) == 2:
+            start, end = index
+            selected_messages = source_messages[start:end]
+        
+        if not selected_messages:
+            return None
+
+        if block_index is None and isinstance(index, int) and not get_full_dict:
+            block_index = 0
+
+        if block_type or block_index is not None:
+            processed_messages = []
+            for msg in selected_messages:
+                original_blocks = msg.get("message", [])
+                
+                filtered_blocks = [b for b in original_blocks if b.get("type") == block_type] if block_type else original_blocks
+                
+                if block_index is not None and isinstance(block_index, int):
+                    try:
+                        final_blocks = [filtered_blocks[block_index]]
+                    except IndexError:
+                        final_blocks = []
+                else:
+                    final_blocks = filtered_blocks
+                
+                if final_blocks:
+                    msg["message"] = final_blocks
+                    processed_messages.append(msg)
+            
+            selected_messages = processed_messages
+
+        if not selected_messages:
+            return None
+
+        # --- 5. Determinar el formato de salida ---
+        if len(selected_messages) > 1:
+            return selected_messages
+        
+        # A partir de aquí, solo trabajamos con un único mensaje
+        single_message = selected_messages[0]
+        
+        if get_full_dict:
+            return single_message
+        
+        source = single_message.get("source")
+        blocks = single_message.get("message", [])
+
+        if not blocks:
+            return source, [], []
+
+        if block_index is not None and isinstance(block_index, int):
+            target_block = blocks[0]
+            block_content = target_block.get("content")
+            
+            # Intentar parsear JSON para bloques de texto
+            if target_block.get("type") == "text" and isinstance(block_content, str):
+                try:
+                    block_content = json.loads(block_content)
+                except (json.JSONDecodeError, TypeError):
+                    pass # Dejar como string si no es JSON válido
+            
+            return source, target_block.get("type"), block_content
+        else:
+            return source, blocks
+
     def _to_blocks(self, value, user_id=None, detail="auto"):
         # Aseguramos user_id para guardar archivos cuando haga falta
         self.ensure_user(user_id)
@@ -4768,678 +4914,42 @@ class AgentSystemManager:
             return json.dumps(val, ensure_ascii=False, indent=2)
         return str(val)
 
-    
-    
-    def start_telegram_bot(self, telegram_token=None, component_name = None, verbose = False,
-              on_complete = None, on_update = None, speech_to_text=None,
-              whisper_provider=None, whisper_model=None,
-              on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.",
-              on_clear_msg = "Message history deleted.",
-              return_token_count = False, start_polling = True,
-              ensure_delivery: bool = False, delivery_timeout: float = 5.0):
-        
-        logger = logging.getLogger(__name__)
-
-        # Get Telegram token from API keys if not provided
-        if telegram_token is None:
-            telegram_token = self.get_key("telegram_token")
-        
-        if not telegram_token:
-            raise ValueError("Telegram token required. Provide as argument or in API keys as 'TELEGRAM_TOKEN'")
-
-        on_update = on_update or self.on_update
-        on_complete = on_complete or self.on_complete
-
-        async def process_audio_message(update, context, file_id):
-            file = await context.bot.get_file(file_id)
-            file_url = file.file_path
-            
-            # Download the audio file
-            response = requests.get(file_url)
-            if response.status_code != 200:
-                return None, None
-
-            # Store in manager's file system
-            file_data = response.content
-            file_uuid = str(uuid.uuid4())
-            file_name = f"{file_uuid}.ogg"  # Telegram uses OGG for voice messages
-            file_path = os.path.join(self.base_directory, "files", str(update.message.chat.id), file_name)
-            
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-            try:
-                with open(file_path, "wb") as f:
-                    f.write(file_data)
-            except OSError as e:
-                logger.error(f"Error writing audio to file {file_path}: {e}")
-
-            # Store in manager's file cache
-            file_ref = self._store_file(file_path, str(update.message.chat.id))
-
-            # Transcribe using appropriate method
-            transcript = None
-            try:
-                if callable(speech_to_text):
-                    transcript = speech_to_text({"manager": self, "file_path": file_path, "update": update, "context": context})
-                else:
-                    # Try automatic transcription
-                    transcript = self.stt(file_path, whisper_provider, whisper_model)
-
-                    if verbose:
-                        logger.debug(f"Audio transcription succeeded: {transcript}")
-            except requests.exceptions.RequestException as e:
-                if verbose:
-                    logger.error(f"HTTP error during transcription: {e}")
-                transcript = None
-            except ValueError as e:
-                if verbose:
-                    logger.error(f"Transcription error: {e}")
-                transcript = None
-
-            return transcript, file_ref
-        
-        async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            audio = update.message.audio or update.message.voice
-            transcript, file_ref = await process_audio_message(update, context, audio.file_id)
-
-            blocks = []
-            if transcript:
-                blocks.extend(self._to_blocks(transcript, user_id=str(update.message.chat.id)))
-
-            blocks.append({
-                "type": "audio",
-                "content": {"kind": "file", "path": file_ref, "detail": "auto"}
-            })
-
-            await handle_system_text(update, blocks, file_ref)
-
-        async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            photo = update.message.photo[-1]
-            file = await context.bot.get_file(photo.file_id)
-            img_bytes = await file.download_as_bytearray()
-            user_id = str(update.message.chat.id)
-            img_ref = self._store_file(bytes(img_bytes), user_id)
-            caption = update.message.caption or ""
-    
-            blocks: List[dict] = []
-            if caption:
-                blocks.extend(self._to_blocks(caption, user_id=str(update.message.chat.id)))
-
-            blocks.append({
-                "type": "image",
-                "content": {"kind": "file", "path": img_ref, "detail": "auto"}
-            })
-
-            await handle_system_text(update, blocks)
-
-        async def send_telegram_response(update, blocks):
-            if not blocks:
-                return
-
-            for blk in blocks:
-                if blk["type"] == "text":
-                    txt = self._block_to_plain_text(blk)
-                    if txt:
-                        await update.message.reply_text(txt)
-                elif blk["type"] == "image":
-                    path = blk["content"]["path"]
-                    if path.startswith("file:"):
-                        local_path = path[5:]
-                        with open(local_path, "rb") as fp:
-                            await update.message.reply_photo(fp)
-                    else:
-                        await update.message.reply_photo(path)
-                elif blk["type"] == "audio":
-                    path = blk["content"]["path"]
-                    if path.startswith("file:"):
-                        local_path = path[5:]
-                        with open(local_path, "rb") as fp:
-                            await update.message.reply_voice(fp)
-                    else:
-                        await update.message.reply_voice(path)
-
-        def on_complete_fn(messages, manager, params):
-
-            blocks = None
-            if on_complete:
-                response = on_complete(messages, manager, params)
-                if response is not None:
-                    blocks = self._to_blocks(response, user_id=str(params["update"].message.chat.id))
-            else:
-                blocks = messages[-1]["message"] if messages else None
-
-            if blocks is None:
-                return
-
-            update = params["update"]
-            loop = params["event_loop"]
-
-            fut = asyncio.run_coroutine_threadsafe(
-                send_telegram_response(update, blocks),
-                loop
-            )
-            if ensure_delivery:
-                try:
-                    fut.result(timeout=delivery_timeout)
-                except Exception:
-                    logger.exception("Telegram delivery failed or timed out in on_complete_fn")
-
-        def on_update_fn(messages, manager, params):
-            blocks = None
-            if on_update:
-                response = on_update(messages, manager, params)
-                if response is not None:
-                    blocks = self._to_blocks(response, user_id=str(params["update"].message.chat.id))
-
-            if not blocks:
-                return
-
-            update = params["update"]
-            loop = params["event_loop"]
-
-            fut = asyncio.run_coroutine_threadsafe(
-                send_telegram_response(update, blocks),
-                loop
-            )
-            if ensure_delivery:
-                try:
-                    fut.result(timeout=delivery_timeout)
-                except Exception:
-                    logger.exception("Telegram delivery failed or timed out in on_update_fn")
-
-        async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            await update.message.reply_text(on_start_msg)
-
-        async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            self.clear_message_history(update.message.chat.id)
-            await update.message.reply_text(on_clear_msg)
-
-        async def clear_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            if not self.admin_user_id:
-                await update.message.reply_text("Comando deshabilitado: no hay admin configurado.")
-                return
-            if str(update.message.chat.id) != str(self.admin_user_id):
-                await update.message.reply_text("No autorizado.")
-                return
-            count = self.clear_global_history()
-            await update.message.reply_text(f"Historiales de todos los usuarios borrados ({count} DBs).")
-
-        async def reset_system_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            if not self.admin_user_id:
-                await update.message.reply_text("Comando deshabilitado: no hay admin configurado.")
-                return
-            if str(update.message.chat.id) != str(self.admin_user_id):
-                await update.message.reply_text("No autorizado.")
-                return
-            try:
-                self.reset_system()
-                await update.message.reply_text("Sistema reseteado: se eliminaron todos los historiales y archivos, y se recrearon las carpetas vacías.")
-            except Exception as e:
-                logger.exception("Error en /reset_system:", exc_info=e)
-                await update.message.reply_text("Ocurrió un error al resetear el sistema.")
-
-        async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            # Solo admin
-            if not self.admin_user_id:
-                await update.message.reply_text("Comando deshabilitado: no hay admin configurado.")
-                return
-            if str(update.message.chat.id) != str(self.admin_user_id):
-                print(update.message.chat.id, self.admin_user_id)
-                await update.message.reply_text("No autorizado.")
-                return
-
-            logs_dir = getattr(self, "logs_folder", None)
-            if not logs_dir:
-                await update.message.reply_text("usage_logging está deshabilitado.")
-                return
-
-            usage_p = os.path.join(logs_dir, "usage.log")
-            summary_p = os.path.join(logs_dir, "summary.log")
-
-            # Refresca summary por las dudas
-            if getattr(self, "_usage_logging_enabled", False):
-                try:
-                    self._refresh_cost_summary()
-                except Exception:
-                    pass
-
-            sent_any = False
-            if os.path.isfile(usage_p):
-                with open(usage_p, "rb") as fp:
-                    await update.message.reply_document(fp, filename="usage.log")
-                sent_any = True
-            if os.path.isfile(summary_p):
-                with open(summary_p, "rb") as fp:
-                    # lo mandamos como summary.json para que el cliente lo trate como JSON
-                    await update.message.reply_document(fp, filename="summary.json")
-                sent_any = True
-
-            if not sent_any:
-                await update.message.reply_text("No hay logs para enviar.")
-
-
-
-        async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            text = update.message.text
-            await handle_system_text(update, text)
-
-        async def handle_system_text(update: Update, input, file_ref=None):
-            if _is_too_old(update.message.date):
-                logging.getLogger(__name__).debug("[Telegram Bot] Message ignored because it is too old.")
-                return
-            
-            params = {
-                "update": update,
-                "event_loop": asyncio.get_running_loop(),
-                "file_ref": file_ref
-            }
-
-            chat_id = update.message.chat.id
-
-            if verbose:
-                logger.debug(f"[Manager] Processing input for user {chat_id}: {input}")
-
-            def run_manager_sync():
-                self.run(
-                    input=input,
-                    component_name = component_name,
-                    user_id=chat_id,
-                    role= "user",
-                    verbose=verbose,
-                    blocking=True,
-                    on_update=on_update_fn,
-                    on_update_params=params,
-                    on_complete = on_complete_fn,
-                    on_complete_params=params,
-                    return_token_count=return_token_count
-                )
-
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, run_manager_sync)
-        
-        application = Application.builder().token(telegram_token).build()
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("clear", clear))
-        application.add_handler(CommandHandler("clear_all_users", clear_all_users))
-        application.add_handler(CommandHandler("reset_system", reset_system_cmd))
-        application.add_handler(CommandHandler("logs", logs_cmd))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text))
-        application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-        application.add_handler(MessageHandler(filters.VOICE, handle_audio))
-        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-        if verbose:
-            logger.info("[Manager] Telegram application ready.")
+    def start_telegram_bot(
+        self, 
+        telegram_token: str = None, 
+        start_polling: bool = True,
+        **kwargs
+    ):
+        bot_instance = TelegramBot(
+            manager=self,
+            telegram_token=telegram_token,
+            **kwargs
+        )
 
         if start_polling:
-            if verbose:
-                logger.info("[Manager] Bot running...")
-            application.run_polling()
-        
-        return application
+            bot_instance.start_polling()
+            return None
+        else:
+            return bot_instance
 
-    # ──────────────────────────────────────────────────────────────────────
-    #   WhatsApp Cloud-API integration  (drop into AgentSystemManager)
-    # ──────────────────────────────────────────────────────────────────────
     def start_whatsapp_bot(
         self,
         *,
-        # WhatsApp Cloud credentials  ─────────────────────────────────────
-        whatsapp_token: str = None,
-        phone_number_id: str = None,
-        webhook_verify_token: str = None,
-        # MAS run-options  ────────────────────────────────────────────────
-        component_name: str = None,
-        verbose: bool = False,
-        on_update: Callable = None,
-        on_complete: Callable = None,
-        return_token_count: bool = False,
-        # multimodal helpers
-        speech_to_text: Callable = None,
-        whisper_provider: str = None,
-        whisper_model: str = None,
-        # command replies (mirror Telegram defaults)  ─────────────────────
-        on_start_msg: str = "Hey! Talk to me or type '/clear' to erase your message history.",
-        on_clear_msg: str = "Message history deleted.",
-        # server opts
+        run_server: bool = True,
         host: str = "0.0.0.0",
         port: int = 5000,
         base_path: str = "/webhook",
+        **kwargs
     ):
-        """
-        Launch a tiny Flask server that bridges WhatsApp Cloud API  ⇄  MAS.
-
-        * multimodal: images, audio (with optional STT), plain text
-        * same callback semantics & defaults as start_telegram_bot()
-        * supports '/start' and '/clear' commands
-        """
-
-        # ──────────────────── credentials / helper vars ──────────────────
-        whatsapp_token       = whatsapp_token       or self.get_key("whatsapp_token")
-        phone_number_id      = phone_number_id      or self.get_key("whatsapp_phone_number_id")
-        webhook_verify_token = webhook_verify_token or self.get_key("webhook_verify_token")
-
-        if not (whatsapp_token and phone_number_id and webhook_verify_token):
-            raise ValueError(
-                "Missing WhatsApp credentials. Provide WHATSAPP_ACCESS_TOKEN, "
-                "WHATSAPP_PHONE_NUMBER_ID and WEBHOOK_VERIFY_TOKEN."
-            )
-        
-        
-        log = logging.getLogger(__name__)
-        log.debug("[Whatsapp Bot] WA-bot starting – phone_id=%s  base_path=%s", phone_number_id, base_path)
-
-        GRAPH_MSG_URL = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
-        HDR_JSON  = {"Authorization": f"Bearer {whatsapp_token}",
-                    "Content-Type":  "application/json"}
-        HDR_AUTH  = {"Authorization": f"Bearer {whatsapp_token}"}
-
-        # choose callbacks from system defaults if not overridden
-        on_update   = on_update   or self.on_update
-        on_complete = on_complete or self.on_complete
-
-        
-
-        # ─────────────────── outbound helpers (send to WA) ───────────────
-        def _send_text(to: str, txt: str):
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "text",
-                "text": {"body": txt}
-            }
-            r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
-            log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "text", r.status_code, to)
-
-        def _upload_media(path: str, mime: str) -> str:
-            url = f"https://graph.facebook.com/v18.0/{phone_number_id}/media"
-            with open(path, "rb") as fh:
-                files = {"file": (os.path.basename(path), fh, mime)}
-                r = requests.post(url, headers=HDR_AUTH,
-                                data={"messaging_product": "whatsapp"},
-                                files=files, timeout=60)
-            if r.ok:
-                return r.json().get("id")
-            log.error("Media upload failed: %s", r.text)
+        bot_instance = WhatsappBot(
+            manager=self,
+            **kwargs
+        )
+        if run_server:
+            bot_instance.run_server(host=host, port=port, base_path=base_path)
             return None
-
-        def _send_image(to: str, path: str, caption: str = None):
-            mime = mimetypes.guess_type(path)[0] or "image/jpeg"
-            mid  = _upload_media(path, mime)
-            if not mid:
-                return
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "image",
-                "image": {"id": mid, **({"caption": caption} if caption else {})}
-            }
-            r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
-            log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "image", r.status_code, to)
-
-        def _send_audio(to: str, path: str):
-            mime = "audio/mpeg"
-            mid  = _upload_media(path, mime)
-            if not mid:
-                return
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "audio",
-                "audio": {"id": mid}
-            }
-            r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
-            log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "audio", r.status_code, to)
-
-        def _send_document(to: str, path: str, filename: Optional[str] = None, caption: Optional[str] = None):
-            import os, mimetypes
-            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-            if not os.path.isfile(path):
-                log.error("[Whatsapp Bot] document not found: %s", path)
-                return
-            mid  = _upload_media(path, mime)
-            if not mid:
-                log.error("[Whatsapp Bot] media upload failed for: %s", path)
-                return
-            doc = {"id": mid}
-            if filename:
-                doc["filename"] = filename
-            if caption:
-                doc["caption"] = caption
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "document",
-                "document": doc
-            }
-            r = requests.post(GRAPH_MSG_URL, headers=HDR_JSON, json=payload, timeout=60)
-            log.debug("[Whatsapp Bot] → send %s status=%s to=%s", "document", r.status_code, to)
-
-
-        # ───────────── MAS blocks → WhatsApp messages ────────────────────
-        def blocks_to_whatsapp(to: str, blocks: list[dict]):
-            for blk in blocks:
-                if blk["type"] == "text":
-                    txt = self._block_to_plain_text(blk)
-                    if txt:
-                        _send_text(to, txt)
-
-                    # raw = blk["content"]
-                    # try:
-                    #     obj = json.loads(raw) if isinstance(raw, str) else raw
-                    #     txt = obj.get("response", raw) if isinstance(obj, dict) else raw
-                    # except json.JSONDecodeError:
-                    #     txt = raw
-                    # _send_text(to, txt)
-
-                elif blk["type"] == "image":
-                    src = blk["content"]
-                    if src.get("kind") == "file":
-                        local = src["path"][5:] if src["path"].startswith("file:") else src["path"]
-                        _send_image(to, local)
-                    elif src.get("kind") == "url":
-                        _send_text(to, src["url"])          # fallback: just send url
-                elif blk["type"] == "audio":
-                    src = blk["content"]
-                    if src.get("kind") == "file":
-                        local = src["path"][5:] if src["path"].startswith("file:") else src["path"]
-                        _send_audio(to, local)
-
-        # ───────────────── Flask webhook server ──────────────────────────
-        app = Flask(__name__)
-
-        @app.route(base_path, methods=["GET"])
-        def verify():
-            if request.args.get("hub.verify_token") == webhook_verify_token:
-                return request.args.get("hub.challenge", ""), 200
-            return "Forbidden", 403
-
-        @app.route(base_path, methods=["POST"])
-        def inbox():
-            data = request.get_json(force=True, silent=True) or {}
-            #log.debug("[Whatsapp Bot] WEBHOOK RAW ⇢ %s ...", json.dumps(data)[:800])
-            try:
-                for entry in data.get("entry", []):
-                    for change in entry.get("changes", []):
-                        for msg in change.get("value", {}).get("messages", []):
-                            threading.Thread(target=_handle_msg, args=(msg,), daemon=True).start()
-            except Exception:
-                log.exception("Error processing webhook payload")
-            return "OK", 200
-
-        # ───────────────── message dispatcher ────────────────────────────
-        def _handle_msg(msg: dict):
-
-            wa_id  = msg.get("from")
-            mtype  = msg.get("type")
-            blocks = []
-
-            log.debug("[Whatsapp Bot] HANDLE %s id=%s from=%s", mtype, msg.get('id'), wa_id)
-
-            # ⏰ timeout check
-            try:
-                msg_epoch = int(msg.get("timestamp", "0"))
-            except ValueError:
-                msg_epoch = 0
-            msg_dt = datetime.fromtimestamp(msg_epoch, timezone.utc)
-            if _is_too_old(msg_dt):
-                log.debug("[Whatsapp Bot] Message ignored because it is too old.")
-                return
-            
-
-            # ── text / commands ───────────────────────────────────────────
-            if mtype == "text":
-                body = msg["text"]["body"].strip()
-                if body.lower() == "/start":
-                    _send_text(wa_id, on_start_msg)
-                    return
-                if body.lower() == "/clear":
-                    self.clear_message_history(wa_id)
-                    _send_text(wa_id, on_clear_msg)
-                    return
-                if body.lower() == "/clear_all_users":
-                    if not self.admin_user_id:
-                        _send_text(wa_id, "Comando deshabilitado: no hay admin configurado.")
-                        return
-                    if str(wa_id) != str(self.admin_user_id):
-                        _send_text(wa_id, "No autorizado.")
-                        return
-                    count = self.clear_global_history()
-                    _send_text(wa_id, f"Historiales de todos los usuarios borrados ({count} DBs).")
-                    return
-                if body.lower() == "/reset_system":
-                    if not self.admin_user_id:
-                        _send_text(wa_id, "Comando deshabilitado: no hay admin configurado.")
-                        return
-                    if str(wa_id) != str(self.admin_user_id):
-                        _send_text(wa_id, "No autorizado.")
-                        return
-                    try:
-                        self.reset_system()
-                        _send_text(wa_id, "Sistema reseteado: se eliminaron todos los historiales y archivos, y se recrearon las carpetas vacías.")
-                    except Exception as e:
-                        logger.exception("Error en /reset_system:", exc_info=e)
-                        _send_text(wa_id, "Ocurrió un error al resetear el sistema.")
-                    return
-                if body.lower() == "/logs":
-                    if not self.admin_user_id:
-                        _send_text(wa_id, "Comando deshabilitado: no hay admin configurado.")
-                        return
-                    if str(wa_id) != str(self.admin_user_id):
-                        _send_text(wa_id, "No autorizado.")
-                        return
-
-                    logs_dir = getattr(self, "logs_folder", None)
-                    if not logs_dir:
-                        _send_text(wa_id, "usage_logging está deshabilitado.")
-                        return
-
-                    usage_p = os.path.join(logs_dir, "usage.log")
-                    summary_p = os.path.join(logs_dir, "summary.log")
-
-                    # Refresca summary si corresponde
-                    if getattr(self, "_usage_logging_enabled", False):
-                        try:
-                            self._refresh_cost_summary()
-                        except Exception:
-                            pass
-
-                    sent = 0
-                    if os.path.isfile(usage_p):
-                        _send_document(wa_id, usage_p, filename="usage.log")
-                        sent += 1
-                    if os.path.isfile(summary_p):
-                        _send_document(wa_id, summary_p, filename="summary.json")
-                        sent += 1
-
-                    if sent == 0:
-                        _send_text(wa_id, "No hay logs para enviar.")
-                    else:
-                        _send_text(wa_id, f"Enviados {sent} archivo(s) de logs.")
-                    return
-
-
-                blocks = self._to_blocks(body, user_id=wa_id)
-
-            # ── images ───────────────────────────────────────────────────
-            elif mtype == "image":
-                media_id = msg["image"]["id"]
-                media_url = requests.get(
-                    f"https://graph.facebook.com/v18.0/{media_id}",
-                    headers=HDR_AUTH, timeout=60).json().get("url")
-                img_bytes = requests.get(media_url, headers=HDR_AUTH, timeout=60).content
-                img_ref   = self.save_file(img_bytes, wa_id)
-                caption   = msg["image"].get("caption", "")
-                if caption:
-                    blocks.extend(self._to_blocks(caption, user_id=wa_id))
-                blocks.append({"type": "image",
-                            "content": {"kind": "file", "path": img_ref, "detail": "auto"}})
-
-            # ── audio / voice ─────────────────────────────────────────────
-            elif mtype in ("audio", "voice"):
-                media_id = msg[mtype]["id"]
-                media_url = requests.get(
-                    f"https://graph.facebook.com/v18.0/{media_id}",
-                    headers=HDR_AUTH, timeout=60).json().get("url")
-                audio_bytes = requests.get(media_url, headers=HDR_AUTH, timeout=60).content
-                audio_ref   = self.save_file(audio_bytes, wa_id)
-
-                transcript = None
-                if callable(speech_to_text):
-                    transcript = speech_to_text({"manager": self, "file_path": audio_ref[5:]})
-                else:
-                    try:
-                        transcript = self.stt(audio_ref, whisper_provider, whisper_model)
-                    except Exception as e:
-                        log.error("STT failed: %s", e)
-
-                if transcript:
-                    blocks.extend(self._to_blocks(transcript, user_id=wa_id))
-                blocks.append({"type": "audio",
-                            "content": {"kind": "file", "path": audio_ref, "detail": "auto"}})
-
-            else:
-                _send_text(wa_id, "Unsupported message type.")
-                return
-
-            # ── runner callbacks ─────────────────────────────────────────
-
-            def _cb_update(messages, manager, params=None, _wa_id=wa_id):
-                if on_update:
-                    custom = on_update(messages, manager, params)
-                    if custom is not None:
-                        blocks_to_whatsapp(_wa_id, manager._to_blocks(custom, user_id=_wa_id))
-
-            def _cb_complete(messages, manager, params=None, _wa_id=wa_id):
-                if on_complete:
-                    custom = on_complete(messages, manager, params)
-                    if custom is not None:
-                        blocks_to_whatsapp(_wa_id, manager._to_blocks(custom, user_id=_wa_id))
-                        return
-                elif messages:
-                    blocks_to_whatsapp(_wa_id, messages[-1]["message"])
-
-            # ── run MAS (thread keeps webhook snappy) ─────────────────────
-            def _run():
-                log.debug("[Whatsapp Bot] MAS RUN user=%s  blocks=%s", wa_id, blocks[:1])
-                self.run(
-                    input=blocks,
-                    component_name=component_name,
-                    user_id=wa_id,
-                    role="user",
-                    verbose=verbose,
-                    blocking=True,
-                    on_update=_cb_update,
-                    on_complete=_cb_complete,
-                    return_token_count=return_token_count
-                )
-            threading.Thread(target=_run, daemon=True).start()
-
-        # ────────────────────────── launch ───────────────────────────────
-        if verbose:
-            log.info("[Whatsapp Bot] WhatsApp bot up at http://%s:%d%s", host, port, base_path)
-        app.run(host=host, port=port, threaded=True)
-
+        else:
+            return bot_instance
 
     def stt(self, file_path, provider=None, model=None):
         if provider:
@@ -5461,16 +4971,6 @@ class AgentSystemManager:
             file_path = file_path[5:]
 
         def _audio_duration_sec(path: str):
-            """
-            Return length in seconds for *any* common audio file.
-            Strategy:
-            1) .wav/.wave → use Python's wave module (no deps)
-            2) If FFmpeg/ffprobe present → use it (handles mp3, ogg, m4a…)
-            3) If mutagen installed → use it
-            4) Give up → None  (caller decides fallback price)
-
-            Works with absolute paths or our internal 'file:...' refs.
-            """
             import os, subprocess, json
 
             if path.startswith("file:"):
@@ -5928,3 +5428,643 @@ class Parser:
             result["component"] = item_str
 
         return result
+
+
+import abc
+import asyncio
+
+class Bot(abc.ABC):
+    def __init__(
+        self,
+        manager: AgentSystemManager,
+        component_name: Optional[str] = None,
+        verbose: bool = False,
+        on_update: Optional[Callable] = None,
+        on_complete: Optional[Callable] = None,
+        speech_to_text: Optional[Callable] = None,
+        whisper_provider: Optional[str] = None,
+        whisper_model: Optional[str] = None,
+        on_start_msg: str = "Hey! Talk to me or type '/clear' to erase your message history.",
+        on_clear_msg: str = "Message history deleted.",
+        return_token_count: bool = False,
+        ensure_delivery: bool = False, 
+        delivery_timeout: float = 5.0,
+        max_allowed_message_delay: float = 120.0
+    ):
+        self.manager = manager
+        self.component_name = component_name
+        self.verbose = verbose
+        self.on_update_user_callback = on_update or self.manager.on_update
+        self.on_complete_user_callback = on_complete or self.manager.on_complete
+        self.speech_to_text = speech_to_text
+        self.whisper_provider = whisper_provider
+        self.whisper_model = whisper_model
+        self.on_start_msg = on_start_msg
+        self.on_clear_msg = on_clear_msg
+        self.return_token_count = return_token_count
+        self.ensure_delivery = ensure_delivery
+        self.delivery_timeout = delivery_timeout
+        self.max_allowed_message_delay = max_allowed_message_delay
+        self.logger = logging.getLogger(__name__)
+
+    # --- Métodos abstractos para ser implementados por las clases hijas ---
+
+    @abc.abstractmethod
+    async def _parse_payload(self, payload: Any) -> Optional[Dict[str, Any]]:
+        """
+        Parsea el payload crudo de la plataforma y lo convierte en un diccionario estandarizado.
+        Debe devolver un diccionario con claves como:
+        {
+            'user_id': str,
+            'message_type': 'text' | 'image' | 'audio',
+            'text': Optional[str],         # Para texto o caption
+            'media_info': Optional[Any],   # Info necesaria para descargar el medio
+            'timestamp': datetime,         # Timestamp del mensaje
+            'original_payload': Any        # Payload original para contexto
+        }
+        o None si el mensaje no debe ser procesado.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def _send_blocks(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]) -> None:
+        """
+        Envía una lista de bloques de MAS al usuario a través de la API de la plataforma.
+        """
+        raise NotImplementedError
+    
+    @abc.abstractmethod
+    async def _download_media_and_save(self, user_id: str, media_info: Any) -> str:
+        """
+        Descarga un archivo multimedia usando la información específica de la plataforma,
+        lo guarda con manager.save_file() y devuelve la referencia al archivo ("file:/...").
+        """
+        raise NotImplementedError
+
+    # --- Lógica de procesamiento principal (común para todos los bots) ---
+
+    def _is_too_old(self, msg_dt, *, max_age=120) -> bool:
+        if not isinstance(msg_dt, datetime):
+            return False
+        if msg_dt.tzinfo is None:
+            msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - msg_dt) > timedelta(seconds=max_age)
+
+    async def process_payload(self, payload: Any) -> None:
+        parsed_message = await self._parse_payload(payload)
+
+        if not parsed_message:
+            if self.verbose:
+                self.logger.debug("[Bot] Payload ignorado o no parseable.")
+            return
+
+        user_id = parsed_message['user_id']
+        
+        # 1. Chequeo de antigüedad del mensaje
+        if self._is_too_old(parsed_message['timestamp'], max_age = self.max_allowed_message_delay):
+            self.logger.debug(f"[Bot] Mensaje de {user_id} ignorado por ser demasiado antiguo.")
+            return
+            
+        # 2. Manejo de comandos
+        if parsed_message.get('message_type') == 'text':
+            is_command = await self._handle_command(user_id, parsed_message['text'], parsed_message)
+            if is_command:
+                return # El comando ya fue manejado y se envió respuesta
+
+        # 3. Construcción de los bloques de MAS
+        mas_blocks = await self._build_mas_blocks(parsed_message)
+        
+        if not mas_blocks:
+            if self.verbose:
+                self.logger.debug(f"[Bot] No se generaron bloques para el mensaje de {user_id}.")
+            return
+        
+        callback_params = {
+            "user_id": user_id,
+            "original_payload": parsed_message['original_payload'],
+            "event_loop": asyncio.get_running_loop()
+        }
+
+        def _send_response_from_callback(response):
+            """Función helper para enviar respuestas desde los callbacks síncronos."""
+            if response is not None:
+                blocks = self.manager._to_blocks(response, user_id=user_id)
+
+                loop = callback_params["event_loop"]
+                fut = asyncio.run_coroutine_threadsafe(
+                   self._send_blocks(user_id, blocks, parsed_message), loop
+                )
+                if self.ensure_delivery:
+                   try:
+                       fut.result(timeout=self.delivery_timeout)
+                   except Exception as e:
+                       self.logger.exception(f"Bot delivery failed or timed out: {e}")
+
+        def on_update_wrapper(messages, manager, params):
+            if self.on_update_user_callback:
+                response = self.on_update_user_callback(messages, manager, params)
+                _send_response_from_callback(response)
+
+        def on_complete_wrapper(messages, manager, params):
+            response = None
+            if self.on_complete_user_callback:
+                response = self.on_complete_user_callback(messages, manager, params)
+            elif messages:
+                response = messages[-1].get("message")
+            
+            _send_response_from_callback(response)
+
+        if self.verbose:
+            self.logger.debug(f"[Bot] Ejecutando manager.run para el usuario {user_id} con bloques: {mas_blocks}")
+        
+        # manager.run es síncrono, lo ejecutamos en un thread pool para no bloquear el loop de eventos.
+        # asyncio.to_thread es la forma moderna y recomendada de hacerlo.
+        await asyncio.to_thread(
+            self.manager.run,
+            input=mas_blocks,
+            component_name=self.component_name,
+            user_id=user_id,
+            role="user",
+            verbose=self.verbose,
+            blocking=True,
+            on_update=on_update_wrapper,
+            on_update_params=callback_params,
+            on_complete=on_complete_wrapper,
+            on_complete_params=callback_params,
+            return_token_count=self.return_token_count
+        )
+
+    async def _handle_command(self, user_id: str, text: str, original_message: Dict[str, Any]) -> bool:
+        """
+        Revisa si el texto es un comando y actúa en consecuencia.
+        Devuelve True si era un comando, False en caso contrario.
+        """
+        cmd = text.strip().lower()
+        response_text = None
+        
+        if cmd == "/start":
+            response_text = self.on_start_msg
+        elif cmd == "/clear":
+            self.manager.clear_message_history(user_id)
+            response_text = self.on_clear_msg
+        elif cmd == "/clear_all_users":
+            if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
+                response_text = "No autorizado."
+            else:
+                count = self.manager.clear_global_history()
+                response_text = f"Historiales de todos los usuarios borrados ({count} DBs)."
+        elif cmd == "/reset_system":
+            if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
+                response_text = "No autorizado."
+            else:
+                self.manager.reset_system()
+                response_text = "Sistema reseteado: se eliminaron todos los historiales y archivos."
+        elif cmd == "/logs":
+             if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
+                response_text = "No autorizado."
+             else:
+                # TODO: La clase hija debería implementar el envío de los archivos de log.
+                response_text = "La funcionalidad de envío de logs debe ser implementada por la clase hija."
+
+        if response_text:
+            response_blocks = self.manager._to_blocks(response_text, user_id=user_id)
+            await self._send_blocks(user_id, response_blocks, original_message)
+            return True
+            
+        return False
+
+    async def _build_mas_blocks(self, parsed_message: Dict[str, Any]) -> List[Dict]:
+        """
+        Construye la lista de bloques de MAS a partir del mensaje parseado.
+        """
+        user_id = parsed_message['user_id']
+        msg_type = parsed_message['message_type']
+        text = parsed_message.get('text')
+        media_info = parsed_message.get('media_info')
+        blocks = []
+
+        # 1. Transcribir audio si existe
+        transcript = None
+        if msg_type == 'audio':
+            audio_ref = await self._download_media_and_save(user_id, media_info)
+            transcript = None
+            if self.speech_to_text:
+                stt_params = {
+                    "manager": self.manager, 
+                    "file_path": audio_ref[5:], # quitamos "file:"
+                }
+                transcript = self.speech_to_text(stt_params)
+            else:
+                try:
+                    transcript = self.manager.stt(audio_ref, self.whisper_provider, self.whisper_model)
+                except Exception as e:
+                    self.logger.error(f"Error en STT automático para {user_id}: {e}")
+            
+            if transcript:
+                blocks.extend(self.manager._to_blocks(transcript, user_id=user_id))
+            
+            # Siempre agregamos el bloque de audio, con o sin transcripción
+            blocks.append({
+                "type": "audio",
+                "content": {"kind": "file", "path": audio_ref, "detail": "auto"}
+            })
+
+        # 2. Agregar texto (de mensaje de texto, caption o transcripción)
+        elif msg_type == 'text' and text:
+            blocks.extend(self.manager._to_blocks(text, user_id=user_id))
+        
+        # 3. Procesar imagen
+        elif msg_type == 'image':
+            if text: # Si hay un caption
+                 blocks.extend(self.manager._to_blocks(text, user_id=user_id))
+            img_ref = await self._download_media_and_save(user_id, media_info)
+            blocks.append({
+                "type": "image",
+                "content": {"kind": "file", "path": img_ref, "detail": "auto"}
+            })
+            
+        return blocks
+    
+
+class TelegramBot(Bot):
+    def __init__(
+        self,
+        manager: AgentSystemManager,
+        telegram_token: str = None, # El token ahora puede ser None aquí
+        **kwargs
+    ):
+        super().__init__(manager=manager, **kwargs)
+        
+        token = telegram_token or self.manager.get_key("telegram_token")
+        if not token:
+            raise ValueError("Telegram token no fue proporcionado ni encontrado en las API keys del manager.")
+            
+        self.telegram_token = token
+        self.application = Application.builder().token(self.telegram_token).build()
+        self.bot = self.application.bot
+        self._register_handlers()
+        
+        if self.verbose:
+            self.logger.info("[TelegramBot] Instancia de TelegramBot creada.")
+
+    def _register_handlers(self):
+        command_list = ["start", "clear", "clear_all_users", "reset_system", "logs"]
+        for command in command_list:
+            self.application.add_handler(CommandHandler(command, self.process_payload_wrapper))
+
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_payload_wrapper))
+        self.application.add_handler(MessageHandler(filters.PHOTO, self.process_payload_wrapper))
+        self.application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.process_payload_wrapper))
+
+    async def initialize(self):
+        """Inicializa la aplicación de Telegram. Llama a esto una vez al iniciar el servidor."""
+        await self.application.initialize()
+
+    async def process_webhook_update(self, update_data: dict):
+        """Procesa un payload JSON entrante de un webhook de Telegram."""
+        update = Update.de_json(update_data, self.bot)
+        await self.application.process_update(update)
+
+    async def process_payload_wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Wrapper que simplemente llama a la lógica de procesamiento principal de la clase base."""
+        await self.process_payload(update)
+
+    async def _parse_payload(self, payload: Update) -> Optional[Dict[str, Any]]:
+        if not payload.message:
+            return None
+
+        message = payload.message
+        msg_type = 'text' if message.text else 'image' if message.photo else 'audio' if (message.voice or message.audio) else None
+        if not msg_type:
+            return None
+
+        return {
+            'user_id': str(message.chat.id),
+            'message_type': msg_type,
+            'text': message.text or message.caption,
+            'media_info': message.photo[-1] if message.photo else message.voice or message.audio,
+            'timestamp': message.date,
+            'original_payload': payload 
+        }
+
+    async def _download_media_and_save(self, user_id: str, media_info: Any) -> str:
+        file = await self.bot.get_file(media_info.file_id)
+        media_bytes = await file.download_as_bytearray()
+        return self.manager.save_file(bytes(media_bytes), user_id)
+
+    async def _send_blocks(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]):
+        """
+        Envía bloques respondiendo al mensaje original para mantener el contexto de la conversación.
+        """
+        update = original_message['original_payload']
+        if not blocks or not update or not update.message:
+            return
+
+        for block in blocks:
+            try:
+                block_type = block.get("type")
+                content = block.get("content", {})
+                
+                if block_type == "text":
+                    text_content = self.manager._block_to_plain_text(block)
+                    if text_content:
+                        await update.message.reply_text(text_content)
+                
+                elif block_type == "image" and "path" in content:
+                    path = content["path"]
+                    if path.startswith("file:"):
+                        with open(path[5:], "rb") as f:
+                            await update.message.reply_photo(f)
+                    else:
+                        await update.message.reply_photo(path)
+
+                elif block_type == "audio" and "path" in content and content["path"].startswith("file:"):
+                    with open(content["path"][5:], "rb") as f:
+                        await update.message.reply_voice(f)
+            except Exception as e:
+                self.logger.error(f"Error al enviar bloque a Telegram para {user_id}: {e}\nBloque: {block}")
+
+    async def _handle_command(self, user_id: str, text: str, original_message: Dict[str, Any]) -> bool:
+        """
+        Maneja comandos, usando el bot para enviar documentos (/logs) o delegando al método base.
+        """
+        cmd = text.strip().lower()
+
+        if cmd == "/logs":
+            if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
+                await self._send_blocks(user_id, self.manager._to_blocks("No autorizado."), original_message)
+                return True
+
+            logs_dir = getattr(self.manager, "logs_folder", None)
+            if not logs_dir or not self.manager._usage_logging_enabled:
+                await self._send_blocks(user_id, self.manager._to_blocks("El registro de uso está deshabilitado."), original_message)
+                return True
+            
+            self.manager._refresh_cost_summary()
+            usage_path = os.path.join(logs_dir, "usage.log")
+            summary_path = os.path.join(logs_dir, "summary.log")
+            
+            sent_count = 0
+            if os.path.isfile(usage_path):
+                with open(usage_path, "rb") as f:
+                    await self.bot.send_document(chat_id=user_id, document=f, filename="usage.log")
+                sent_count += 1
+            if os.path.isfile(summary_path):
+                 with open(summary_path, "rb") as f:
+                    await self.bot.send_document(chat_id=user_id, document=f, filename="summary.json")
+                 sent_count += 1
+            
+            if sent_count == 0:
+                await self._send_blocks(user_id, self.manager._to_blocks("No se encontraron archivos de log."), original_message)
+
+            return True
+
+        return await super()._handle_command(user_id, text, original_message)
+
+    def start_polling(self):
+        if self.verbose:
+            self.logger.info("[TelegramBot] Iniciando bot en modo polling...")
+        self.application.run_polling()
+
+class WhatsappBot(Bot):
+    def __init__(
+        self,
+        manager: AgentSystemManager,
+        whatsapp_token: str = None,
+        phone_number_id: str = None,
+        webhook_verify_token: str = None,
+        **kwargs
+    ):
+        super().__init__(manager=manager, **kwargs)
+
+        self.whatsapp_token = whatsapp_token or self.manager.get_key("whatsapp_token")
+        self.phone_number_id = phone_number_id or self.manager.get_key("whatsapp_phone_number_id")
+        self.webhook_verify_token = webhook_verify_token or self.manager.get_key("webhook_verify_token")
+
+        if not all([self.whatsapp_token, self.phone_number_id, self.webhook_verify_token]):
+            raise ValueError(
+                "Faltan credenciales de WhatsApp. Proporciona whatsapp_token, "
+                "phone_number_id y webhook_verify_token."
+            )
+
+        self.api_version = "v18.0"
+        self.graph_url = f"https://graph.facebook.com/{self.api_version}/{self.phone_number_id}"
+        self.headers_json = {"Authorization": f"Bearer {self.whatsapp_token}", "Content-Type": "application/json"}
+        self.headers_auth = {"Authorization": f"Bearer {self.whatsapp_token}"}
+        self.persistent_loop = None
+
+        if self.verbose:
+            self.logger.info("[WhatsappBot] Instancia de WhatsappBot creada y configurada.")
+
+    def handle_webhook_verification(self, query_params: dict) -> tuple[str, int]:
+        if query_params.get("hub.verify_token") == self.webhook_verify_token:
+            challenge = query_params.get("hub.challenge", "")
+            return challenge, 200
+        return "Forbidden", 403
+    
+    async def process_webhook_update(self, update_data: dict):
+        """
+        Punto de entrada para un webhook. Procesa el JSON crudo de Meta.
+        """
+        try:
+            for entry in update_data.get("entry", []):
+                for change in entry.get("changes", []):
+                    for msg in change.get("value", {}).get("messages", []):
+                        await self.process_payload(msg)
+        except Exception as e:
+            self.logger.exception(f"Error al procesar payload de webhook de WhatsApp: {e}")
+
+
+    async def _parse_payload(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        msg_type = payload.get("type")
+        if not msg_type or not payload.get("from"):
+            return None
+
+        user_id = payload["from"]
+        timestamp = datetime.fromtimestamp(int(payload.get("timestamp", 0)), timezone.utc)
+        text, media_info = None, None
+
+        if msg_type == "text":
+            text = payload.get("text", {}).get("body")
+        elif msg_type in ("image", "audio", "voice"):
+            media_type = "audio" if msg_type == "voice" else msg_type
+            media_info = payload.get(media_type, {}).get("id")
+            text = payload.get(media_type, {}).get("caption")
+        else: # Ignorar otros tipos como 'sticker', 'document', etc. por ahora
+            return None
+
+        return {
+            'user_id': user_id,
+            'message_type': "audio" if msg_type == "voice" else msg_type,
+            'text': text,
+            'media_info': media_info,
+            'timestamp': timestamp,
+            'original_payload': payload 
+        }
+
+    async def _download_media_and_save(self, user_id: str, media_info: str) -> str:
+        media_id = media_info
+        
+        def do_download():
+            media_url_info = requests.get(
+                f"https://graph.facebook.com/{self.api_version}/{media_id}",
+                headers=self.headers_auth, timeout=30
+            )
+            media_url_info.raise_for_status()
+            media_url = media_url_info.json().get("url")
+            if not media_url:
+                raise ValueError("No se pudo obtener la URL del medio de WhatsApp.")
+
+            media_bytes_response = requests.get(media_url, headers=self.headers_auth, timeout=30)
+            media_bytes_response.raise_for_status()
+            return self.manager.save_file(media_bytes_response.content, user_id)
+        
+        return await asyncio.to_thread(do_download)
+
+    async def _send_blocks(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]):
+        # El 'original_message' no se usa aquí como en Telegram (no hay "reply"),
+        # pero mantenemos la firma consistente.
+        if not blocks:
+            return
+
+        for block in blocks:
+            try:
+                block_type = block.get("type")
+                content = block.get("content", {})
+                
+                if block_type == "text":
+                    text_content = self.manager._block_to_plain_text(block)
+                    if text_content:
+                        await self._send_api_request("text", to=user_id, body=text_content)
+                
+                elif block_type == "image" and content.get("path", "").startswith("file:"):
+                    media_id = await self._upload_media(content["path"][5:])
+                    if media_id:
+                        await self._send_api_request("image", to=user_id, media_id=media_id)
+
+                elif block_type == "audio" and content.get("path", "").startswith("file:"):
+                    media_id = await self._upload_media(content["path"][5:])
+                    if media_id:
+                        await self._send_api_request("audio", to=user_id, media_id=media_id)
+
+            except Exception as e:
+                self.logger.error(f"Error al enviar bloque a WhatsApp para {user_id}: {e}\nBloque: {block}")
+    
+
+    async def _send_document(self, to: str, path: str, filename: str = None, caption: str = None):
+        media_id = await self._upload_media(path)
+        if not media_id: return
+        
+        doc_payload = {"id": media_id}
+        if filename: doc_payload["filename"] = filename
+        if caption: doc_payload["caption"] = caption
+        
+        await self._send_api_request("document", to=to, document_payload=doc_payload)
+
+    async def _send_api_request(self, msg_type: str, to: str, body: str = None, media_id: str = None, document_payload: dict = None):
+        payload = {"messaging_product": "whatsapp", "to": to}
+        if msg_type == "text":
+            payload["type"] = "text"
+            payload["text"] = {"body": body}
+        elif msg_type in ("image", "audio"):
+            payload["type"] = msg_type
+            payload[msg_type] = {"id": media_id}
+        elif msg_type == "document":
+            payload["type"] = "document"
+            payload["document"] = document_payload
+        
+        resp = await asyncio.to_thread(
+            requests.post, f"{self.graph_url}/messages", headers=self.headers_json, json=payload, timeout=30
+        )
+
+        if not resp.ok:
+            # Log claro con datos útiles (recorta payload para no romper logs)
+            short_payload = json.dumps(payload)[:1200]
+            self.logger.error(
+                "[WA SEND] FAILED %s → %s | status=%s | resp=%s | payload=%s",
+                msg_type, to, resp.status_code, resp.text, short_payload
+            )
+        else:
+            self.logger.debug(
+                "[WA SEND] OK %s → %s | status=%s",
+                msg_type, to, resp.status_code
+            )
+
+    async def _handle_command(self, user_id: str, text: str, original_message: Dict[str, Any]) -> bool:
+        cmd = text.strip().lower()
+        if cmd == "/logs":
+            if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
+                await self._send_blocks(user_id, self.manager._to_blocks("No autorizado."), original_message)
+                return True
+
+            logs_dir = getattr(self.manager, "logs_folder", None)
+            if not logs_dir or not self.manager._usage_logging_enabled:
+                await self._send_blocks(user_id, self.manager._to_blocks("El registro de uso está deshabilitado."), original_message)
+                return True
+            
+            self.manager._refresh_cost_summary()
+            usage_path = os.path.join(logs_dir, "usage.log")
+            summary_path = os.path.join(logs_dir, "summary.log")
+            
+            sent_count = 0
+            if os.path.isfile(usage_path):
+                await self._send_document(user_id, usage_path, filename="usage.log")
+                sent_count += 1
+            if os.path.isfile(summary_path):
+                await self._send_document(user_id, summary_path, filename="summary.json")
+                sent_count += 1
+            
+            if sent_count == 0:
+                await self._send_blocks(user_id, self.manager._to_blocks("No se encontraron archivos de log."), original_message)
+            else:
+                await self._send_blocks(user_id, self.manager._to_blocks(f"Enviados {sent_count} archivo(s) de logs."), original_message)
+                
+            return True
+            
+        return await super()._handle_command(user_id, text, original_message)
+
+    async def _upload_media(self, path: str) -> Optional[str]:
+        def do_upload():
+            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            with open(path, "rb") as fh:
+                files = {"file": (os.path.basename(path), fh, mime)}
+                r = requests.post(f"{self.graph_url}/media", headers=self.headers_auth,
+                                  data={"messaging_product": "whatsapp"}, files=files, timeout=60)
+                if r.ok:
+                    return r.json().get("id")
+            self.logger.error("Fallo al subir medio a WhatsApp: %s", r.text)
+            return None
+        return await asyncio.to_thread(do_upload)
+        
+    def run_server(self, host: str = "0.0.0.0", port: int = 5000, base_path: str = "/webhook"):
+        """Inicia un servidor Flask de conveniencia para el modo "polling"."""
+        self.persistent_loop = asyncio.new_event_loop()
+
+        def run_asyncio_loop():
+            asyncio.set_event_loop(self.persistent_loop)
+            self.persistent_loop.run_forever()
+        
+        loop_thread = threading.Thread(target=run_asyncio_loop, daemon=True)
+        loop_thread.start()
+
+        app = Flask(__name__)
+        @app.route(base_path, methods=["GET", "POST"])
+        def webhook_handler():
+            if request.method == "GET":
+                body, status = self.handle_webhook_verification(request.args)
+                return body, status
+            elif request.method == "POST":
+                data = request.get_json(force=True, silent=True) or {}
+                asyncio.run_coroutine_threadsafe(
+                    self.process_webhook_update(data), self.persistent_loop
+                )
+                return "OK", 200
+        if self.verbose: self.logger.info(f"[WhatsappBot] Servidor Flask corriendo en http://{host}:{port}{base_path}")
+        try:
+            app.run(host=host, port=port)
+        except Exception as e:
+            self.logger.exception(f"Error al iniciar el servidor Flask: {e}")
+        finally:
+            if self.persistent_loop and self.persistent_loop.is_running():
+                self.logger.info("[WhatsappBot] Deteniendo el bucle de eventos asíncrono.")
+                self.persistent_loop.call_soon_threadsafe(self.persistent_loop.stop)
