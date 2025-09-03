@@ -5446,6 +5446,9 @@ class Bot(abc.ABC):
         whisper_model: Optional[str] = None,
         on_start_msg: str = "Hey! Talk to me or type '/clear' to erase your message history.",
         on_clear_msg: str = "Message history deleted.",
+        on_help_msg: str = "Here are the available commands:",
+        unknown_command_msg: Optional[str] = "I don't recognize that command. Type /help to see what I can do.", # NUEVO
+        custom_commands: Optional[Union[Dict, List[Dict]]] = None, # NUEVO
         return_token_count: bool = False,
         ensure_delivery: bool = False, 
         delivery_timeout: float = 5.0,
@@ -5459,12 +5462,20 @@ class Bot(abc.ABC):
         self.speech_to_text = speech_to_text
         self.whisper_provider = whisper_provider
         self.whisper_model = whisper_model
+
         self.on_start_msg = on_start_msg
         self.on_clear_msg = on_clear_msg
+        self.on_help_msg = on_help_msg
+        self.unknown_command_msg = unknown_command_msg
+        self.commands = {}
+        
+        self._register_commands(custom_commands)
+
         self.return_token_count = return_token_count
         self.ensure_delivery = ensure_delivery
         self.delivery_timeout = delivery_timeout
         self.max_allowed_message_delay = max_allowed_message_delay
+
         self.logger = logging.getLogger(__name__)
 
     # --- Métodos abstractos para ser implementados por las clases hijas ---
@@ -5501,6 +5512,14 @@ class Bot(abc.ABC):
         """
         raise NotImplementedError
 
+    @abc.abstractmethod
+    async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
+        """
+        Envía una lista de archivos de log al usuario, cada uno con su ruta y nombre de archivo.
+        Debe ser implementado por cada clase de bot específica de la plataforma.
+        """
+        raise NotImplementedError
+
     # --- Lógica de procesamiento principal (común para todos los bots) ---
 
     def _is_too_old(self, msg_dt, *, max_age=120) -> bool:
@@ -5526,7 +5545,7 @@ class Bot(abc.ABC):
             return
             
         # 2. Manejo de comandos
-        if parsed_message.get('message_type') == 'text':
+        if parsed_message.get('message_type') == 'text' and parsed_message.get('text', '').startswith('/'):
             is_command = await self._handle_command(user_id, parsed_message['text'], parsed_message)
             if is_command:
                 return # El comando ya fue manejado y se envió respuesta
@@ -5577,8 +5596,6 @@ class Bot(abc.ABC):
         if self.verbose:
             self.logger.debug(f"[Bot] Ejecutando manager.run para el usuario {user_id} con bloques: {mas_blocks}")
         
-        # manager.run es síncrono, lo ejecutamos en un thread pool para no bloquear el loop de eventos.
-        # asyncio.to_thread es la forma moderna y recomendada de hacerlo.
         await asyncio.to_thread(
             self.manager.run,
             input=mas_blocks,
@@ -5594,44 +5611,156 @@ class Bot(abc.ABC):
             return_token_count=self.return_token_count
         )
 
-    async def _handle_command(self, user_id: str, text: str, original_message: Dict[str, Any]) -> bool:
-        """
-        Revisa si el texto es un comando y actúa en consecuencia.
-        Devuelve True si era un comando, False en caso contrario.
-        """
-        cmd = text.strip().lower()
-        response_text = None
+    def _register_commands(self, custom_commands: Optional[Union[Dict, List[Dict]]]):
+        # --- Comandos Integrados ---
+        self.commands["/start"] = {
+            "message": self.on_start_msg, "function": None, 
+            "description": "Starts the conversation.", "admin_only": False
+        }
+        self.commands["/clear"] = {
+            "message": self.on_clear_msg, "function": self._clear_history_cmd,
+            "description": "Clears your message history.", "admin_only": False
+        }
+        self.commands["/help"] = {
+            "message": None, "function": self._generate_help_message,
+            "description": "Shows this help message.", "admin_only": False
+        }
         
-        if cmd == "/start":
-            response_text = self.on_start_msg
-        elif cmd == "/clear":
-            self.manager.clear_message_history(user_id)
-            response_text = self.on_clear_msg
-        elif cmd == "/clear_all_users":
+        # --- Comandos de Administrador ---
+        if self.manager.admin_user_id:
+            self.commands["/clear_all_users"] = {
+                "message": None, "function": self._clear_all_cmd,
+                "description": "[Admin] Clears history for all users.", "admin_only": True
+            }
+            self.commands["/reset_system"] = {
+                "message": None, "function": self._reset_system_cmd,
+                "description": "[Admin] Resets the entire system (history and files).", "admin_only": True
+            }
+            self.commands["/logs"] = {
+                 "message": None, "function": self._logs_command_handler,
+                 "description": "[Admin] Requests log files.", "admin_only": True
+            }
+
+        # --- Comandos Personalizados ---
+        if custom_commands:
+            cmds = [custom_commands] if isinstance(custom_commands, dict) else custom_commands
+            for cmd_def in cmds:
+                command = cmd_def.get("command")
+                if not command or not isinstance(command, str) or not command.startswith('/'):
+                    self.logger.warning(f"Invalid custom command definition skipped: {cmd_def}")
+                    continue
+                
+                func = cmd_def.get("function")
+                if isinstance(func, str):
+                    try:
+                        func = self.manager._get_function_from_string(func)
+                    except (ValueError, FileNotFoundError, AttributeError) as e:
+                        self.logger.error(f"Could not resolve function for command {command}: {e}")
+                        func = None
+
+                self.commands[command.lower().strip()] = {
+                    "message": cmd_def.get("message"),
+                    "function": func,
+                    "description": cmd_def.get("description", "Custom command."),
+                    "admin_only": cmd_def.get("admin_only", False)
+                }
+
+    async def _generate_help_message(self, **kwargs) -> str:
+        lines = [self.on_help_msg, ""]
+        for cmd, details in sorted(self.commands.items()):
+            lines.append(f"{cmd} - {details['description']}")
+        return "\n".join(lines)
+
+    async def _clear_history_cmd(self, manager: AgentSystemManager, user_id: str, **kwargs) -> None:
+        manager.clear_message_history(user_id)
+
+    async def _clear_all_cmd(self, manager: AgentSystemManager, **kwargs) -> str:
+        count = manager.clear_global_history()
+        return f"Histories for all users cleared ({count} DBs)."
+
+    async def _reset_system_cmd(self, manager: AgentSystemManager, **kwargs) -> str:
+        manager.reset_system()
+        return "System reset: all user histories and files have been deleted."
+
+    async def _logs_command_handler(self, manager: AgentSystemManager, user_id: str, original_message: Dict[str, Any], **kwargs) -> Optional[str]:
+
+        logs_dir = getattr(manager, "logs_folder", None)
+        if not logs_dir or not manager._usage_logging_enabled:
+            return "Usage logging is disabled."
+
+        manager._refresh_cost_summary()
+
+        files_to_send = []
+        usage_path = os.path.join(logs_dir, "usage.log")
+        summary_path = os.path.join(logs_dir, "summary.log")
+
+        if os.path.isfile(usage_path):
+            files_to_send.append({"path": usage_path, "filename": "usage.log"})
+        if os.path.isfile(summary_path):
+            files_to_send.append({"path": summary_path, "filename": "summary.json"})
+
+        if not files_to_send:
+            return "No log files found."
+
+        try:
+            sent_count = await self._send_log_files(user_id, files_to_send, original_message)
+            if sent_count == 0 and len(files_to_send) > 0:
+                 return "Failed to send log files."
+            return None
+        
+        except Exception as e:
+            self.logger.error(f"Error during log sending process for user {user_id}: {e}")
+            return "An error occurred while trying to send the log files."
+    
+    async def _handle_command(self, user_id: str, text: str, original_message: Dict[str, Any]) -> bool:
+        if not text or not text.startswith('/'):
+            return False
+
+        command_str = text.split(' ', 1)[0].lower()
+        cmd_handler = self.commands.get(command_str)
+
+        if not cmd_handler:
+            if self.unknown_command_msg:
+                response_blocks = self.manager._to_blocks(self.unknown_command_msg, user_id=user_id)
+                await self._send_blocks(user_id, response_blocks, original_message)
+            return True
+        
+        if cmd_handler.get("admin_only", False):
             if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
-                response_text = "No autorizado."
-            else:
-                count = self.manager.clear_global_history()
-                response_text = f"Historiales de todos los usuarios borrados ({count} DBs)."
-        elif cmd == "/reset_system":
-            if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
-                response_text = "No autorizado."
-            else:
-                self.manager.reset_system()
-                response_text = "Sistema reseteado: se eliminaron todos los historiales y archivos."
-        elif cmd == "/logs":
-             if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
-                response_text = "No autorizado."
-             else:
-                # TODO: La clase hija debería implementar el envío de los archivos de log.
-                response_text = "La funcionalidad de envío de logs debe ser implementada por la clase hija."
+                response_blocks = self.manager._to_blocks("Unauthorized.", user_id=user_id)
+                await self._send_blocks(user_id, response_blocks, original_message)
+                return True
+
+        response_text = None
+        func = cmd_handler.get("function")
+        if func:
+            try:
+                sig = inspect.signature(func)
+                params = {"user_id": user_id, "original_message": original_message}
+                if 'manager' in sig.parameters:
+                    params['manager'] = self.manager
+                
+                if asyncio.iscoroutinefunction(func):
+                    func_result = await func(**params)
+                else:
+                    func_result = func(**params)
+
+                if isinstance(func_result, str):
+                    response_text = func_result
+
+            except Exception as e:
+                self.logger.exception(f"Error executing function for command {command_str}: {e}")
+                response_text = f"An error occurred while running the command."
+
+        if response_text is None and cmd_handler.get("message"):
+            response_text = cmd_handler.get("message")
 
         if response_text:
             response_blocks = self.manager._to_blocks(response_text, user_id=user_id)
             await self._send_blocks(user_id, response_blocks, original_message)
-            return True
             
-        return False
+        return True
+
 
     async def _build_mas_blocks(self, parsed_message: Dict[str, Any]) -> List[Dict]:
         """
@@ -5708,7 +5837,7 @@ class TelegramBot(Bot):
             self.logger.info("[TelegramBot] Instancia de TelegramBot creada.")
 
     def _register_handlers(self):
-        command_list = ["start", "clear", "clear_all_users", "reset_system", "logs"]
+        command_list = [cmd.lstrip('/') for cmd in self.commands.keys()]
         for command in command_list:
             self.application.add_handler(CommandHandler(command, self.process_payload_wrapper))
 
@@ -5784,42 +5913,16 @@ class TelegramBot(Bot):
             except Exception as e:
                 self.logger.error(f"Error al enviar bloque a Telegram para {user_id}: {e}\nBloque: {block}")
 
-    async def _handle_command(self, user_id: str, text: str, original_message: Dict[str, Any]) -> bool:
-        """
-        Maneja comandos, usando el bot para enviar documentos (/logs) o delegando al método base.
-        """
-        cmd = text.strip().lower()
-
-        if cmd == "/logs":
-            if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
-                await self._send_blocks(user_id, self.manager._to_blocks("No autorizado."), original_message)
-                return True
-
-            logs_dir = getattr(self.manager, "logs_folder", None)
-            if not logs_dir or not self.manager._usage_logging_enabled:
-                await self._send_blocks(user_id, self.manager._to_blocks("El registro de uso está deshabilitado."), original_message)
-                return True
-            
-            self.manager._refresh_cost_summary()
-            usage_path = os.path.join(logs_dir, "usage.log")
-            summary_path = os.path.join(logs_dir, "summary.log")
-            
-            sent_count = 0
-            if os.path.isfile(usage_path):
-                with open(usage_path, "rb") as f:
-                    await self.bot.send_document(chat_id=user_id, document=f, filename="usage.log")
+    async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
+        sent_count = 0
+        for file_info in files_to_send:
+            try:
+                with open(file_info["path"], "rb") as f:
+                    await self.bot.send_document(chat_id=user_id, document=f, filename=file_info["filename"])
                 sent_count += 1
-            if os.path.isfile(summary_path):
-                 with open(summary_path, "rb") as f:
-                    await self.bot.send_document(chat_id=user_id, document=f, filename="summary.json")
-                 sent_count += 1
-            
-            if sent_count == 0:
-                await self._send_blocks(user_id, self.manager._to_blocks("No se encontraron archivos de log."), original_message)
-
-            return True
-
-        return await super()._handle_command(user_id, text, original_message)
+            except Exception as e:
+                self.logger.error(f"Error sending log file {file_info['filename']} to Telegram user {user_id}: {e}")
+        return sent_count
 
     def start_polling(self):
         if self.verbose:
@@ -5922,8 +6025,7 @@ class WhatsappBot(Bot):
         return await asyncio.to_thread(do_download)
 
     async def _send_blocks(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]):
-        # El 'original_message' no se usa aquí como en Telegram (no hay "reply"),
-        # pero mantenemos la firma consistente.
+
         if not blocks:
             return
 
@@ -5990,38 +6092,19 @@ class WhatsappBot(Bot):
                 msg_type, to, resp.status_code
             )
 
-    async def _handle_command(self, user_id: str, text: str, original_message: Dict[str, Any]) -> bool:
-        cmd = text.strip().lower()
-        if cmd == "/logs":
-            if not self.manager.admin_user_id or str(user_id) != str(self.manager.admin_user_id):
-                await self._send_blocks(user_id, self.manager._to_blocks("No autorizado."), original_message)
-                return True
-
-            logs_dir = getattr(self.manager, "logs_folder", None)
-            if not logs_dir or not self.manager._usage_logging_enabled:
-                await self._send_blocks(user_id, self.manager._to_blocks("El registro de uso está deshabilitado."), original_message)
-                return True
-            
-            self.manager._refresh_cost_summary()
-            usage_path = os.path.join(logs_dir, "usage.log")
-            summary_path = os.path.join(logs_dir, "summary.log")
-            
-            sent_count = 0
-            if os.path.isfile(usage_path):
-                await self._send_document(user_id, usage_path, filename="usage.log")
+    async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
+        sent_count = 0
+        for file_info in files_to_send:
+            try:
+                await self._send_document(user_id, file_info["path"], filename=file_info["filename"])
                 sent_count += 1
-            if os.path.isfile(summary_path):
-                await self._send_document(user_id, summary_path, filename="summary.json")
-                sent_count += 1
-            
-            if sent_count == 0:
-                await self._send_blocks(user_id, self.manager._to_blocks("No se encontraron archivos de log."), original_message)
-            else:
-                await self._send_blocks(user_id, self.manager._to_blocks(f"Enviados {sent_count} archivo(s) de logs."), original_message)
-                
-            return True
-            
-        return await super()._handle_command(user_id, text, original_message)
+            except Exception as e:
+                self.logger.error(f"Error sending log file {file_info['filename']} to WhatsApp user {user_id}: {e}")
+        
+        if sent_count > 0:
+            await self._send_blocks(user_id, self.manager._to_blocks(f"Sent {sent_count} log file(s)."), original_message)
+        
+        return sent_count
 
     async def _upload_media(self, path: str) -> Optional[str]:
         def do_upload():

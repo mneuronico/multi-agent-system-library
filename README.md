@@ -1045,6 +1045,49 @@ Additionally, if you want an agent to declare which tool it uses directly inside
 
 Note that these examples are incomplete. You would need to define the inputs and outputs of the tool, as well as `my_tool_function` in your function file.
 
+### Listing Components
+
+The manager provides several methods to list registered components, which is useful for system introspection or building dynamic user interfaces.
+
+#### Type-Specific Methods
+
+You can list components of a specific type with these straightforward methods:
+
+```python
+# List all registered agents
+agent_names = manager.list_agents()  # Returns ['hello_agent', 'myagent']
+
+# List all tools
+tool_names = manager.list_tools() # Returns ['mytool']
+```
+*   `list_agents() -> List[str]`
+*   `list_tools() -> List[str]`
+*   `list_processes() -> List[str]`
+*   `list_automations() -> List[str]`
+
+#### Advanced Filtering with `list_components`
+
+For more advanced queries, use the `list_components` method, which allows filtering by type, name substring, or regular expression.
+
+```python
+manager.list_components(
+    types: Optional[List[str]] = None,
+    name_contains: Optional[str] = None,
+    regex: Optional[str] = None
+) -> List[str]
+```
+**Examples:**
+```python
+# List only agents and tools
+components = manager.list_components(types=['agent', 'tool'])
+
+# List all components whose name contains 'responder'
+responders = manager.list_components(name_contains='responder')
+
+# List tools that follow a versioning pattern (e.g., 'yt_tool_v1', 'yt_tool_v2')
+yt_tools = manager.list_components(types=['tool'], regex=r'yt_tool_v\d+')
+```
+
 ### Running Components
 
 ```python
@@ -1173,6 +1216,57 @@ A **list** of dictionaries, each representing a message with the following keys:
 - **`type`**: Component type (`"agent"`, `"tool"`, `"process"`, `"user"`, etc.).
 - **`model`**: Model used, in the format `"<provider>:<model-name>"`.
 - **`timestamp`**: Timestamp indicating when the message was saved to history, in the specified timezone.
+
+### Reading and Querying Messages: `read()`
+
+While `get_messages` returns the entire history, the `read()` method provides a powerful and flexible interface for querying and extracting specific information from messages.
+
+#### Method Signature
+```python
+manager.read(
+    messages: Optional[Union[Dict, List[Dict]]] = None,
+    user_id: Optional[str] = None,
+    *,
+    source: Optional[Union[str, List[str]]] = None,
+    index: Optional[Union[int, tuple]] = -1,
+    get_full_dict: bool = False,
+    block_type: Optional[str] = None,
+    block_index: Optional[Union[int, None]] = None
+) -> Any
+```
+
+#### Parameters
+*   **`messages`**: An optional list of message dictionaries to operate on. If `None`, it uses the history of the specified (or current) `user_id`.
+*   **`source`**: Filters messages by one or more `source` roles (e.g., `'user'`, `['agent1', 'tool2']`).
+*   **`index`**: Selects messages by index: `-1` for the last message (default), `None` for all messages, or a tuple `(start, end)` for a slice.
+*   **`get_full_dict`**: If `True`, returns the complete message dictionary (or list of dictionaries if the `index` returns a slice).
+*   **`block_type`**: Filters blocks within the selected messages by their type (`'text'`, `'image'`, `'audio'`).
+*   **`block_index`**: Selects a specific block by its index after filtering by `block_type`.
+
+#### Usage Examples
+
+```python
+# Get the content of the first block from the last message
+# Returns a tuple: (source, block_type, content)
+source, b_type, content = manager.read()
+print(f"Source: {source}, Content: {content}")
+
+# Get the file path of the last image sent by the user
+_, _, img_content = manager.read(source='user', block_type='image', block_index=0)
+if img_content:
+    print(f"Image path: {img_content.get('path')}")
+
+# Get the last 5 full messages from the 'summarizer' agent
+latest_messages = manager.read(source='summarizer', index=(-5, None), get_full_dict=True)
+print(f"Found {len(latest_messages)} messages.")
+
+# Get all audio blocks from the entire conversation
+# Returns a tuple: (source, list_of_blocks)
+source, audio_blocks = manager.read(index=None, block_type='audio')
+print(f"Audio blocks: {audio_blocks}")
+```
+
+The `read()` method dramatically simplifies accessing specific data from the history, removing the need to manually iterate and filter the output of `get_messages`.
 
 ### Deleting User History `clear_message_history`
 
@@ -1523,153 +1617,121 @@ A dictionary containing a detailed breakdown of costs and token counts, structur
 ```
 
 
-### Telegram Integration
+### Bot Integrations (Telegram & WhatsApp)
 
-The `mas` library allows the developer to integrate any system with Telegram seamlessly to allow users to interact with the system through the messaging app without requiring the developer to define custom async logic and event loops. This is possible through the `start_telegram_bot` method:
+The `mas` library abstracts the complexity of building messaging bots through a modular architecture. Instead of managing asynchronous logic and event loops yourself, you can instantiate and run a fully-featured bot with a single method call, connecting it directly to your agent system.
+
+The framework is built upon an abstract `Bot` class that handles all common logic for message processing, commands, and callbacks. The `TelegramBot` and `WhatsappBot` classes inherit from this base class to manage platform-specific communication.
+
+#### `manager.start_telegram_bot()`
+
+This method creates and launches a Telegram bot instance.
 
 ```python
 manager.start_telegram_bot(
-  telegram_token = None, # if not provided, the manager looks for it in its API keys
-  component_name = "my_automation", # optional, defaults to default or latest automation
-  verbose = False, # defaults to False
-  on_complete = None, # defaults to sending latest message to user
-  on_update = None, # defaults to no operation
-  whisper_provider=None, # 'groq' and 'openai' are supported
-  whisper_model=None, # defaults to v3-turbo in groq and v2 in openai
-  speech_to_text=None, # optional callable if you need to process your audios and voice notes in a custom way
-  on_start_msg = "Hey! Talk to me or type '/clear' to erase your message history.", # defaults to this message
-  on_clear_msg = "Message history deleted." # defaults to this message,
-  return_token_count = False
+  telegram_token: str = None,
+  component_name: str = None,
+  verbose: bool = False,
+  on_update: Callable = None,
+  on_complete: Callable = None,
+  speech_to_text: Callable = None,
+  whisper_provider: str = None,
+  whisper_model: str = None,
+  on_start_msg: str = "Hey! Talk to me or type '/clear' to erase your message history.",
+  on_clear_msg: str = "Message history deleted.",
+  on_help_msg: str = "Here are the available commands:",
+  unknown_command_msg: str = "I don't recognize that command. Type /help to see what I can do.",
+  custom_commands: List[Dict] = None,
+  return_token_count: bool = False,
+  ensure_delivery: bool = False, 
+  delivery_timeout: float = 5.0,
+  start_polling: bool = True
 )
 ```
 
--   **`telegram_token`**: The token from Telegram's `BotFather`. If this is not provided, the manager will search for `TELEGRAM_TOKEN` using its standard key retrieval mechanism (`api_keys.json`, `.env`, or environment variables). If the key is not found, an error will be thrown.
--   **`component_name`**: Optional string defining which component should be executed when receiving a user message. If not set, this defaults to the latest or default automation defined, just like `manager.run()`.
--   **`verbose`**: Optional boolean, defines whether the system will run in verbose mode or not (defaults to False).
--   **`on_complete`**: Optional callable, function that will be called when completing execution after a specific user message.
--   **`on_update`**: Optional callable, function that will be called every time a component finishes execution.
--   **`whisper_provider`**: Optional string, provider used to transform voice notes and audio files to text in order for them to be processed by the system. If not set, it looks for a `groq` API key first, and for an `openai` API key later, and uses the `whisper` implementation of the first available provider.
--   **`whisper_model`**: Optional string, `whisper` model used for speech-to-text transformation. Defaults to `whisper-large-v3-turbo` for `groq` and to `whisper-1` for `openai`.
--   **`speech_to_text`**: Optional callable, custom function to be called instead of the default providers.
--   **`on_start_msg`**: Optional string defining what the bot will send to the user when receiving '/start' commnad.
--   **`on_clear_msg`**: Optional string defining what the bot will send to the user when receiving '/clear' command.
--   **`return_token_count`**: Boolean that determines whether component outputs should include usage metadata (`input_tokens`, `output_tokens`, `usd_cost`). This allows for tracking costs and token counts for every user interaction.
+**Key Parameters:**
 
-After defining the system through JSON and writing the necessary functions, it's possible to run a full Telegram bot with just one line of code:
+*   **`telegram_token`**: Your bot token from Telegram's BotFather. If `None`, it will be retrieved from the manager's API keys file.
+*   **`component_name`**: The component (typically an automation) to execute when a message is received. Defaults to the standard `manager.run()` logic.
+*   **`on_update` / `on_complete`**: Callbacks to handle responses. If `on_complete` is not defined, the bot will automatically send the content of the last generated message to the user.
+*   **`whisper_provider` / `whisper_model`**: Configures the speech-to-text (STT) provider. It automatically detects and uses `groq` or `openai` if their API keys are available.
+*   **`custom_commands`**: A list of dictionaries to define your own custom bot commands (see details below).
+*   **`start_polling`**: If `True` (default), the bot starts polling and blocks the main thread. If `False`, the method returns the `TelegramBot` object instance for advanced handling (e.g., integrating with a web server for webhooks).
+
+This integration allows you to launch a fully functional Telegram bot with a single line of code:
 
 ```python
+# main.py
+from mas import AgentSystemManager
+
+# Load the configuration and start the bot
 AgentSystemManager(config="config.json").start_telegram_bot()
 ```
 
-Defining `on_complete` and `on_update` is optional. If not defined, the system will automatically send the latest message's `"response"` field after execution is finished. If this is not desired behavior, the developer should define `on_complete` to return a string (the response to be sent to user), or `None` if no message should be sent to the user in that step, always taking `messages`, `manager` and `on_complete_params` as arguments. The same applies to `on_update`. In both cases, the developer **does not need to handle Telegram integration**. When using them in conjunction with the `start_telegram_bot` method, they can return a string (which will be sent to the correct user by the system), `None` to send nothing, or a dict for more advanced response patterns, as described below.
+#### `manager.start_whatsapp_bot()`
 
-Telegram integration also supports image processing out of the box, with no extra effort from the developer.
-
-#### Automatic Speech To Text in Telegram
-
-The `mas` Telegram integration functionality handles speech-to-text transcription for audios and voice notes automatically. You can specify a provider (either `groq` or `openai`) as described above, or they will be used automatically if the API key is available (`groq` is tried first). You may also define your own `speech_to_text` function if you need to. This function must receive a single argument, a dictionary with keys for `manager`, the audio's `file_path`, and Telegram's `update` and `context`. The function must return the text as string.
-
-#### Handling Responses in Telegram
-
-When using `start_telegram_bot`, the `on_complete` and `on_update` callbacks handle how your system responds to the user.
-
-- **Default Behavior**: If you do not provide an `on_complete` function, the system will automatically find the last message generated, look for a `"response"` field inside its content, and send that text to the user.
-
-- **Custom Behavior**: You can define your own `on_complete` or `on_update` functions for full control. These functions should be defined to accept `(messages, manager, params)`. The function's return value determines what is sent to the user:
-    - **Return `None`**: Nothing is sent to the user.
-    - **Return a `str`**: The string is sent as a plain text message.
-    - **Return a `list` of blocks**: The system will iterate through the list and send each block as a separate message.
-        - A `text` block will be sent as a text message.
-        - An `image` block will be sent as a photo.
-        - An `audio` block will be sent as a voice message.
-    - **Return any other type**: The value will be converted to blocks using `manager._to_blocks()` and sent accordingly.
-
-This allows for simple text replies or complex, multi-part responses with images and audio.
-
-**Example `on_complete` function:**
-
-```python
-# fns.py
-def my_on_complete(messages, manager, on_complete_params):
-    blocks = messages[-1]["message"]  # List[Block]
-
-    summary_text = None
-    image_path = None
-
-    # 1. Buscar el primer bloque de texto y obtener sus datos
-    for block in blocks:
-        if block.get("type") == "text":
-            content = block.get("content", {})
-            # El contenido puede ser un dict directamente o un string JSON
-            if isinstance(content, str):
-                try:
-                    content = json.loads(content)
-                except (json.JSONDecodeError, TypeError):
-                    content = {"response": content} # Tratar como texto plano si no es JSON
-            
-            if isinstance(content, dict):
-                summary_text = content.get("summary")
-                image_path = content.get("image_path")
-            break # El diccionario principal suele estar en el primer bloque de texto
-
-    # 2. Construir la respuesta usando el formato de bloque correcto
-    response_blocks = []
-    if summary_text:
-        response_blocks.append({
-            "type": "text",
-            "content": summary_text
-        })
-
-    if image_path:
-        response_blocks.append({
-            "type": "image",
-            "content": {"kind": "file", "path": image_path}
-        })
-
-    return response_blocks
-```
-
-#### Administrative Commands
-
-If you initialize the `AgentSystemManager` with an `admin_user_id` (e.g., your personal Telegram or WhatsApp chat ID), that user gains access to powerful administrative commands in bot integrations:
-
-*   **/clear\_all\_users**: Clears the message history for **every** user of the bot.
-*   **/reset\_system**: A destructive command that **deletes all data**: all history databases (`history/`), all saved files (`files/`), and all usage logs (`logs/`). Use with caution.
-*   **/logs**: Sends the `usage.log` and `summary.log` files directly to the admin user for inspection.
-
-These commands are protected and can only be executed by the configured admin user.
-
-
-### WhatsApp Integration
-
-The library offers seamless integration with the WhatsApp Cloud API, allowing you to deploy your multi-agent system as a WhatsApp bot. This is handled by the `start_whatsapp_bot` method, which launches a Flask-based web server to handle WhatsApp webhooks.
+This method creates and launches a WhatsApp bot using the Meta Cloud API. It starts a Flask web server to handle incoming webhooks.
 
 ```python
 manager.start_whatsapp_bot(
-  whatsapp_token=None,
-  phone_number_id=None,
-  webhook_verify_token=None,
-  component_name="my_automation",
-  verbose=False,
-  on_complete=None,
-  on_update=None,
-  speech_to_text=None,
-  host="0.0.0.0",
-  port=5000,
-  base_path="/webhook"
+  whatsapp_token: str = None,
+  phone_number_id: str = None,
+  webhook_verify_token: str = None,
+  # ... (all other parameters are the same as TelegramBot)
+  host: str = "0.0.0.0",
+  port: int = 5000,
+  base_path: str = "/webhook",
+  run_server: bool = True
 )
 ```
 
-**Parameters:**
+**WhatsApp-Specific Parameters:**
 
-*   **`whatsapp_token`**: Your WhatsApp Cloud API access token.
-*   **`phone_number_id`**: The Phone Number ID from your WhatsApp App settings.
-*   **`webhook_verify_token`**: The custom verify token you set up for your webhook.
-    *(These three credentials can be provided directly or sourced from your API keys file/environment variables).*
-*   **`component_name`, `verbose`, `on_complete`, `on_update`, `speech_to_text`**: These parameters function identically to their counterparts in `start_telegram_bot`.
-*   **`host`, `port`, `base_path`**: Standard Flask server configuration for hosting the webhook endpoint.
+*   **`whatsapp_token`, `phone_number_id`, `webhook_verify_token`**: Your credentials from the WhatsApp Cloud API platform. These can be provided directly or loaded from the manager's API keys file.
+*   **`host`, `port`, `base_path`**: Configuration for the built-in Flask server that listens for webhook events.
+*   **`run_server`**: If `True` (default), the Flask server is started. If `False`, the method returns the `WhatsappBot` instance, allowing you to integrate it into your own web server (e.g., Gunicorn, uWSGI).
 
-The WhatsApp bot supports text, images, and audio (voice notes), with automatic STT transcription. It also supports the same administrative commands as the Telegram bot (`/clear`, `/start`, `/clear_all_users`, `/reset_system`, `/logs`), provided an `admin_user_id` is configured in the manager.
+#### Common Bot Features
+
+Both `TelegramBot` and `WhatsappBot` come with a powerful set of features out-of-the-box:
+
+*   **Multimodal Support**: Automatically process text messages, images with captions, and voice/audio notes.
+*   **Automatic Speech-to-Text (STT)**: Voice notes and audio files are automatically transcribed to text using the manager's `stt()` method, allowing your agents to understand voice messages without any extra configuration.
+*   **Built-in Commands**:
+    *   `/start`: Sends the welcome message (`on_start_msg`).
+    *   `/clear`: Clears the message history for the user running the command.
+    *   `/help`: Displays a list of all available commands and their descriptions.
+*   **Administrative Commands**: If you set an `admin_user_id` in the manager, that user gains access to privileged commands:
+    *   **/clear\_all\_users**: Clears the message history for **every** user of the bot.
+    *   **/reset\_system**: **WARNING:** This is a destructive command that permanently deletes all histories (`history/`), saved files (`files/`), and usage logs (`logs/`).
+    *   **/logs**: Sends the `usage.log` and `summary.log` files directly to the admin's chat for inspection.
+*   **Custom Commands**: You can define your own commands using the `custom_commands` parameter. Each command is a dictionary:
+    ```python
+    custom_commands = [
+        {
+            "command": "/status",
+            "description": "Checks the system's operational status.",
+            "function": "fn:check_system_status", # Can be a callable or a function string
+            "message": "System is operational.", # Fallback message if function returns None
+            "admin_only": True # Optional: restrict command to the admin user
+        }
+    ]
+    ```
+
+#### Advanced Response Handling in Bots
+
+When using the bot integrations, the `on_complete` and `on_update` callbacks give you full control over how your system replies to users.
+
+*   **Default Behavior**: If you do not provide an `on_complete` function, the system intelligently processes the last generated message to create a reply. It inspects the `text` blocks of that message and follows this logic:
+    1.  **It first looks for a `"response"` field.** The primary behavior is to find a `text` block whose content is a dictionary containing a key named `"response"`. If found, **only the value of that key** is sent to the user as a plain text message. This is the standard and recommended way to handle simple conversational replies.
+    2.  **If no `"response"` field is found**, the system falls back to sending the entire content of the first available `text` block. If that content is a dictionary or list, it will be sent as a formatted JSON string. This ensures that the user always receives a reply, even if the component's output is structured data not intended for direct conversation.
+*   **Custom Behavior**: Your callback function (which can work as on_update, on_complete or both), defined as `def my_callback(messages, manager, params):`, determines what is sent based on its return value:
+    *   **Return `None`**: Nothing is sent to the user.
+    *   **Return a `str`**: The string is sent as a plain text message.
+    *   **Return a `list` of blocks**: The system iterates through the list and sends each block as a separate message. A `text` block becomes a text message, an `image` block a photo, and an `audio` block a voice message.
+    *   **Return any other type**: The value is converted to a list of blocks using `manager._to_blocks()` and sent accordingly.
+
+This allows for anything from simple text replies to complex, multi-part responses with images and audio.
 
 
 ## Multimodal Message Support
