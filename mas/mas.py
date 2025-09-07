@@ -1336,22 +1336,19 @@ class Tool(Component):
         self.default_output = default_output or {}
         self.description = description if description else "Tool"
 
-        # Check if function expects manager
-        sig = inspect.signature(function)
-        params = list(sig.parameters.values())
-        
-        # Look for "manager" parameter in first position
-        self.expects_manager = False
-        if len(params) > 0:
-            self.expects_manager = params[0].name == "manager"
+        self.sig = inspect.signature(function)
+        self.params = list(self.sig.parameters.values())
 
-        # Validate parameter count (either inputs or inputs+1 if has manager)
-        expected_params = len(inputs) + (1 if self.expects_manager else 0)
-        if len(params) != expected_params:
-            raise ValueError(
-                f"Tool '{name}' function requires {expected_params} parameters "
-                f"(manager? + inputs), but has {len(params)}"
-            )
+        self.expects_manager = bool(self.params and self.params[0].name == "manager")
+
+        self.accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in self.params)
+        
+        valid_param_names = {p.name for p in self.params[(1 if self.expects_manager else 0):]}
+        if not self.accepts_kwargs:
+            unknown = [k for k in self.inputs.keys() if k not in valid_param_names]
+            if unknown:
+                logger.warning(f"[Tool:{self.name}] inputs no presentes en la firma de la función: {unknown}")
+
 
     def to_string(self) -> str:
         return (
@@ -1363,67 +1360,108 @@ class Tool(Component):
         )
 
     def run(
-        self,
-        input_data: Any = None,
-        target_input: Optional[str] = None,
-        target_index: Optional[int] = None,
-        target_fields: Optional[list] = None,
-        target_custom: Optional[list] = None,
-        verbose: bool = False
-    ) -> dict:
+            self,
+            input_data: Any = None,
+            target_input: Optional[str] = None,
+            target_index: Optional[int] = None,
+            target_fields: Optional[list] = None,
+            target_custom: Optional[list] = None,
+            verbose: bool = False
+        ) -> dict:
 
-        if verbose:
-            logger.debug(
-                f"[Tool:{self.name}] .run() => target_input={target_input}, "
-                f"target_index={target_index}, target_fields={target_fields}, target_custom={target_custom}, input_data={input_data}"
-            )
-
-        db_conn = self.manager._get_user_db()
-
-        if isinstance(input_data, dict):
             if verbose:
-                logger.debug(f"[Tool:{self.name}] Using provided input_data directly.")
-            input_dict = input_data
-        else:
-            # If we have a `target_input` string that might hold advanced syntax => parse
-            if target_input and any(x in target_input for x in [":", "fn?","fn:", "?"]):
-                parsed = self.manager.parser.parse_input_string(target_input)
-                # Now collect data from DB
-                input_dict = self._gather_data_for_tool_process(parsed, db_conn, verbose)
-            else:
-                input_dict = self._resolve_tool_or_process_input(db_conn, target_input, target_index, target_fields, target_custom, verbose)
-
-        func_args = []
-        if self.expects_manager:
-            func_args.append(self.manager)
-            
-        for arg_name in self.inputs:
-            if arg_name not in input_dict:
-                raise ValueError(f"[Tool:{self.name}] Missing required input: {arg_name}")
-            func_args.append(input_dict[arg_name])
-
-        # Call the tool function
-        try:
-            result = self.function(*func_args)
-
-            if len(result) != len(self.outputs):
-                raise ValueError(
-                    f"[Tool:{self.name}] function returned {len(result)} items, "
-                    f"but {len(self.outputs)} expected."
+                logger.debug(
+                    f"[Tool:{self.name}] .run() => target_input={target_input}, "
+                    f"target_index={target_index}, target_fields={target_fields}, target_custom={target_custom}, input_data={input_data}"
                 )
 
-            if verbose:
-                logger.debug(f"[Tool:{self.name}] => {result}")
+            db_conn = self.manager._get_user_db()
 
-            result.setdefault("metadata", {})
-            result["metadata"]["usd_cost"] = self.manager.cost_tool_call(self.name)
-            return result
+            if isinstance(input_data, dict):
+                if verbose:
+                    logger.debug(f"[Tool:{self.name}] Using provided input_data directly.")
+                input_dict = input_data
+            else:
+                # If we have a `target_input` string that might hold advanced syntax => parse
+                if target_input and any(x in target_input for x in [":", "fn?","fn:", "?"]):
+                    parsed = self.manager.parser.parse_input_string(target_input)
+                    # Now collect data from DB
+                    input_dict = self._gather_data_for_tool_process(parsed, db_conn, verbose)
+                else:
+                    input_dict = self._resolve_tool_or_process_input(db_conn, target_input, target_index, target_fields, target_custom, verbose)
 
-        except (TypeError, ValueError) as e:
-            if verbose:
-                logger.error(f"[Tool:{self.name}] => error: {e}")
-                traceback.print_exc()
-            return self.default_output
+            # =======================
+            #   Llamar función "suave"
+            # =======================
+            import inspect
+
+            # Firma/params (permitir fallback si no fueron precargados en __init__)
+            sig = getattr(self, "sig", inspect.signature(self.function))
+            params = list(getattr(self, "params", list(sig.parameters.values())))
+
+            # ¿Espera manager?
+            expects_manager = getattr(self, "expects_manager", bool(params and params[0].name == "manager"))
+            start = 1 if expects_manager else 0
+            fparams = params[start:]
+
+            POS_ONLY = inspect.Parameter.POSITIONAL_ONLY
+            POS_OR_KW = inspect.Parameter.POSITIONAL_OR_KEYWORD
+            KW_ONLY  = inspect.Parameter.KEYWORD_ONLY
+
+            pos_only = [p for p in fparams if p.kind == POS_ONLY]
+            pos_or_kw = [p for p in fparams if p.kind == POS_OR_KW]
+            kw_only   = [p for p in fparams if p.kind == KW_ONLY]
+
+            # 1) Validar requeridos (por nombre). Si falta alguno => default_output
+            missing = []
+            missing += [p.name for p in pos_only  if p.default is inspect._empty and p.name not in input_dict]
+            missing += [p.name for p in pos_or_kw if p.default is inspect._empty and p.name not in input_dict]
+            missing += [p.name for p in kw_only   if p.default is inspect._empty and p.name not in input_dict]
+            if missing:
+                if verbose:
+                    logger.error(f"[Tool:{self.name}] Faltan argumentos requeridos: {missing}")
+                return self.default_output
+
+            # 2) Positional-only: construir prefijo contiguo para evitar corrimientos
+            pos_args = []
+            for p in pos_only:
+                if p.name in input_dict:
+                    pos_args.append(input_dict[p.name])
+                else:
+                    # si es requerido ya habríamos salido en 'missing'; al faltar uno opcional
+                    # cortamos para mantener prefijo contiguo y evitar desalinear posiciones
+                    break
+
+            # 3) kwargs: solo nombres reconocidos; ignorar extras SIEMPRE (aunque la función tenga **kwargs)
+            kw_names = {p.name for p in pos_or_kw + kw_only}
+            func_kwargs = {k: input_dict[k] for k in kw_names if k in input_dict}
+
+            # 4) Llamar; cualquier TypeError/ValueError => default_output
+            try:
+                if expects_manager:
+                    result = self.function(self.manager, *pos_args, **func_kwargs)
+                else:
+                    result = self.function(*pos_args, **func_kwargs)
+
+                if len(result) != len(self.outputs):
+                    raise ValueError(
+                        f"[Tool:{self.name}] function returned {len(result)} items, "
+                        f"but {len(self.outputs)} expected."
+                    )
+
+                if verbose:
+                    logger.debug(f"[Tool:{self.name}] => {result}")
+
+                result.setdefault("metadata", {})
+                result["metadata"]["usd_cost"] = self.manager.cost_tool_call(self.name)
+                return result
+
+            except (TypeError, ValueError) as e:
+                if verbose:
+                    logger.error(f"[Tool:{self.name}] => error: {e}")
+                    traceback.print_exc()
+                return self.default_output
+
 
     def _resolve_tool_or_process_input(
         self,
@@ -3095,6 +3133,25 @@ class AgentSystemManager:
         if user_id in self._db_pool:
             return self._db_pool[user_id]
         db_path = self._get_db_path_for_user(user_id)
+        
+        # 0) sanity: sqlite en memoria
+        print("starting test...")
+        try:
+            sqlite3.connect(":memory:").close()
+            print("[diag] sqlite :memory: OK")
+        except Exception as e:
+            print("[diag] sqlite :memory: FAIL", repr(e), traceback.format_exc())
+
+        # 1) intentá abrir en %TEMP% (archivo nuevo)
+        tmp_test = os.path.join(tempfile.gettempdir(), "mas_sqlite_probe.sqlite")
+        try:
+            t = sqlite3.connect(tmp_test, timeout=5)
+            t.execute("create table if not exists t (x int);")
+            t.close()
+            print("[diag] sqlite temp-file OK:", tmp_test)
+        except Exception as e:
+            print("[diag] sqlite temp-file FAIL", repr(e), traceback.format_exc())
+
 
         conn = sqlite3.connect(db_path, check_same_thread=False)
 
@@ -3104,9 +3161,6 @@ class AgentSystemManager:
 
         if not table_exists:
             self._create_table(conn)
-            # Optional but helpful logging:
-            print(f"INFO: 'message_history' table did not exist. Initializing it now for user {user_id}.")
-        
 
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -4716,7 +4770,6 @@ class AgentSystemManager:
             return source, blocks
 
     def _to_blocks(self, value, user_id=None, detail="auto"):
-        # Aseguramos user_id para guardar archivos cuando haga falta
         self.ensure_user(user_id)
         user_id = user_id or self._uid()
 
@@ -4758,19 +4811,6 @@ class AgentSystemManager:
                 "type": "text",
                 "content": data_copy
             }]
-            # try:
-            #     dumped = json.dumps(value, ensure_ascii=False)
-            # except TypeError:
-            #     # Fallback: persist non-serializable values into files
-            #     if isinstance(value, dict):
-            #         dumped = self._dict_to_json_with_file_persistence(value, user_id)
-            #     else:
-            #         data_copy = self._persist_non_json_values(value, user_id)
-            #         dumped = json.dumps(data_copy, ensure_ascii=False)
-            # return [{
-            #     "type": "text",
-            #     "content": dumped
-            # }]
 
         # 5) todo lo demás (str, int, float, …)
         return [{
@@ -5530,7 +5570,9 @@ class Bot(abc.ABC):
         return (datetime.now(timezone.utc) - msg_dt) > timedelta(seconds=max_age)
 
     async def process_payload(self, payload: Any) -> None:
+        self.logger.debug("[Bot] process_payload: entry type=%s", type(payload).__name__)
         parsed_message = await self._parse_payload(payload)
+        self.logger.debug("[Bot] parsed_message=%s", parsed_message)
 
         if not parsed_message:
             if self.verbose:
@@ -5551,7 +5593,9 @@ class Bot(abc.ABC):
                 return # El comando ya fue manejado y se envió respuesta
 
         # 3. Construcción de los bloques de MAS
+        self.logger.debug("[Bot] before _build_mas_blocks")
         mas_blocks = await self._build_mas_blocks(parsed_message)
+        self.logger.debug("[Bot] after _build_mas_blocks: %s", mas_blocks)
         
         if not mas_blocks:
             if self.verbose:
@@ -5596,6 +5640,7 @@ class Bot(abc.ABC):
         if self.verbose:
             self.logger.debug(f"[Bot] Ejecutando manager.run para el usuario {user_id} con bloques: {mas_blocks}")
         
+        self.logger.debug("[Bot] about to call manager.run (to_thread)")
         await asyncio.to_thread(
             self.manager.run,
             input=mas_blocks,
@@ -5610,6 +5655,7 @@ class Bot(abc.ABC):
             on_complete_params=callback_params,
             return_token_count=self.return_token_count
         )
+        self.logger.debug("[Bot] manager.run finished")
 
     def _register_commands(self, custom_commands: Optional[Union[Dict, List[Dict]]]):
         # --- Comandos Integrados ---
@@ -5766,11 +5812,14 @@ class Bot(abc.ABC):
         """
         Construye la lista de bloques de MAS a partir del mensaje parseado.
         """
+        
         user_id = parsed_message['user_id']
         msg_type = parsed_message['message_type']
         text = parsed_message.get('text')
         media_info = parsed_message.get('media_info')
         blocks = []
+
+        self.logger.debug(f"[Bot] _build_mas_blocks: msg_type={msg_type}, text_len={len(text or '')}")
 
         # 1. Transcribir audio si existe
         transcript = None
@@ -5836,6 +5885,13 @@ class TelegramBot(Bot):
         if self.verbose:
             self.logger.info("[TelegramBot] Instancia de TelegramBot creada.")
 
+    async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Log detallado del error
+        self.logger.exception(
+            "PTB caught an error. update=%r", getattr(update, "to_dict", lambda: update)(),
+            exc_info=context.error
+        )
+
     def _register_handlers(self):
         command_list = [cmd.lstrip('/') for cmd in self.commands.keys()]
         for command in command_list:
@@ -5844,6 +5900,7 @@ class TelegramBot(Bot):
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_payload_wrapper))
         self.application.add_handler(MessageHandler(filters.PHOTO, self.process_payload_wrapper))
         self.application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.process_payload_wrapper))
+        self.application.add_error_handler(self._on_error)
 
     async def initialize(self):
         """Inicializa la aplicación de Telegram. Llama a esto una vez al iniciar el servidor."""
@@ -5855,8 +5912,11 @@ class TelegramBot(Bot):
         await self.application.process_update(update)
 
     async def process_payload_wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Wrapper que simplemente llama a la lógica de procesamiento principal de la clase base."""
-        await self.process_payload(update)
+        try:
+            await self.process_payload(update)
+        except Exception as e:
+            self.logger.exception("[TelegramBot] Error while processing payload", exc_info=e)
+            raise
 
     async def _parse_payload(self, payload: Update) -> Optional[Dict[str, Any]]:
         if not payload.message:
@@ -5889,10 +5949,14 @@ class TelegramBot(Bot):
         if not blocks or not update or not update.message:
             return
 
+        self.logger.debug("[TelegramBot] _send_blocks: n=%d", len(blocks))
+
         for block in blocks:
             try:
                 block_type = block.get("type")
                 content = block.get("content", {})
+
+                self.logger.debug("[TelegramBot] sending block type=%s", block_type)
                 
                 if block_type == "text":
                     text_content = self.manager._block_to_plain_text(block)
