@@ -3258,7 +3258,6 @@ class AgentSystemManager:
             return f"Error: Archivo '{os.path.basename(file_path)}' no encontrado en el historial."
         
 
-
     def add_blocks(
         self,
         content,
