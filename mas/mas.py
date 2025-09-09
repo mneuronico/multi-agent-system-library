@@ -4230,7 +4230,6 @@ class AgentSystemManager:
         cur = conn.cursor()
         cur.execute("DELETE FROM message_history")
         conn.commit()
-        logger.debug(f"Message history cleared for user ID: {self._uid()}")
 
     def clear_global_history(self) -> int:
         self._close_all_db_conns()
