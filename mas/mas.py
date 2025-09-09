@@ -133,10 +133,7 @@ class Agent(Component):
         verbose: bool = False,
         return_token_count: bool = False
     ) -> dict:
-
-        if verbose:
-            logger.debug(f"[Agent:{self.name}] .run() => reading conversation history from DB")
-
+        
         db_conn = self.manager._get_user_db()
 
         conversation = None
@@ -1122,7 +1119,7 @@ class Agent(Component):
             payload["system_instruction"] = {"parts": system_parts}
 
         if verbose:
-            logger.debug(f"[Agent:{self.name}] _call_google_api => model={model_name} (v1alpha + response_json_schema)")
+            logger.debug(f"[Agent:{self.name}] _call_google_api => model={model_name}")
 
         try:
             r = requests.post(
@@ -1336,12 +1333,6 @@ class Tool(Component):
             target_custom: Optional[list] = None,
             verbose: bool = False
         ) -> dict:
-
-            if verbose:
-                logger.debug(
-                    f"[Tool:{self.name}] .run() => target_input={target_input}, "
-                    f"target_index={target_index}, target_fields={target_fields}, target_custom={target_custom}, input_data={input_data}"
-                )
 
             db_conn = self.manager._get_user_db()
 
@@ -1693,10 +1684,6 @@ class Process(Component):
         verbose: bool = False
     ) -> Dict:
         
-        if verbose:
-            logger.debug(f"[Process:{self.name}] .run() => target_input={target_input}, "
-                  f"target_index={target_index}, target_fields={target_fields}, target_custom={target_custom}, input_data={input_data}")
-
         db_conn = self.manager._get_user_db()
 
         if isinstance(input_data, dict) or isinstance(input_data, list):
@@ -1706,16 +1693,10 @@ class Process(Component):
 
         elif target_input and any(x in target_input for x in [":", "fn?", "fn:", "?"]):
             parsed = self.manager.parser.parse_input_string(target_input)
-            if verbose:
-                logger.debug(f"[Process:{self.name}] Detected advanced parser usage => parsed={parsed}")
             final_input = self._build_message_list_from_parser_result(parsed, db_conn, verbose)
         elif target_custom:
-            if verbose:
-                logger.debug(f"[Process:{self.name}] Using target_custom => building message list from multiple items.")
             final_input = self._build_message_list_from_custom(db_conn, target_custom, verbose)
         else:
-            if verbose:
-                logger.debug(f"[Process:{self.name}] Using fallback => single target_input + target_index.")
             final_input = self._build_message_list_from_fallback(db_conn, target_input, target_index, target_fields, verbose)
 
         try:
@@ -1950,9 +1931,6 @@ class Automation(Component):
             on_update: Optional[Callable] = None,
             on_update_params: Optional[Dict] = None,
             return_token_count = False) -> Dict:
-        if verbose:
-            logger.debug(f"[Automation:{self.name}] .run() => executing sequence: {self.sequence}")
-
         db_conn = self.manager._get_user_db()
         current_output = {}
 
@@ -1983,9 +1961,7 @@ class Automation(Component):
                 return current_output
 
             if verbose:
-                logger.debug(f"[Automation:{self.name}] => running component '{comp_name}' with "
-                    f"target_input={parsed_target_input}, target_index={parsed_target_index}, "
-                    f"target_custom={parsed_target_custom}")
+                logger.debug(f"[Automation:{self.name}] => running component '{comp_name}'")
 
             if isinstance(comp, Automation):
                 step_output = comp.run(
@@ -2978,23 +2954,6 @@ class AgentSystemManager:
         if user_id in self._db_pool:
             return self._db_pool[user_id]
         db_path = self._get_db_path_for_user(user_id)
-        
-        print("starting test...")
-        try:
-            sqlite3.connect(":memory:").close()
-            print("[diag] sqlite :memory: OK")
-        except Exception as e:
-            print("[diag] sqlite :memory: FAIL", repr(e), traceback.format_exc())
-
-        tmp_test = os.path.join(tempfile.gettempdir(), "mas_sqlite_probe.sqlite")
-        try:
-            t = sqlite3.connect(tmp_test, timeout=5)
-            t.execute("create table if not exists t (x int);")
-            t.close()
-            print("[diag] sqlite temp-file OK:", tmp_test)
-        except Exception as e:
-            print("[diag] sqlite temp-file FAIL", repr(e), traceback.format_exc())
-
 
         conn = sqlite3.connect(db_path, check_same_thread=False)
 
@@ -3283,16 +3242,21 @@ class AgentSystemManager:
         if file_path in self._file_cache:
             return self._file_cache[file_path]
 
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext == ".pkl":
-            with open(file_path, "rb") as f:
-                obj = pickle.load(f)
-        else:
-            with open(file_path, "rb") as f:
-                obj = f.read()
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == ".pkl":
+                with open(file_path, "rb") as f:
+                    obj = pickle.load(f)
+            else:
+                with open(file_path, "rb") as f:
+                    obj = f.read()
 
-        self._file_cache[file_path] = obj
-        return obj
+            self._file_cache[file_path] = obj
+            return obj
+        except:
+            logger.warning(f"[Manager] File not found while loading from history: {file_path}")
+            return f"Error: Archivo '{os.path.basename(file_path)}' no encontrado en el historial."
+        
 
 
     def add_blocks(
@@ -5150,9 +5114,7 @@ class Bot(abc.ABC):
         return (datetime.now(timezone.utc) - msg_dt) > timedelta(seconds=max_age)
 
     async def process_payload(self, payload: Any) -> None:
-        self.logger.debug("[Bot] process_payload: entry type=%s", type(payload).__name__)
         parsed_message = await self._parse_payload(payload)
-        self.logger.debug("[Bot] parsed_message=%s", parsed_message)
 
         if not parsed_message:
             if self.verbose:
@@ -5211,10 +5173,6 @@ class Bot(abc.ABC):
             
             _send_response_from_callback(response)
 
-        if self.verbose:
-            self.logger.debug(f"[Bot] Running manager.run for user {user_id} with blocks: {mas_blocks}")
-
-        self.logger.debug("[Bot] about to call manager.run (to_thread)")
         await asyncio.to_thread(
             self.manager.run,
             input=mas_blocks,
@@ -5229,7 +5187,6 @@ class Bot(abc.ABC):
             on_complete_params=callback_params,
             return_token_count=self.return_token_count
         )
-        self.logger.debug("[Bot] manager.run finished")
 
     def _register_commands(self, custom_commands: Optional[Union[Dict, List[Dict]]]):
         self.commands["/start"] = {
@@ -5538,10 +5495,7 @@ class TelegramBot(Bot):
         for block in blocks:
             try:
                 block_type = block.get("type")
-                content = block.get("content", {})
-
-                self.logger.debug("[TelegramBot] sending block type=%s", block_type)
-                
+                content = block.get("content", {})                
                 if block_type == "text":
                     text_content = self.manager._block_to_plain_text(block)
                     if text_content:
