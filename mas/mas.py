@@ -12,6 +12,7 @@ import importlib.util
 import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 import re
 import tempfile
 import requests
@@ -23,7 +24,12 @@ from importlib import resources
 import logging
 import base64
 import collections
+import textwrap
 from flask import Flask, request, jsonify
+import copy
+import subprocess
+import abc
+import wave
 
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -45,11 +51,6 @@ if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
 
 def get_readme(owner: str, repo: str, branch: str = None,
                token: str = None) -> str:
-    """
-    Download the README of a GitHub repo and return it as UTF-8 text.
-    Uses the GitHub REST API v3 so it always picks the canonical README,
-    regardless of file name or branch.
-    """
     url = f"https://api.github.com/repos/{owner}/{repo}/readme"
     if branch:
         url += f"?ref={branch}"
@@ -65,14 +66,14 @@ def get_readme(owner: str, repo: str, branch: str = None,
 
 class Component:
     def __init__(self, name: str):
-        self.name = name  # Developer-friendly name (no prefix).
-        self.manager = None  # Assigned when the manager creates the component.
+        self.name = name 
+        self.manager = None
 
     def to_string(self) -> str:
         return f"Component(Name: {self.name})"
 
 
-    def run(self, input_data: Any = None,  # Not used, but kept for interface consistency
+    def run(self, input_data: Any = None,
         verbose: bool = False) -> Dict:
         raise NotImplementedError("Subclass must implement .run().")
 
@@ -124,7 +125,7 @@ class Agent(Component):
 
     def run(
         self,
-        input_data: Any = None,  # Not used, but kept for interface consistency
+        input_data: Any = None,
         target_input: Optional[str] = None,
         target_index: Optional[int] = None,
         target_fields: Optional[list] = None,
@@ -138,7 +139,6 @@ class Agent(Component):
 
         db_conn = self.manager._get_user_db()
 
-        # 1) Check for advanced parser usage
         conversation = None
         if target_input and any(x in target_input for x in [":", "fn?", "fn:", "?"]):
             parsed = self.manager.parser.parse_input_string(target_input)
@@ -161,7 +161,6 @@ class Agent(Component):
         if verbose:
             logger.debug(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2, ensure_ascii=False)}\n")
 
-        # Now we call each model in self.models in order:
         for model_info in self.models:
             provider = model_info["provider"].lower()
             model_name = model_info["model"]
@@ -230,7 +229,6 @@ class Agent(Component):
                 else:
                     raise ValueError(f"[Agent:{self.name}] Unknown provider '{provider}'")
 
-                # Now unpack the result if return_token_count is True:
                 if return_token_count:
                     response_str, input_tokens, output_tokens = response
                 else:
@@ -250,7 +248,6 @@ class Agent(Component):
                     logger.debug(f"[Agent:{self.name}] => success from provider={provider}\n{response_dict}")
                 
                 if return_token_count:
-                    # empaquetamos los metadatos en el primer bloque de texto
                     response_blocks[0].setdefault("metadata", {})
                     md = response_blocks[0]["metadata"]
                     md["input_tokens"]  = input_tokens
@@ -275,31 +272,18 @@ class Agent(Component):
         return self.default_output
 
     def _as_blocks(self, value):
-        """
-        Con la normalización global, *todo* lo que viene de la DB
-        ya es List[Block]. Este helper sólo garantiza eso para
-        casos heredados o tests unitarios.
-        """
         if isinstance(value, list) and value and all(
             isinstance(b, dict) and "type" in b and "content" in b for b in value
         ):
             return value
 
-        # Fallback: pedile al Manager que lo normalice
         return self.manager._to_blocks(value)
 
     def _provider_format_messages(self, provider: str, conversation: list) -> list:
-        """
-        Convierte cada mensaje (que SIEMPRE es List[Block])
-        al formato requerido por cada proveedor.
-        """
-        import base64, mimetypes, os, requests, json
         provider = provider.lower()
         out = []
 
-        # ---- helpers internos --------------------------------
         def _clean_path(path_str):
-            # QUITA el prefijo "file:" si existe
             if isinstance(path_str, str) and path_str.startswith("file:"):
                 return path_str[5:]
             return path_str
@@ -312,18 +296,15 @@ class Agent(Component):
             return f"data:{mime};base64,{b64}"
         
         def _text_as_string(content):
-            # dict/list → json, str → tal cual
             if isinstance(content, (dict, list)):
                 return json.dumps(content, ensure_ascii=False)
             return str(content)
 
-        # ---- conversión --------------------------------------
         for msg in conversation:
             role   = msg["role"]
             blocks = self._as_blocks(msg["content"])
 
             if provider in {"openai", "groq", "deepseek", "lmstudio"}:
-                # OpenAI / Groq style: user puede ser multimodal, system/assistant solo texto
                 if role == "user":
                     parts = []
                     for blk in blocks:
@@ -335,13 +316,13 @@ class Agent(Component):
                                 url = _image_to_datauri(src["path"])
                             elif src["kind"] == "url":
                                 url = src["url"]
-                            else:   # b64 directo
+                            else:
                                 url = f"data:image/*;base64,{src['b64']}"
                             parts.append({"type": "image_url",
                                           "image_url": {"url": url,
                                                         "detail": src.get("detail","auto")}})
                     out.append({"role": role, "content": parts})
-                else:   # assistant / system
+                else:
                     text = "\n".join(
                         _text_as_string(blk["content"]) if blk["type"] == "text"
                         else "[image omitted]"
@@ -349,7 +330,7 @@ class Agent(Component):
                     )
                     out.append({"role": role, "content": text})
 
-            elif provider == "google":        # Gemini
+            elif provider == "google":
                 gem_parts = []
                 for blk in blocks:
                     if blk["type"] == "text":
@@ -374,7 +355,7 @@ class Agent(Component):
                     out.append({"role": "user" if role=="user" else "model",
                                 "parts": gem_parts})
 
-            elif provider == "anthropic":     # Claude
+            elif provider == "anthropic":
                 c_blocks = []
                 for blk in blocks:
                     if blk["type"] == "text":
@@ -397,7 +378,6 @@ class Agent(Component):
                 out.append({"role": role, "content": c_blocks})
 
             else:
-                # Por defecto: devolvemos los bloques sin tocar
                 out.append({"role": role, "content": blocks})
 
         return out
@@ -426,14 +406,12 @@ class Agent(Component):
             for source_item in parsed["multiple_sources"]:
                 partial = self._collect_msg_snippets_for_agent(source_item, filtered_msgs)
                 combined.extend(partial)
-            # Now sort by msg_number ascending
             combined.sort(key=lambda x: x[2])
             conversation = self._transform_to_conversation(combined)
         else:
             partial = self._collect_msg_snippets_for_agent(parsed["single_source"], filtered_msgs)
             conversation = self._transform_to_conversation(partial)
 
-        # Prepend system
         conversation = [{"role": "system", "content": self.system_prompt}] + conversation
         return conversation
 
@@ -462,7 +440,7 @@ class Agent(Component):
 
     def _handle_index(self, index, subset):
         if index is None or index == "~":
-            chosen = subset[:]  # all (default for agents)
+            chosen = subset[:]
         elif isinstance(index, int):
             if len(subset) >= abs(index):
                 chosen = [subset[index]]
@@ -483,7 +461,7 @@ class Agent(Component):
 
             chosen = subset[start:end]
         else:
-            chosen = subset[:] # Fallback to all if index is not recognized
+            chosen = subset[:]
 
         return chosen
     
@@ -544,7 +522,6 @@ class Agent(Component):
                 "msg_number": msg_number
             })
 
-        # Sort by msg_number to preserve chronological order
         conversation.sort(key=lambda e: e["msg_number"])
 
         if not include_message_number:
@@ -570,7 +547,6 @@ class Agent(Component):
                 index = item.get("index", None)
                 fields = item.get("fields", None)
 
-                # Filter by component
                 subset = [
                     (r, c, n, t, ts) 
                     for (r, c, n, t, ts) in filtered_msgs 
@@ -595,18 +571,14 @@ class Agent(Component):
     def _handle_fields(self, msg_tuples, fields):
         processed_tuples = []
         for (role, content, msg_number, msg_type, timestamp) in msg_tuples:
-            # First, parse the JSON string from the DB into a list of blocks.
             try:
                 blocks = json.loads(content) if isinstance(content, str) else content
             except (json.JSONDecodeError, TypeError):
-                # If it's not valid JSON, treat it as a single text block
                 blocks = [{"type": "text", "content": str(content)}]
 
-            # Now, if fields are specified, filter the parsed blocks.
             if fields:
                 blocks = self.manager._filter_blocks_by_fields(blocks, fields)
             
-            # Append the processed tuple. The `blocks` variable is now a Python object.
             processed_tuples.append((role, blocks, msg_number, msg_type, timestamp))
             
         return processed_tuples
@@ -639,7 +611,7 @@ class Agent(Component):
 
         if target_index is not None:
             subset = self._handle_index(target_index, subset)
-            if not subset: # _handle_index puede devolver una lista vacía si el índice está fuera de rango
+            if not subset:
                  raise IndexError(f"Requested index/range={target_index} resulted in zero messages from a subset of size {len(filtered_msgs)}.")
 
         conversation = self._transform_to_conversation(subset, target_fields)
@@ -666,7 +638,6 @@ class Agent(Component):
                 return msg_type == "tool"
             if fltr == "process":
                 return msg_type == "process"
-            # exact match
             return (r == fltr)
 
         filtered = []
@@ -682,15 +653,27 @@ class Agent(Component):
         return filtered
 
     def _build_json_schema(self) -> Dict[str, Any]:
+        def normalize_prop(spec):
+            if not isinstance(spec, dict):
+                return {"type": "string", "description": str(spec)}
+
+            t = str(spec.get("type", "") or "").lower()
+            if t == "list":  t = "array"
+            if t == "dict":  t = "object"
+            if not t:
+                t = "object" if "properties" in spec else ("array" if "items" in spec else "string")
+
+            out = {k: v for k, v in spec.items() if k not in ("type",)}
+            out["type"] = t
+
+            if t == "array" and "items" not in out:
+                out["items"] = {}
+
+            return out
+
         props = {}
         for field_name, desc in self.required_outputs.items():
-            if isinstance(desc, dict):
-                props[field_name] = {
-                    "description": desc.get("description", ""),
-                    "type": desc.get("type", "string")
-                }
-            else:
-                props[field_name] = {"description": desc, "type": "string"}
+            props[field_name] = normalize_prop(desc)
 
         return {
             "name": f"{self.name}_schema",
@@ -700,24 +683,9 @@ class Agent(Component):
                 "additionalProperties": False
             }
         }
+
     
     def _extract_and_parse_json(self, value):
-        """
-        Parser robusto para contenidos de agentes.
-        - Acepta dict/list/str.
-        - Quita code fences (``` y ```json).
-        - Puede extraer el PRIMER bloque JSON embebido en un string más largo.
-        - Desanida el caso 'doble response': {"response": {"response": ...}} o
-        {"response": "```json {\"response\": ... } ```"}.
-        - Nunca devuelve la cadena 'None' por errores de parseo.
-
-        Retorna:
-        * dict/list si se pudo parsear JSON
-        * str original (posiblemente sin fences) si NO es JSON
-        * None si el input no es str/dict/list
-        """
-        import json, re
-
         JSON_FENCE_RE = re.compile(r"^\s*```[\w-]*\s*([\s\S]*?)\s*```\s*$", re.IGNORECASE)
 
         def strip_code_fences(s: str) -> str:
@@ -733,46 +701,38 @@ class Agent(Component):
             return t.startswith("{") or t.startswith("[")
 
         def json_unwrap_once(s: str):
-            """Intenta una sola capa de json.loads sobre s o s sin fences."""
             if not isinstance(s, str):
                 return s
             t = s.strip()
             if not t:
                 return s
-            # quita comillas completas si viniera entrecomillado
             if (t.startswith("'") and t.endswith("'")) or (t.startswith('"') and t.endswith('"')):
                 t = t[1:-1].strip()
-            # intento directo
             try:
                 return json.loads(t)
             except Exception:
                 pass
-            # intento sin fences
             t2 = strip_code_fences(t)
             if t2 != t:
                 try:
                     return json.loads(t2)
                 except Exception:
                     pass
-            return s  # no parsea, devolver string original
+            return s
 
         def extract_first_json_lenient(s: str):
-            """Intenta json.loads tolerante sobre un fragmento que ya parece JSON."""
             if not isinstance(s, str):
                 return None
             t = strip_code_fences(s).strip()
-            # intento directo
             try:
                 return json.loads(t)
             except Exception:
                 pass
-            # tolerancia: escapar saltos de línea no escapados
             t2 = re.sub(r'(?<!\\)\n', r'\\n', t)
             try:
                 return json.loads(t2)
             except Exception:
                 pass
-            # tolerancia especial para {"response":"(multilínea)"}
             m = re.match(r'^\s*\{\s*"response"\s*:\s*"(.*)"\s*\}\s*$', t, flags=re.DOTALL)
             if m:
                 inner = m.group(1).replace('\\"', '"').replace('\\n', '\n')
@@ -780,7 +740,6 @@ class Agent(Component):
             return None
 
         def extract_first_json_anywhere(s: str):
-            """Busca el primer bloque {...} o [...] balanceado dentro de s y lo parsea."""
             if not isinstance(s, str):
                 return None
             t = strip_code_fences(s)
@@ -814,33 +773,24 @@ class Agent(Component):
                     if depth == 0:
                         chunk = t[start:i+1]
                         return extract_first_json_lenient(chunk)
-            # si quedó abierto, intentamos cerrar de forma conservadora
             if depth > 0:
                 candidate = t[start:] + closer * depth
                 return extract_first_json_lenient(candidate)
             return None
 
         def flatten_double_response(obj):
-            """
-            Si obj = {"response": {"response": ...}} => devuelve el interno.
-            Si obj = {"response": <string-jsonish>} => parsea y, si es dict con 'response', devuelve ese interno.
-            De lo contrario, preserva lo que haya en 'response'.
-            """
             if not isinstance(obj, dict) or "response" not in obj:
                 return obj
 
             inner = obj["response"]
 
-            # Caso 1: inner dict con 'response' -> quedarnos con el interno
             if isinstance(inner, dict) and "response" in inner:
                 return inner
 
-            # Caso 2: inner dict/list (sin 'response'): mantener tal cual
             if isinstance(inner, (dict, list)):
                 obj["response"] = inner
                 return obj
 
-            # Caso 3: inner string que parece JSON -> intentar parsear
             if isinstance(inner, str) and looks_jsonish(inner):
                 unwrapped = json_unwrap_once(inner)
                 if isinstance(unwrapped, dict) and "response" in unwrapped:
@@ -858,45 +808,34 @@ class Agent(Component):
 
             return obj
 
-        # ---- lógica principal ----
-
-        # 1) ya es objeto
         if isinstance(value, (dict, list)):
             return flatten_double_response(value) if isinstance(value, dict) else value
 
-        # 2) si no es str/dict/list
         if not isinstance(value, str):
             return None
 
         s = value.strip()
-        # quita fences sueltos de apertura/cierre si vinieran
         s = re.sub(r"^```json\s*|```$", "", s, flags=re.IGNORECASE).strip()
 
-        # 3) intentar desempaquetar una capa (json.loads o sin fences)
         unwrapped = json_unwrap_once(s)
 
-        # a) dict/list -> posible aplanado
         if isinstance(unwrapped, dict):
             return flatten_double_response(unwrapped)
         if isinstance(unwrapped, list):
             return unwrapped
 
-        # b) sigue siendo string: intentar extraer primer JSON embebido
         if isinstance(unwrapped, str):
             extracted = extract_first_json_anywhere(unwrapped)
             if isinstance(extracted, dict):
                 return flatten_double_response(extracted)
             if isinstance(extracted, list):
                 return extracted
-            # No se pudo parsear a objeto: devolver string (¡nunca "None"!)
             return unwrapped
 
-        # c) cualquier otro caso raro
         return None
 
             
     def _flatten_system_content(self, blocks):
-        # puede venir string o lista de bloques
         if isinstance(blocks, str):
             return blocks
         if isinstance(blocks, list):
@@ -926,7 +865,7 @@ class Agent(Component):
             "max_tokens": self.model_params.get("max_tokens"),
             "top_p": self.model_params.get("top_p")
         }
-        # Filter out None values
+        
         params = {k: v for k, v in params.items() if v is not None}
 
         
@@ -964,7 +903,6 @@ class Agent(Component):
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
-            # imprime status + body
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
             logger.error(f"[Agent:{self.name}] OPENAI HTTP {status} ERROR:\n{body}")
@@ -1001,7 +939,6 @@ class Agent(Component):
             "max_tokens": self.model_params.get("max_tokens"),
             "top_p": self.model_params.get("top_p")
         }
-        # Filter out None values
         params = {k: v for k, v in params.items() if v is not None}
 
         if verbose:
@@ -1029,7 +966,6 @@ class Agent(Component):
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
-            # imprime status + body
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
             logger.error(f"[Agent:{self.name}] LMSTUDIO HTTP {status} ERROR:\n{body}")
@@ -1061,7 +997,6 @@ class Agent(Component):
             "max_tokens": self.model_params.get("max_tokens"),
             "top_p": self.model_params.get("top_p")
         }
-        # Filter out None values
         params = {k: v for k, v in params.items() if v is not None}
 
         new_messages = []
@@ -1091,7 +1026,6 @@ class Agent(Component):
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
-            # imprime status + body
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
             logger.error(f"[Agent:{self.name}] DEEPSEEK HTTP {status} ERROR:\n{body}")
@@ -1107,7 +1041,8 @@ class Agent(Component):
             return (content, input_tokens, output_tokens)
         else:
             return content
-    
+
+
     def _call_google_api(
         self,
         model_name: str,
@@ -1116,73 +1051,112 @@ class Agent(Component):
         verbose: bool,
         return_token_count: bool = False
     ) -> str:
-        """
-        Calls the Google Gemini API to get a response.
-        """
-        params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_output_tokens": self.model_params.get("max_tokens"),
-            "top_p": self.model_params.get("top_p")
-        }
-        # Filter out None values
-        params = {k: v for k, v in params.items() if v is not None}
 
         system_parts = None
         contents = []
         for msg in conversation:
-
             role = msg["role"]
-            parts = msg.get("parts")
-
-
+            parts = msg.get("parts") or []
             if role == "system":
-                system_parts = parts or []
+                system_parts = parts
             else:
-                contents.append({
-                    "role": "user" if role == "user" else "model",
-                    "parts": parts or []
-                })
+                contents.append({"role": "user" if role == "user" else "model", "parts": parts})
 
-        if verbose:
-            logger.debug(f"[Agent:{self.name}] _call_google_api => model={model_name} (params = {params})")
-        
+        def to_json_schema(spec):
+            if not isinstance(spec, dict):
+                return {"type": "string", "description": str(spec)}
+
+            t = str(spec.get("type", "") or "").lower()
+            if not t:
+                t = "object" if "properties" in spec else ("array" if "items" in spec else "string")
+            if t == "list": t = "array"
+            if t == "dict": t = "object"
+
+            node = {"type": t}
+            if "description" in spec: node["description"] = spec["description"]
+            if "enum" in spec: node["enum"] = spec["enum"]
+            if "format" in spec: node["format"] = spec["format"]
+
+            if t == "array":
+                items = spec.get("items")
+                node["items"] = to_json_schema(items) if isinstance(items, dict) else {}
+                if "minItems" in spec: node["minItems"] = int(spec["minItems"])
+                if "maxItems" in spec: node["maxItems"] = int(spec["maxItems"])
+
+            if t == "object":
+                props = spec.get("properties", {})
+                if isinstance(props, dict) and props:
+                    node["properties"] = {k: to_json_schema(v) for k, v in props.items()}
+                if "required" in spec and isinstance(spec["required"], list):
+                    node["required"] = spec["required"]
+
+            if isinstance(spec.get("type"), list):
+                node = {"anyOf": [to_json_schema({**spec, "type": tt}) for tt in spec["type"]]}
+
+            return node
+
+        prop_names = list(self.required_outputs.keys())
+        json_schema = {
+            "type": "object",
+            "properties": {k: to_json_schema(self.required_outputs[k]) for k in prop_names},
+            "required": prop_names
+        }
+
+        mp = self.model_params or {}
+        gc = {
+            "response_mime_type": "application/json",
+            "response_json_schema": json_schema,
+        }
+        if mp.get("temperature") is not None:
+            gc["temperature"] = float(mp["temperature"])
+        if mp.get("max_tokens") is not None:
+            gc["maxOutputTokens"] = int(mp["max_tokens"])
+        if mp.get("top_p") is not None:
+            gc["topP"] = float(mp["top_p"])
+
         payload = {
             "contents": contents,
-            "generationConfig": params
+            "generationConfig": gc
         }
         if system_parts is not None:
-            payload["systemInstruction"] = {"parts": system_parts}
+            payload["system_instruction"] = {"parts": system_parts}
 
-        
+        if verbose:
+            logger.debug(f"[Agent:{self.name}] _call_google_api => model={model_name} (v1alpha + response_json_schema)")
 
         try:
-            response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}",
-                headers={"Content-Type": "application/json"},
-                json=payload
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1alpha/models/{model_name}:generateContent",
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                json=payload, timeout=30
             )
-            response.raise_for_status()
+            r.raise_for_status()
         except requests.exceptions.RequestException as e:
-            # imprime status + body
-            status = getattr(e.response, "status_code", None)
-            body   = getattr(e.response, "text", None)
-            logger.error(f"[Agent:{self.name}] GOOGLE HTTP {status} ERROR:\n{body}")
-            raise
+            resp = getattr(e, "response", None)
+            if not resp: raise
+            try:
+                err = resp.json().get("error", {})
+                msg = err.get("message") or resp.text
+                det = []
+                for d in err.get("details", []) or []:
+                    if d.get("@type","").endswith("google.rpc.BadRequest"):
+                        for v in d.get("fieldViolations", []) or []:
+                            det.append(f"{v.get('field')}: {v.get('description')}")
+                rid = resp.headers.get("x-goog-request-id") or resp.headers.get("x-request-id")
+                extra = ("\n" + "\n".join(det)) if det else ""
+                rid_s = f"\nrequest-id: {rid}" if rid else ""
+                raise ValueError(f"Google API {resp.status_code}: {msg}{extra}{rid_s}")
+            except ValueError:
+                raise ValueError(f"Google API {resp.status_code}: {resp.text}")
 
-
-        response_json = response.json()
-
-        
-        content = response_json["candidates"][0]["content"]["parts"][0]["text"]
+        data = r.json()
+        content = data["candidates"][0]["content"]["parts"][0]["text"]
 
         if return_token_count:
-            # The Gemini API response includes a "usageMetadata" field
-            usage = response_json.get("usageMetadata", {})
-            input_tokens = usage.get("promptTokenCount", 0)
-            output_tokens = usage.get("candidatesTokenCount", 0)
-            return (content, input_tokens, output_tokens)
-        else:
-            return content
+            usage = data.get("usageMetadata", {})
+            return (content, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0))
+        return content
+
 
     def _call_anthropic_api(
         self,
@@ -1198,10 +1172,8 @@ class Agent(Component):
             "max_tokens": self.model_params.get("max_tokens", 4096),
             "top_p": self.model_params.get("top_p")
         }
-        # Filter out None values
         params = {k: v for k, v in params.items() if v is not None}
 
-        # Extract system messages (anywhere in conversation)
         system_messages = [msg for msg in conversation if msg['role'] == 'system']
         system_prompt = system_messages[0]['content'] if system_messages else None
         messages = [msg for msg in conversation if msg['role'] != 'system']
@@ -1229,7 +1201,6 @@ class Agent(Component):
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
-            # imprime status + body
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
             logger.error(f"[Agent:{self.name}] ANTHROPIC HTTP {status} ERROR:\n{body}")
@@ -1268,10 +1239,9 @@ class Agent(Component):
         new_messages = []
         for msg in conversation:
             role = msg["role"]
-            blocks = msg["content"]       # lista de bloques
+            blocks = msg["content"]
 
             if role == "system":
-                # Groq (y la 1.0 de OpenAI) exigen string
                 sys_text = self._flatten_system_content(blocks)
                 new_messages.append({"role": "system", "content": sys_text})
             else:
@@ -1299,7 +1269,6 @@ class Agent(Component):
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
-            # imprime status + body
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
             logger.error(f"[Agent:{self.name}] GROQ HTTP {status} ERROR:\n{body}")
@@ -1318,7 +1287,6 @@ class Agent(Component):
 
 
 class Tool(Component):
-
     def __init__(
         self,
         name: str,
@@ -1347,7 +1315,7 @@ class Tool(Component):
         if not self.accepts_kwargs:
             unknown = [k for k in self.inputs.keys() if k not in valid_param_names]
             if unknown:
-                logger.warning(f"[Tool:{self.name}] inputs no presentes en la firma de la función: {unknown}")
+                logger.warning(f"[Tool:{self.name}] inputs absent in function signature: {unknown}")
 
 
     def to_string(self) -> str:
@@ -1382,24 +1350,16 @@ class Tool(Component):
                     logger.debug(f"[Tool:{self.name}] Using provided input_data directly.")
                 input_dict = input_data
             else:
-                # If we have a `target_input` string that might hold advanced syntax => parse
                 if target_input and any(x in target_input for x in [":", "fn?","fn:", "?"]):
                     parsed = self.manager.parser.parse_input_string(target_input)
-                    # Now collect data from DB
                     input_dict = self._gather_data_for_tool_process(parsed, db_conn, verbose)
                 else:
                     input_dict = self._resolve_tool_or_process_input(db_conn, target_input, target_index, target_fields, target_custom, verbose)
 
-            # =======================
-            #   Llamar función "suave"
-            # =======================
-            import inspect
 
-            # Firma/params (permitir fallback si no fueron precargados en __init__)
             sig = getattr(self, "sig", inspect.signature(self.function))
             params = list(getattr(self, "params", list(sig.parameters.values())))
 
-            # ¿Espera manager?
             expects_manager = getattr(self, "expects_manager", bool(params and params[0].name == "manager"))
             start = 1 if expects_manager else 0
             fparams = params[start:]
@@ -1412,31 +1372,39 @@ class Tool(Component):
             pos_or_kw = [p for p in fparams if p.kind == POS_OR_KW]
             kw_only   = [p for p in fparams if p.kind == KW_ONLY]
 
-            # 1) Validar requeridos (por nombre). Si falta alguno => default_output
+            def _coerce(v):
+                if isinstance(v, str):
+                    s = v.strip().lower()
+                    if s in ("null", "none", ""):
+                        return None
+                    if s == "true":
+                        return True
+                    if s == "false":
+                        return False
+                return v
+
+            if isinstance(input_dict, dict):
+                input_dict = {k: _coerce(v) for k, v in input_dict.items()}
+
             missing = []
             missing += [p.name for p in pos_only  if p.default is inspect._empty and p.name not in input_dict]
             missing += [p.name for p in pos_or_kw if p.default is inspect._empty and p.name not in input_dict]
             missing += [p.name for p in kw_only   if p.default is inspect._empty and p.name not in input_dict]
             if missing:
                 if verbose:
-                    logger.error(f"[Tool:{self.name}] Faltan argumentos requeridos: {missing}")
+                    logger.error(f"[Tool:{self.name}] Required arguments are missing: {missing}")
                 return self.default_output
 
-            # 2) Positional-only: construir prefijo contiguo para evitar corrimientos
             pos_args = []
             for p in pos_only:
                 if p.name in input_dict:
                     pos_args.append(input_dict[p.name])
                 else:
-                    # si es requerido ya habríamos salido en 'missing'; al faltar uno opcional
-                    # cortamos para mantener prefijo contiguo y evitar desalinear posiciones
                     break
 
-            # 3) kwargs: solo nombres reconocidos; ignorar extras SIEMPRE (aunque la función tenga **kwargs)
             kw_names = {p.name for p in pos_or_kw + kw_only}
             func_kwargs = {k: input_dict[k] for k in kw_names if k in input_dict}
 
-            # 4) Llamar; cualquier TypeError/ValueError => default_output
             try:
                 if expects_manager:
                     result = self.function(self.manager, *pos_args, **func_kwargs)
@@ -1456,7 +1424,7 @@ class Tool(Component):
                 result["metadata"]["usd_cost"] = self.manager.cost_tool_call(self.name)
                 return result
 
-            except (TypeError, ValueError) as e:
+            except Exception as e:
                 if verbose:
                     logger.error(f"[Tool:{self.name}] => error: {e}")
                     traceback.print_exc()
@@ -1474,10 +1442,8 @@ class Tool(Component):
     ) -> dict:
         
         if target_custom:
-            # Combine multiple partial inputs
             return self._gather_inputs_from_custom(db_conn, target_custom, verbose)
         else:
-            # Single input source
             return self._gather_single_input(db_conn, target_input, target_index, target_fields, verbose)
 
 
@@ -1514,7 +1480,7 @@ class Tool(Component):
             role, content, msg_number, msg_type, timestamp = subset[target_index]
 
 
-        blocks = content                           # ya es List[Block]
+        blocks = content
         data   = self.manager._blocks_as_tool_input(blocks)
 
         try:
@@ -1560,7 +1526,7 @@ class Tool(Component):
                     if subset:
                         role, content, msg_number, msg_type, timestamp = subset[-1]
 
-                        blocks = content                           # ya es List[Block]
+                        blocks = content
                         data   = self.manager._blocks_as_tool_input(blocks)
 
                         data = self.manager._load_files_in_dict(data)
@@ -1574,7 +1540,6 @@ class Tool(Component):
             else:
                 return {}
 
-        # If multiple sources => gather them all and merge
         if parsed["multiple_sources"]:
             final_input = {}
             for source_item in parsed["multiple_sources"]:
@@ -1618,7 +1583,7 @@ class Tool(Component):
             return {}
 
         role, content, msg_number, msg_type, timestamp = subset[index]
-        blocks = content                           # ya es List[Block]
+        blocks = content
         data   = self.manager._blocks_as_tool_input(blocks)
 
         data = self.manager._load_files_in_dict(data)
@@ -1642,16 +1607,6 @@ class Tool(Component):
         target_custom: list,
         verbose: bool
     ) -> dict:
-        """
-        target_custom: a list of dicts like:
-        {
-            "component": "myagent" or "user",
-            "index": -2 (optional),
-            "fields": ["foo", "bar"] (optional)
-        }
-        We gather each piece, put them in a single dict (merging).
-        If there's a field collision, the last one overwrites.
-        """
         final_input = {}
         all_messages = self.manager._get_all_messages(db_conn)
 
@@ -1681,22 +1636,19 @@ class Tool(Component):
                 raise IndexError(f"Index={index} must be an integer for Tools.")
                 
             for (role, content, msg_number, msg_type, timestamp) in chosen:
-                blocks = content                           # ya es List[Block]
+                blocks = content
                 data   = self.manager._blocks_as_tool_input(blocks)
                     
                 data = self.manager._load_files_in_dict(data)
                 if not isinstance(data, dict):
                     continue
                 if fields:
-                    # subset the fields
                     extracted = {}
                     for f in fields:
                         if f in data:
                             extracted[f] = data[f]
-                    # merge
                     final_input.update(extracted)
                 else:
-                    # merge entire data
                     final_input.update(data)
 
         return final_input
@@ -1709,11 +1661,9 @@ class Process(Component):
         self.function = function
         self.description = description if description else "Process"
 
-        # Check if function expects manager
         sig = inspect.signature(function)
         params = list(sig.parameters.values())
         
-        # Track expected parameters
         self.expected_params = []
         valid_params = {"manager", "messages"}
         
@@ -1749,13 +1699,11 @@ class Process(Component):
 
         db_conn = self.manager._get_user_db()
 
-        # 1) If user explicitly provided a dict (or list) in 'input_data', pass that directly
         if isinstance(input_data, dict) or isinstance(input_data, list):
             if verbose:
                 logger.debug(f"[Process:{self.name}] Using user-provided input_data directly.")
             final_input = input_data
 
-        # 2) If advanced parser syntax is in target_input, build the message list from that
         elif target_input and any(x in target_input for x in [":", "fn?", "fn:", "?"]):
             parsed = self.manager.parser.parse_input_string(target_input)
             if verbose:
@@ -1770,9 +1718,6 @@ class Process(Component):
                 logger.debug(f"[Process:{self.name}] Using fallback => single target_input + target_index.")
             final_input = self._build_message_list_from_fallback(db_conn, target_input, target_index, target_fields, verbose)
 
-        # -- At this point, 'final_input' should be a list of message dicts
-
-        # 5) Call the function
         try:
             args = []
             for param_name in self.expected_params:
@@ -1812,19 +1757,17 @@ class Process(Component):
                         if r == comp_name
                     ]
                 
-                chosen = subset[-1:] if subset else [] # last message is default for processes
+                chosen = subset[-1:] if subset else []
                 message_list = self._transform_to_message_list(chosen)
             else:
                 chosen = all_msgs[-1:] if all_msgs else []
                 message_list = self._transform_to_message_list(chosen)
 
-        # 3) If multiple_sources => collect each, combine as a message list, sort by msg_number
         elif parsed["multiple_sources"]:
             combined = []
             for source_item in parsed["multiple_sources"]:
                 partial = self._collect_msg_snippets(source_item, all_msgs)
                 combined.extend(partial)
-            # sort by msg_number
             combined.sort(key=lambda x: x[2])
             message_list = self._transform_to_message_list(combined)
 
@@ -1865,9 +1808,6 @@ class Process(Component):
         return final
 
     def _handle_index(self, index, subset):
-        """
-        index can be None, "~", int, or (start, end)
-        """
         if not subset:
             return []
 
@@ -1896,11 +1836,9 @@ class Process(Component):
                 end = int(end)
             return subset[start:end]
 
-        # If we don't recognize index => fallback to last
         return [subset[-1]]
 
     def _transform_to_message_list(self, msg_tuples: List[tuple]) -> List[dict]:
-        # Sort by msg_number ascending
         sorted_msgs = sorted(msg_tuples, key=lambda x: x[2])
 
         output = []
@@ -1915,7 +1853,6 @@ class Process(Component):
                 "timestamp": timestamp
             })
 
-        # If you do NOT want "msg_number" in the final structure, remove it:
         output = [{"source": m["source"], "message": m["message"], "type": m["type"]} for m in output]
 
         return output
@@ -1965,7 +1902,6 @@ class Process(Component):
 
             combined.extend(final)
 
-        # sort by msg_number
         combined.sort(key=lambda x: x[2])
         return self._transform_to_message_list(combined)
 
@@ -1982,7 +1918,6 @@ class Process(Component):
         if not all_msgs:
             return []
 
-        # 1) filtrado por componente
         subset = (
             [row for row in all_msgs if row[0] == target_input]
             if target_input else all_msgs
@@ -1990,10 +1925,8 @@ class Process(Component):
         if not subset:
             return []
 
-        # 2) manejamos el índice / rango
         chosen = self._handle_index(target_index, subset)
 
-        # 3) filtramos fields
         if target_fields:
             tmp = []
             for (role, content, num, typ, ts) in chosen:
@@ -2033,9 +1966,6 @@ class Automation(Component):
     def _execute_step(self, step, current_output, db_conn, verbose,
                       on_update = None, on_update_params = None,
                       return_token_count = False):
-        """
-        Execute a single step, which can be a component name (string) or a control flow dictionary.
-        """
 
         if isinstance(step, str):
             (
@@ -2057,9 +1987,6 @@ class Automation(Component):
                     f"target_input={parsed_target_input}, target_index={parsed_target_index}, "
                     f"target_custom={parsed_target_custom}")
 
-            # Run the component
-
-            # Check if the component is an Automation and pass `on_update`
             if isinstance(comp, Automation):
                 step_output = comp.run(
                     verbose=verbose,
@@ -2112,7 +2039,6 @@ class Automation(Component):
                 end_condition = step.get("end_condition", step.get("condition"))
                 body = step.get("body", [])
 
-                # Evaluate start_condition; if it's a bool, use that directly; if it's a string/dict, parse it
                 if (isinstance(start_condition, bool) and start_condition) or \
                 (isinstance(start_condition, (str, dict)) and self._evaluate_condition(start_condition, current_output)):
                     while True:
@@ -2132,7 +2058,6 @@ class Automation(Component):
                 if verbose:
                     logger.debug(f"[Automation:{self.name}] Processing FOR loop with items: {items_spec}")
 
-                # Resolve items specification
                 items_data = self._resolve_items_spec(items_spec, db_conn, verbose)
 
                 elements = self._generate_elements_from_items(items_data, verbose)
@@ -2142,14 +2067,12 @@ class Automation(Component):
                     if verbose:
                         logger.debug(f"[Automation:{self.name}] FOR loop iteration {idx+1}/{len(elements)}")
                     
-                    # Create iterator message
                     iterator_msg = {
                         "item_number": idx,
                         "item": element
                     }
                     self.manager._save_message(db_conn, "iterator", iterator_msg, "iterator")
 
-                    # Execute loop body
                     for nested_step in body:
                         current_output = self._execute_step(
                             nested_step, current_output, db_conn, 
@@ -2166,7 +2089,7 @@ class Automation(Component):
                     case_body = case.get("body", [])
                     
                     if case_value == "default":
-                        continue  # Process default last
+                        continue
                         
                     if self._case_matches(switch_value, case_value, verbose):
                         if verbose:
@@ -2176,7 +2099,6 @@ class Automation(Component):
                         executed = True
                         break
                 
-                # Process default case if no matches
                 if not executed:
                     for case in step.get("cases", []):
                         if case.get("case") == "default":
@@ -2194,7 +2116,6 @@ class Automation(Component):
     def _resolve_switch_value(self, value_spec, db_conn, verbose):
         """Resolve switch value using parser logic"""
         if isinstance(value_spec, str) and not value_spec.startswith(":"):
-            # Direct field reference from last message
             last_blocks = self.manager._get_all_messages(db_conn)[-1][1]
             data_dict   = self.manager._blocks_as_tool_input(last_blocks)
             return data_dict.get(value_spec)
@@ -2234,20 +2155,16 @@ class Automation(Component):
             return False
 
     def _resolve_items_spec(self, items_spec, db_conn, verbose):
-        """Resolve items specification to concrete data with parser logic"""
-        # Handle numeric cases first
         if isinstance(items_spec, (int, float)):
             return int(items_spec)
         
         if isinstance(items_spec, list) and all(isinstance(x, (int, float)) for x in items_spec):
             return items_spec
         
-        # Handle string specifications with parser
         if isinstance(items_spec, str):
             parsed = self.manager.parser.parse_input_string(items_spec)
             resolved_data = self._gather_data_for_parser_result(parsed, db_conn)
             
-            # Enforce single message selection
             if isinstance(resolved_data, list):
                 if len(resolved_data) > 1:
                     raise ValueError(f"[Automation] FOR loop items spec '{items_spec}' resolved to multiple messages")
@@ -2260,33 +2177,24 @@ class Automation(Component):
         return items_spec
 
     def _generate_elements_from_items(self, items_data, verbose):
-        """Convert resolved items data into iterable elements with type-specific handling"""
         if items_data is None:
             return []
         
-        # Handle numeric ranges
         if isinstance(items_data, (int, float)):
             return list(range(int(items_data)))
         
-        # Handle list-based ranges or generic lists
         if isinstance(items_data, list):
             if len(items_data) in (2, 3) and all(isinstance(x, (int, float)) for x in items_data):
-                # Numeric range case
                 params = [int(x) for x in items_data]
                 return list(range(*params))
-            # Generic list case
             return items_data
         
-        # Handle dictionary cases
         if isinstance(items_data, dict):
-            # If single field, use its value
             if len(items_data) == 1:
                 return self._generate_elements_from_items(next(iter(items_data.values())), verbose)
             
-            # Convert dict to list of key-value pairs
             return [{"key": k, "value": v} for k, v in items_data.items()]
         
-        # Wrap single items in list
         return [items_data]
 
     def _evaluate_condition(self, condition, current_output) -> bool:
@@ -2299,14 +2207,13 @@ class Automation(Component):
             if parsed["is_function"] and parsed["function_name"]:
                 input_data = self._gather_data_for_parser_result(parsed, db_conn)
                 fn = self.manager._get_function_from_string(parsed["function_name"])
-                result = fn(input_data)  # must return a boolean
+                result = fn(input_data)
                 if not isinstance(result, bool):
                     raise ValueError(
                         f"[Automation:{self.name}] Condition function '{parsed['function_name']}' did not return a bool."
                     )
                 return result
             else:
-                # Not a function => interpret as a single param or multiple params => must all be True
                 data = self._gather_data_for_parser_result(parsed, db_conn)
                 if isinstance(data, dict):
                     return all(bool(v) for v in data.values())
@@ -2330,10 +2237,7 @@ class Automation(Component):
                 result = fn(input_data)
                 return (result == target_value)
 
-            # Otherwise => retrieve data, compare to 'value'
             data = self._gather_data_for_parser_result(parsed, db_conn)
-
-            # If data is a single value or list or dict => do direct equality
             return (data == target_value)
 
         raise ValueError(f"[Automation:{self.name}] Unsupported condition type: {condition}")
@@ -2344,7 +2248,6 @@ class Automation(Component):
             if parsed["component_or_param"]:
                 comp = self.manager._get_component(parsed["component_or_param"])
                 if comp:
-                    # It's a component => let's get the latest message from that component
                     messages = self.manager._get_all_messages(db_conn)
 
                     filtered = [
@@ -2361,19 +2264,16 @@ class Automation(Component):
                     else:
                         return None
                 else:
-                    # It's just a param name or string => interpret it as a param from the last message
                     subset = self.manager._get_all_messages(db_conn)
                     role, content, msg_number, msg_type, timestamp = subset[-1]
                     
-                    blocks = content                           # ya es List[Block]
+                    blocks = content
                     data   = self.manager._blocks_as_tool_input(blocks)
 
                     return data[parsed["component_or_param"]]
             else:
-                # Nothing
                 return None
 
-        # 2) If multiple_sources is not None, we unify them into a single dict
         if parsed["multiple_sources"]:
             final_data = {}
             for source_item in parsed["multiple_sources"]:
@@ -2381,7 +2281,6 @@ class Automation(Component):
                 if isinstance(partial_data, dict):
                     final_data.update(partial_data)
                 else:
-                    # If partial_data isn't a dict, we put it under a key with the component name or "unnamed"
                     comp_key = source_item["component"] if source_item["component"] else "unnamed"
                     final_data[comp_key] = partial_data
             return final_data
@@ -2411,7 +2310,7 @@ class Automation(Component):
         if not subset:
             return None
 
-        index_to_use = index if index is not None else -1  # default to latest
+        index_to_use = index if index is not None else -1
         if len(subset) < abs(index_to_use):
             return None
 
@@ -2570,7 +2469,6 @@ class AgentSystemManager:
 
         self._last_known_update = None
 
-        # Setup history folder:
         if history_folder is not None:
             if os.path.isabs(history_folder):
                 self.history_folder = history_folder
@@ -2581,7 +2479,6 @@ class AgentSystemManager:
                 self.history_folder = os.path.join(self.base_directory, "history")
         os.makedirs(self.history_folder, exist_ok=True)
 
-        # Setup files folder:
         if files_folder is not None:
             if os.path.isabs(files_folder):
                 self.files_folder = files_folder
@@ -2603,9 +2500,7 @@ class AgentSystemManager:
                                     base_directory: str,
                                     default_models: List[Dict[str, str]],
                                     verbose: bool = False) -> str:
-        import textwrap
 
-        # ---------- 1. README + combined input ------------------------
         readme_text = get_readme("mneuronico", "multi-agent-system-library")
 
         combined_input = textwrap.dedent(f"""\
@@ -2662,7 +2557,6 @@ class AgentSystemManager:
         with open(bootstrap_cfg_path, "w", encoding="utf-8") as fp:
             json.dump(bootstrap_cfg, fp, indent=2)
 
-        # ---------- 3. run bootstrap ----------------------------------
         sub_mgr = AgentSystemManager(config=bootstrap_cfg_path,
                                      base_directory=base_directory)
 
@@ -2672,7 +2566,6 @@ class AgentSystemManager:
             verbose = verbose
         )
 
-        # ----------- extract the JSON object from the first text block ---
         agent_payload = None
         for blk in blocks:
             if blk.get("type") == "text":
@@ -2693,7 +2586,6 @@ class AgentSystemManager:
         comps    = agent_payload["components"]
         fns_list = agent_payload["fns"]
 
-        # ---------- 4. persist final system ---------------------------
         final_cfg_path = os.path.join(base_directory, "config.json")
         with open(final_cfg_path, "w", encoding="utf-8") as fp:
             json.dump({"general_parameters": gp, "components": comps}, fp, indent=2)
@@ -2702,14 +2594,11 @@ class AgentSystemManager:
         with open(final_fns_path, "w", encoding="utf-8") as fp:
             fp.write("\n\n".join(fns_list))
 
-        # ---------- 4-bis. clean bootstrap artefacts ------------------
-        # Close the sub-manager’s DB so Windows lets us delete the folder
         try:
             sub_mgr._close_all_db_conns()
         except Exception:
             pass
 
-        # Remove history/ and files/ produced by the bootstrap run
         for folder in ("history", "files"):
             path = os.path.join(base_directory, folder)
             if os.path.isdir(path):
@@ -2744,7 +2633,6 @@ class AgentSystemManager:
             self._process_single_import(import_str)
 
     def _uid(self):
-        """User-id vigente para *este* hilo (o None)."""
         return getattr(self._tls, "current_user_id", None)
     
     def _process_single_import(self, import_str: str):
@@ -2765,14 +2653,11 @@ class AgentSystemManager:
             file_part, comps_part = import_str.split("?", 1)
             file_part = file_part.strip()
             comps_part = comps_part.strip()
-            # Expect something like "[comp1, comp2, ...]"
             if comps_part.startswith("[") and comps_part.endswith("]"):
-                inside = comps_part[1:-1].strip()  # remove brackets
+                inside = comps_part[1:-1].strip()
                 if inside:
-                    # Split by comma to get component names
                     components = [c.strip() for c in inside.split(",") if c.strip()]
                 else:
-                    # "?[ ]" was empty: no specific components => None => import all
                     components = None
 
         base, ext = os.path.splitext(file_part)
@@ -2816,7 +2701,6 @@ class AgentSystemManager:
     
     def _merge_imported_components(self, other_mgr, only_names):
 
-        # 1) Agents
         for name, agent_obj in other_mgr.agents.items():
             if only_names and name not in only_names:
                 continue
@@ -2824,9 +2708,7 @@ class AgentSystemManager:
                 agent_obj.manager = self
                 self.agents[name] = agent_obj
                 self._component_order.append(name)
-            # else: skip if it already exists
 
-        # 2) Tools
         for name, tool_obj in other_mgr.tools.items():
             if only_names and name not in only_names:
                 continue
@@ -2834,9 +2716,7 @@ class AgentSystemManager:
                 tool_obj.manager = self
                 self.tools[name] = tool_obj
                 self._component_order.append(name)
-            # else: skip if it already exists
 
-        # 3) Processes
         for name, proc_obj in other_mgr.processes.items():
             if only_names and name not in only_names:
                 continue
@@ -2844,9 +2724,7 @@ class AgentSystemManager:
                 proc_obj.manager = self
                 self.processes[name] = proc_obj
                 self._component_order.append(name)
-            # else: skip if it already exists
 
-        # 4) Automations
         for name, auto_obj in other_mgr.automations.items():
             if only_names and name not in only_names:
                 continue
@@ -2854,7 +2732,6 @@ class AgentSystemManager:
                 auto_obj.manager = self
                 self.automations[name] = auto_obj
                 self._component_order.append(name)
-            # else: skip if it already exists
 
     def _component_exists(self, name: str) -> bool:
         return any(
@@ -2870,16 +2747,11 @@ class AgentSystemManager:
         return None
         
     def clear_file_cache(self):
-        """
-        Clears the in-memory cache of file-based objects.
-        Does NOT delete the actual files on disk.
-        """
         self._file_cache = {}
         
     def to_string(self) -> str:
         components_details = []
 
-        # Iterate over each type of component and call its `to_string`
         for category, components in [
             ("Agents", self.agents),
             ("Tools", self.tools),
@@ -2904,17 +2776,14 @@ class AgentSystemManager:
         )
 
     def _load_api_keys(self):
-        # Initialize api_keys as an empty dictionary. It will only be populated by the JSON file.
         self.api_keys = {}
 
         if self.api_keys_path is None or not os.path.exists(self.api_keys_path):
-            # No file path provided, so we'll rely solely on environment variables later.
             return
         
         if self.api_keys_path.endswith('.json'):
             try:
                 with open(self.api_keys_path, "r", encoding="utf-8") as f:
-                    # JSON file has the highest priority, load its keys directly.
                     self.api_keys = json.load(f)
             except OSError as e:
                 logger.error(f"Error opening API keys file: {e}")
@@ -2922,16 +2791,11 @@ class AgentSystemManager:
                 logger.error(f"Error decoding JSON from {self.api_keys_path}: {e}")
 
         elif self.api_keys_path.endswith('.env'):
-            # .env file loads variables into the environment. 'override=True' gives it
-            # priority over system-level environment variables.
             load_dotenv(self.api_keys_path, override=True)
         else:
             raise ValueError(f"Unsupported API keys format: {self.api_keys_path}")
         
     def _load_costs(self):
-        """
-        Populate self.costs from a JSON file. Silent-fail → empty dict.
-        """
         if self.costs_path and os.path.exists(self.costs_path):
             try:
                 with open(self.costs_path, "r", encoding="utf-8") as f:
@@ -2940,7 +2804,6 @@ class AgentSystemManager:
                 logger.warning(f"Could not read costs file: {e}")
                 self.costs = {}
         else:
-            # Try <base_dir>/costs.json automatically
             auto = os.path.join(self.base_directory, "costs.json")
             if os.path.exists(auto):
                 self.costs_path = auto
@@ -2948,7 +2811,6 @@ class AgentSystemManager:
             else:
                 self.costs = {}
 
-    # ---------------- price lookup helpers --------------
     def _price_for_model(self, provider: str, model: str):
         prov = self.costs.get("models", {}).get(provider.lower(), {})
         mdl  = prov.get(model, {})
@@ -2961,10 +2823,10 @@ class AgentSystemManager:
 
     def _price_for_stt(self, provider: str, model: str):
         return (
-            self.costs.get("stt", {})           # top-level bucket
+            self.costs.get("stt", {})
                     .get(provider.lower(), {})
                     .get(model, {})
-                    .get("per_minute", 0.0)    # $ per audio minute
+                    .get("per_minute", 0.0)
         )
     
     def _log_stt_call(self,
@@ -2973,7 +2835,7 @@ class AgentSystemManager:
                       seconds: float,
                       transcription: str):
         usd = round(self._price_for_stt(provider, model) *
-                    (seconds / 60.0), 10)      # pro-rate by duration
+                    (seconds / 60.0), 10)
 
         blocks = self._to_blocks({"transcription": transcription},
                                  user_id=self._active_user_id())
@@ -3001,7 +2863,6 @@ class AgentSystemManager:
         return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     def _write_usage_entry(self, entry: dict, force_summary: bool = False):
-        """Append one JSON-line to usage.log and regenerate the summary."""
         entry["ts"] = self._now_iso()
         with open(self._usage_log_path, "a", encoding="utf-8") as fp:
             fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -3024,7 +2885,6 @@ class AgentSystemManager:
                     continue
 
     def _bucket_for(self, ts_iso, span):
-        """Return True if timestamp is inside the given window span."""
         ts = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
         delta = now - ts
@@ -3038,7 +2898,6 @@ class AgentSystemManager:
         }[span]
 
     def _refresh_cost_summary(self):
-        """Recompute aggregates and overwrite summary.log."""
         spans = ["minute", "hour", "day", "week", "month", "year", "lifetime"]
         agg   = {s: collections.defaultdict(lambda: {
                     "calls":0, "input_tokens":0, "output_tokens":0,
@@ -3047,7 +2906,7 @@ class AgentSystemManager:
         for row in self._iter_usage_rows():
             for span in spans:
                 if span == "lifetime" or self._bucket_for(row["ts"], span):
-                    key = row["id"]        # provider:model  OR  tool_name  OR  stt_model
+                    key = row["id"]
                     bucket = agg[span][key]
                     bucket["calls"]         += 1
                     bucket["usd_cost"]      += row.get("cost", 0.0)
@@ -3055,7 +2914,6 @@ class AgentSystemManager:
                     bucket["output_tokens"] += row.get("out_toks", 0)
                     bucket["seconds"]       += row.get("seconds", 0)
 
-        # totals & per-user averages
         summary = {}
         for span, data in agg.items():
             total_cost = sum(v["usd_cost"] for v in data.values())
@@ -3077,13 +2935,6 @@ class AgentSystemManager:
             self._write_usage_entry(entry)
 
     def get_cost_report(self, span="lifetime", user=None, model_or_tool=None):
-        """
-        Return an in-memory dict with the same structure that lives in summary.log.
-        Optional filters:
-            span            one of minute/hour/day/week/month/year/lifetime
-            user            restrict to a single user_id
-            model_or_tool   restrict to a single id (provider:model, toolname, stt-model)
-        """
         if not os.path.isfile(self._summary_log_path):
             self._refresh_cost_summary()
         with open(self._summary_log_path, encoding="utf-8") as fp:
@@ -3117,12 +2968,6 @@ class AgentSystemManager:
             return result
         return span_data
 
-
-
-
-
-
-
     def _get_db_path_for_user(self, user_id: str) -> str:
         return os.path.join(self.history_folder, f"{user_id}.sqlite")
 
@@ -3134,7 +2979,6 @@ class AgentSystemManager:
             return self._db_pool[user_id]
         db_path = self._get_db_path_for_user(user_id)
         
-        # 0) sanity: sqlite en memoria
         print("starting test...")
         try:
             sqlite3.connect(":memory:").close()
@@ -3142,7 +2986,6 @@ class AgentSystemManager:
         except Exception as e:
             print("[diag] sqlite :memory: FAIL", repr(e), traceback.format_exc())
 
-        # 1) intentá abrir en %TEMP% (archivo nuevo)
         tmp_test = os.path.join(tempfile.gettempdir(), "mas_sqlite_probe.sqlite")
         try:
             t = sqlite3.connect(tmp_test, timeout=5)
@@ -3189,7 +3032,6 @@ class AgentSystemManager:
             with open(db_path, "rb") as f:
                 return f.read()
         else:
-            # If no DB exists, return empty bytes
             return b""
     
     def import_history(self, user_id: str, sqlite_bytes: bytes):
@@ -3197,22 +3039,19 @@ class AgentSystemManager:
             try:
                 self._db_pool[user_id].close()
             except Exception as e:
-                logger.warning(f"Error al cerrar la conexión existente para el usuario {user_id} antes de importar: {e}")
+                logger.warning(f"Error closing existing connection for user {user_id} before import: {e}")
             del self._db_pool[user_id]
 
         if hasattr(self, "_tls") and getattr(self._tls, "current_user_id", None) == user_id:
             if hasattr(self._tls, "db_conn") and self._tls.db_conn is not None:
                 try:
-                    # Intenta cerrar la conexión por si acaso, no da error si ya está cerrada
                     self._tls.db_conn.close()
                 except Exception: pass
-            # Forzamos a que la caché del hilo se vacíe.
             self._tls.db_conn = None
             logger.debug(f"Cleared thread-local DB connection for user {user_id}.")
             
         db_path = self._get_db_path_for_user(user_id)
         if os.path.exists(db_path):
-            # Log a warning that an existing DB is being overwritten
             logger.warning(f"Overwriting existing history for user {user_id}")
         with open(db_path, "wb") as f:
             f.write(sqlite_bytes)
@@ -3251,7 +3090,6 @@ class AgentSystemManager:
         if not hasattr(self, "_tls"):
             self._tls = threading.local()
 
-        # Conexión sqlite específica de ese usuario
         self._tls.current_user_id = user_id
         self._tls.db_conn         = self._ensure_user_db(user_id)
 
@@ -3260,7 +3098,6 @@ class AgentSystemManager:
         if user_id:
             self.set_current_user(user_id)
             return
-        # Si este hilo no tiene usuario aún, crea uno
         if not hasattr(self, "_tls"):
             self._tls = threading.local()
         if getattr(self._tls, "current_user_id", None) is None:
@@ -3298,7 +3135,6 @@ class AgentSystemManager:
             content_str = str(content)
 
         cur = conn.cursor()
-        # Bloquea para evitar carreras con MAX(msg_number)
         cur.execute("BEGIN IMMEDIATE")
         cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
         next_num = cur.fetchone()[0]
@@ -3324,14 +3160,9 @@ class AgentSystemManager:
         output_value,
         verbose=False
     ):
-        """
-        Recibe la salida cruda del componente, la convierte en bloques y la guarda.
-        """
-        # Automatizaciones no se persisten (mantengo comportamiento original)
         if isinstance(component, Automation):
             return
 
-        # ---- info de metadatos ────────────────────────────────
         model_info = getattr(component, "_last_used_model", None)
         if model_info:
             del component._last_used_model
@@ -3340,7 +3171,7 @@ class AgentSystemManager:
             model_str = None
 
         if output_value is None:
-            return  # nada que guardar
+            return
 
         save_role      = component.name
         component_type = (
@@ -3350,7 +3181,6 @@ class AgentSystemManager:
             "automation"
         )
 
-        # ---- persistencia final ───────────────────────────────
         self._save_message(
             db_conn,
             save_role,
@@ -3361,24 +3191,20 @@ class AgentSystemManager:
 
         meta = self._extract_metadata_from_blocks(output_value)
         if not meta:
-            return                                      # nada que loggear
+            return
 
         entry = {
             "user":   self._active_user_id(),
-            "type":   component_type,                   # "agent" | "tool" | …
-            "id":     model_str or save_role,           # p.e.  "openai:gpt-4o"
+            "type":   component_type,
+            "id":     model_str or save_role,
             "in_toks":  meta.get("input_tokens", 0),
             "out_toks": meta.get("output_tokens", 0),
-            "seconds": meta.get("seconds", 0),          # STT deja esto en 0
+            "seconds": meta.get("seconds", 0),
             "cost":    meta.get("usd_cost", 0.0)
         }
         self._log_if_enabled(entry)
         
     def _dict_to_json_with_file_persistence(self, data: dict, user_id: str) -> str:
-        """
-        Recursively persist non-JSON-friendly values into files, replacing them with "file:/path/to.pkl".
-        Then return the JSON representation of the modified dictionary.
-        """
         data_copy = self._persist_non_json_values(data, user_id)
         return json.dumps(data_copy, indent=2, ensure_ascii=False)
 
@@ -3389,7 +3215,6 @@ class AgentSystemManager:
         if isinstance(value, list):
             return [self._persist_non_json_values(item, user_id) for item in value]
 
-        # ⬇️ NUEVO: bytes / bytearray se guardan igual que otros objetos
         if isinstance(value, (bytes, bytearray)):
             return self._store_file(value, user_id)
 
@@ -3401,14 +3226,9 @@ class AgentSystemManager:
     
 
     def _detect_extension(self, data: bytes, fallback=".bin") -> str:
-        """Devuelve '.jpg' | '.png' | '.gif'… si data es imagen, 
-        '.ogg' | '.mp3' si es audio (cabecera “ID3”…), etc.
-        Si no reconoce, usa fallback."""
-        
         ext = imghdr.what(None, h=data)
         if ext:
             return f".{ext}"
-        # audio muy simple → ID3, OggS…
         if data[:3] == b"ID3":
             return ".mp3"
         if data[:4] == b"OggS":
@@ -3420,15 +3240,13 @@ class AgentSystemManager:
         files_dir = os.path.join(self.files_folder, user_id)
         os.makedirs(files_dir, exist_ok=True)
 
-        # ── 1. si es ruta a un archivo existente … ──────────────────────
         if isinstance(obj, str) and os.path.isfile(obj):
             ext = os.path.splitext(obj)[1] or ".bin"
             new_path = os.path.join(files_dir, f"{uuid.uuid4()}{ext}")
             shutil.copy2(obj, new_path)
-            self._file_cache[new_path] = obj          # opcional: apuntar a path original
+            self._file_cache[new_path] = obj
             return f"file:{new_path}"
 
-        # ── 2. si es bytes / bytearray … ────────────────────────────────
         if isinstance(obj, (bytes, bytearray)):
             ext = self._detect_extension(obj)
             new_path = os.path.join(files_dir, f"{uuid.uuid4()}{ext}")
@@ -3437,7 +3255,6 @@ class AgentSystemManager:
             self._file_cache[new_path] = bytes(obj)
             return f"file:{new_path}"
 
-        # ── 3. cualquier otro objeto → pickle (comportamiento previo) ───
         new_path = os.path.join(files_dir, f"{uuid.uuid4()}.pkl")
         with open(new_path, "wb") as f:
             pickle.dump(obj, f)
@@ -3457,7 +3274,6 @@ class AgentSystemManager:
         if isinstance(value, list):
             return [self._load_files_in_dict(item) for item in value]
 
-        # ⬇️ file:/  -> cargar del disco / caché
         if isinstance(value, str) and value.startswith("file:"):
             return self._load_file(value[5:])
 
@@ -3468,10 +3284,10 @@ class AgentSystemManager:
             return self._file_cache[file_path]
 
         ext = os.path.splitext(file_path)[1].lower()
-        if ext == ".pkl":                       #  ← solo los .pkl se des-pickle-an
+        if ext == ".pkl":
             with open(file_path, "rb") as f:
                 obj = pickle.load(f)
-        else:                                   #  imágenes / audio → bytes
+        else:
             with open(file_path, "rb") as f:
                 obj = f.read()
 
@@ -3487,10 +3303,6 @@ class AgentSystemManager:
         msg_type: str = "user",
         user_id: Union[str, None] = None
     ) -> int:
-        """
-        Normaliza *content* a List[Block] con _to_blocks() y lo guarda.
-        Devuelve el msg_number asignado (atómico).
-        """
         self.ensure_user(user_id)
         conn = self._get_user_db()
         msg_number = self._save_message(conn, role, content, msg_type)
@@ -3498,7 +3310,6 @@ class AgentSystemManager:
 
     
     def _filter_blocks_by_fields(self, blocks, fields):
-        import copy
         if not fields:
             return blocks
 
@@ -3574,13 +3385,7 @@ class AgentSystemManager:
 
         return messages
     
-    # ---------- helper: saca metadata de una lista de bloques --------------
     def _extract_metadata_from_blocks(self, content):
-        """
-        Devuelve el dict metadata que guarda MAS dentro del primer bloque con ella.
-        Si no hay, devuelve {}.
-        """
-
         if isinstance(content, dict):
             return content.get("metadata", {})
 
@@ -3588,11 +3393,9 @@ class AgentSystemManager:
             for blk in content:
                 if not isinstance(blk, dict):
                     continue
-                # 1) bloque con metadata explícita
                 if "metadata" in blk:
                     return blk["metadata"]
 
-                # 2) bloque type=text con JSON serializado
                 if blk.get("type") == "text":
                     raw = blk.get("content")
                     if isinstance(raw, dict) and "metadata" in raw:
@@ -3607,29 +3410,6 @@ class AgentSystemManager:
         return {}
     
     def get_usage_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Returns a summary of token- and cost-usage for the given user (defaults to current).
-        {
-        "models": {
-            "<provider:model>": {
-            "input_tokens": int,
-            "output_tokens": int,
-            "usd_cost": float
-            },
-            ...,
-            "overall": { same fields summed }
-        },
-        "tools": {
-            "<tool_name>": {
-            "calls": int,
-            "usd_cost": float
-            },
-            ...,
-            "overall": { calls, usd_cost }
-        },
-        "overall": { "usd_cost": float }
-        }
-        """
         messages = self.get_messages(user_id)
         models = {}
         tools  = {}
@@ -3653,7 +3433,6 @@ class AgentSystemManager:
                 t["calls"]     += 1
                 t["usd_cost"]  += cost
 
-        # now build totals
         models_overall = {"input_tokens": 0, "output_tokens": 0, "usd_cost": 0.0}
         for v in models.values():
             models_overall["input_tokens"]  += v["input_tokens"]
@@ -3667,7 +3446,6 @@ class AgentSystemManager:
 
         grand_total = models_overall["usd_cost"] + tools_overall["usd_cost"]
 
-        # insert the overall buckets
         models["overall"] = models_overall
         tools["overall"] = tools_overall
 
@@ -3683,10 +3461,6 @@ class AgentSystemManager:
         specific_desc: str, 
         required_outputs: dict
     ) -> str:
-        """
-        Combine the general_desc + specific_desc, then build a JSON-like structure
-        from required_outputs, showing (type) and description.
-        """
 
         prompt = f"System general description: {general_desc.strip()}\n"
     
@@ -3700,17 +3474,15 @@ class AgentSystemManager:
     
         for field_name, info in required_outputs.items():
             if isinstance(info, dict):
-                # If the user provided a dict with "type" and "description"
                 field_type = info.get("type", "string")
                 field_desc = info.get("description", str(info))
                 line = f'  "{field_name}" ({field_type}): "{field_desc}",'
             else:
-                # Just a string
                 field_desc = info
                 line = f'  "{field_name}": "{field_desc}",'
             lines.append(line)
     
-        if len(lines) > 3:  # means we have at least 1 field
+        if len(lines) > 3:
             last_line = lines[-1]
             if last_line.endswith(","):
                 lines[-1] = last_line[:-1]
@@ -3742,7 +3514,6 @@ class AgentSystemManager:
         include_timestamp: Optional[bool] = None,
         description: str = None
     ):
-        # Automatically assign name if not provided
         if name is None:
             name = self._generate_agent_name()
     
@@ -3752,7 +3523,6 @@ class AgentSystemManager:
         if models is None:
             models = self.default_models.copy()
     
-        # Convert string required_outputs to {response: <string>}
         if isinstance(required_outputs, str):
             required_outputs = {"response": required_outputs}
     
@@ -3859,7 +3629,6 @@ class AgentSystemManager:
                 changed = True
 
         if changed:
-            # Rebuild the entire system prompt using the same builder
             new_prompt = self._build_agent_prompt(
                 self.general_system_description,
                 agent_name,
@@ -3888,21 +3657,14 @@ class AgentSystemManager:
         agent.system_prompt += extra
 
     def link(self, name1: str, name2: str):
-        """
-        Link a tool and an agent based on their relationship:
-        - If the first argument is a tool, link the tool as output to the agent.
-        - If the first argument is an agent, link the agent as output to the tool.
-        """
         is_tool_1 = name1 in self.tools
         is_tool_2 = name2 in self.tools
         is_agent_1 = name1 in self.agents
         is_agent_2 = name2 in self.agents
 
         if is_tool_1 and is_agent_2:
-            # Tool -> Agent
             self.link_tool_to_agent_as_input(name1, name2)
         elif is_agent_1 and is_tool_2:
-            # Agent -> Tool
             self.link_tool_to_agent_as_output(name2, name1)
         else:
             raise ValueError(
@@ -3945,22 +3707,21 @@ class AgentSystemManager:
 
         db_conn = self._get_user_db()
 
-        # Store user-provided input (if any) in the DB
         if input is not None:
-            # por defecto consideramos que el emisor es el propio usuario
             store_role = role or "user"
 
             if store_role == "user":
-                self.add_blocks(input, role="user", msg_type="user")
+                processed_input = input
+                if isinstance(input, str):
+                    processed_input = {"response": input}
+                self.add_blocks(processed_input, role="user", msg_type="user")
                 if verbose:
                     logger.debug("[Manager] Saved user input")
             else:
-                # resto de los casos (system, internal, etc.) se guardan igual
                 self._save_message(db_conn, store_role, input, store_role)
                 logger.debug("[Manager] Saved developer input")
 
         if component_name is None:
-            # Use default or latest automation logic
             if not self.automations or len(self.automations) < 1:
                 if verbose:
                     logger.info("[Manager] Using default automation.")
@@ -4002,7 +3763,6 @@ class AgentSystemManager:
                     return_token_count=return_token_count
                 )
         else:
-            # Agents, Tools, and Processes accept input targeting arguments
             if verbose:
                 logger.debug(f"[Manager] Running {component_name or comp.name} with target_input={target_input}, "
                     f"target_index={target_index}, target_custom={target_custom}")
@@ -4053,17 +3813,11 @@ class AgentSystemManager:
         on_complete_params: Optional[Dict] = None,
         return_token_count = False
     ) -> Dict:
-        """
-        - If user_id is given, we switch to that DB. If none, we use/create the current user.
-        - The output is also saved to DB as a JSON (with file references if needed).
-        """
-
         on_update = on_update or self.on_update
         on_complete = on_complete or self.on_complete
 
         run_user_id = user_id or self._uid()
         if not run_user_id:
-            # Si todavía no hay usuario, créalo y establécelo ahora.
             run_user_id = str(uuid.uuid4())
             self.set_current_user(run_user_id)
 
@@ -4114,7 +3868,6 @@ class AgentSystemManager:
                     "total_cost":    round(delta_total, 6)
                 }
 
-                # Log simple
                 if verbose:
                     logger.info(
                         f"[Usage] +{delta_in} in / +{delta_out} out tokens  "
@@ -4123,7 +3876,6 @@ class AgentSystemManager:
                         f"tools: ${usage_summary['tools_cost']:.6f})"
                     )
 
-                # Y lo devolvemos embebido en el dict resultado
                 if final_blocks and isinstance(final_blocks, list):
                     final_blocks[0].setdefault("metadata", {})
                     final_blocks[0]["metadata"]["usage_summary"] = usage_summary
@@ -4136,12 +3888,11 @@ class AgentSystemManager:
             return final_blocks
         else:
             thread = threading.Thread(target=task)
-            thread.daemon = True  # Ensures thread exits when the main program exits
+            thread.daemon = True
             thread.start()
             return None
 
     def save_file(self, obj: Any, user_id = None) -> str:
-        # Usa el user_id explícito o el del hilo actual
         uid = str(user_id) if user_id is not None else str(self._active_user_id() or "unknown")
         self.ensure_user(uid)
         return self._store_file(obj, uid)
@@ -4181,7 +3932,6 @@ class AgentSystemManager:
         admin_from_cfg = general_params.get("admin_user_id", None)
         self.admin_user_id = str(admin_from_cfg) if admin_from_cfg is not None else getattr(self, "admin_user_id", None)
 
-        # Resolve history folder from JSON:
         history_folder = general_params.get("history_folder")
         if history_folder:
             if os.path.isabs(history_folder):
@@ -4191,7 +3941,6 @@ class AgentSystemManager:
         else:
             self.history_folder = os.path.join(self.base_directory, "history")
 
-        # Resolve files folder from JSON:
         files_folder = general_params.get("files_folder")
         if files_folder:
             if os.path.isabs(files_folder):
@@ -4262,7 +4011,6 @@ class AgentSystemManager:
                 description=description
             )
 
-            # Store the link information to be processed later
             uses_tool = component.get("uses_tool")
             if uses_tool:
                 if not hasattr(self, 'pending_links'):
@@ -4308,19 +4056,14 @@ class AgentSystemManager:
         if not ref:
             raise ValueError(f"Empty function reference.")
 
-        
-
-        # If there's a colon that is not just "fn:", it's presumably 'file.py:func'
         if ":" in ref and not ref.startswith("fn:"):
             file_part, func_name = ref.rsplit(":", 1)
             file_path = file_part.strip()
             func_name = func_name.strip()
             return self._load_function_from_file(file_path, func_name)
 
-        # Otherwise, handle the "fn:funcname" style
         if ref.startswith("fn:"):
             func_name = ref[3:].strip()
-            # Try each file in self.functions in order
             for candidate_path in self.functions:
                 try:
                     return self._load_function_from_file(candidate_path, func_name)
@@ -4387,9 +4130,6 @@ class AgentSystemManager:
         return tmp_file.name
         
     def _resolve_automation_sequence(self, sequence):
-        """
-        Resolve a sequence in an automation, including control flow objects.
-        """
         resolved_sequence = []
 
         for step in sequence:
@@ -4408,10 +4148,8 @@ class AgentSystemManager:
 
                 import_ref = f"{left_part}->{component_name}"
 
-                # 4) Now we actually process the single import
                 self._process_single_import(import_ref)
 
-                # 5) The final resolved step
                 resolved_step = f"{component_name}:{target_params}" if target_params else component_name
                 resolved_sequence.append(resolved_step)
 
@@ -4420,14 +4158,12 @@ class AgentSystemManager:
             elif isinstance(step, dict):
                 control_flow_type = step.get("control_flow_type")
                 if control_flow_type == "branch":
-                    # Validate mandatory fields for branch
                     if "condition" not in step or "if_true" not in step or "if_false" not in step:
                         raise ValueError("Branch must have 'condition', 'if_true', and 'if_false'.")
                     step["condition"] = self._resolve_condition(step["condition"])
                     step["if_true"] = self._resolve_automation_sequence(step.get("if_true", []))
                     step["if_false"] = self._resolve_automation_sequence(step.get("if_false", []))
                 elif control_flow_type == "while":
-                    # Validate mandatory fields for while
                     if "body" not in step:
                         raise ValueError("While must have 'body'.")
 
@@ -4443,21 +4179,17 @@ class AgentSystemManager:
                     if "items" not in step or "body" not in step:
                         raise ValueError("For must have 'items' and 'body'.")
                     
-                    # Resolve items specification using existing parser logic
                     step["items"] = step["items"]
                     step["body"] = self._resolve_automation_sequence(step.get("body", []))
 
                 elif control_flow_type == "switch":
-                    # Validate required fields
                     if "value" not in step or "cases" not in step:
                         raise ValueError("Switch must have 'value' and 'cases'")
                     
-                    # Validate cases structure
                     for case in step["cases"]:
                         if "case" not in case or "body" not in case:
                             raise ValueError("Each switch case must have 'case' and 'body'")
                     
-                    # Resolve remains as-is since processing happens at runtime
                     step["value"] = step["value"]
                     step["cases"] = [{
                         "case": case["case"],
@@ -4473,9 +4205,6 @@ class AgentSystemManager:
         return resolved_sequence
 
     def _resolve_condition(self, condition):
-        """
-        Resolve a condition which can be a string, dict, or callable.
-        """
         if isinstance(condition, bool):
             return condition
         elif isinstance(condition, str):
@@ -4490,11 +4219,6 @@ class AgentSystemManager:
             raise ValueError(f"Unsupported condition type: {condition}")
     
     def clear_message_history(self, user_id: Optional[str] = None):
-        """
-        Clears the message history for the specified user.
-        If no user_id is provided, it clears the history for the current user.
-        If no user_id is set or passed, it does nothing.
-        """
         if user_id is not None:
             self.set_current_user(user_id)
 
@@ -4509,11 +4233,6 @@ class AgentSystemManager:
         logger.info(f"Message history cleared for user ID: {self._uid()}")
 
     def clear_global_history(self) -> int:
-        """
-        Borra el historial de TODOS los usuarios (deja los archivos .sqlite y sus tablas vacías).
-        No hace chequeos de admin. Pensado para ser llamado por el developer.
-        Retorna la cantidad de bases tocadas.
-        """
         self._close_all_db_conns()
         os.makedirs(self.history_folder, exist_ok=True)
 
@@ -4525,7 +4244,6 @@ class AgentSystemManager:
             try:
                 conn = sqlite3.connect(db_path, check_same_thread=False)
                 cur = conn.cursor()
-                # Garantiza que la tabla exista
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS message_history (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4537,7 +4255,6 @@ class AgentSystemManager:
                         model TEXT
                     )
                 """)
-                # Limpia
                 cur.execute("DELETE FROM message_history")
                 conn.commit()
                 conn.close()
@@ -4548,43 +4265,29 @@ class AgentSystemManager:
         return cleared
 
     def reset_system(self) -> None:
-        """
-        Resetea el sistema:
-        - Cierra conexiones a DBs
-        - Elimina TODAS las bases sqlite (history/) y TODOS los archivos en files/
-        - Recrea carpetas vacías y limpia caches internas
-        NO hace chequeos de admin. Pensado para el developer.
-        """
         self._close_all_db_conns()
-        # Borra history
         try:
             shutil.rmtree(self.history_folder, ignore_errors=True)
         except Exception:
             logger.exception("Failed to remove history folder.")
-        # Borra files
         try:
             shutil.rmtree(self.files_folder, ignore_errors=True)
         except Exception:
             logger.exception("Failed to remove files folder.")
-        # Borra logs (si existen)
         try:
             if hasattr(self, "logs_folder") and self.logs_folder:
                 shutil.rmtree(self.logs_folder, ignore_errors=True)
         except Exception:
             logger.exception("Failed to remove logs folder.")
 
-        # Recrea carpetas
         os.makedirs(self.history_folder, exist_ok=True)
         os.makedirs(self.files_folder, exist_ok=True)
         if hasattr(self, "logs_folder") and self.logs_folder:
             os.makedirs(self.logs_folder, exist_ok=True)
-            # reestablece rutas (por si cambió logs_folder)
             self._usage_log_path   = os.path.join(self.logs_folder, "usage.log")
             self._summary_log_path = os.path.join(self.logs_folder, "summary.log")
-            # limpia contador interno
             if hasattr(self, "_lines_since_refresh"):
                 self._lines_since_refresh = 0
-        # Limpia caches internas
         if hasattr(self, "_db_pool"):
             self._db_pool.clear()
         self._file_cache = {}
@@ -4592,14 +4295,10 @@ class AgentSystemManager:
 
 
     def escape_markdown(self, text: str) -> str:
-        """
-        Escapes special characters in Markdown v1.
-        """
         pattern = r'([_*\[\]\(\)~`>#\+\-=|{}\.!\\])'
         return re.sub(pattern, r'\\\1', text)
     
     def _is_block(self, obj):
-        """True si obj es un bloque {'type','content'}."""
         return isinstance(obj, dict) and "type" in obj and "content" in obj
     
     def _is_image_bytes(self, val):
@@ -4608,7 +4307,6 @@ class AgentSystemManager:
     def _is_valid_image_path(self, p):
         if not isinstance(p, str):
             return False
-        import mimetypes, os
         mime, _ = mimetypes.guess_type(p)
         return mime and mime.startswith("image/") and os.path.isfile(p)
 
@@ -4629,7 +4327,6 @@ class AgentSystemManager:
         name_contains: Optional[str] = None,
         regex: Optional[str] = None
     ) -> list[str]:
-        import re
         registries = []
         if not types:
             registries = [
@@ -4668,16 +4365,16 @@ class AgentSystemManager:
     ) -> Any:
 
         if source is not None and not isinstance(source, (str, list, tuple)):
-            raise ValueError("source debe ser None, str o lista/tupla de str.")
+            raise ValueError("source must be None, str or list/tuple of str.")
         if isinstance(source, (list, tuple)) and not all(isinstance(s, str) for s in source):
-            raise ValueError("Todos los elementos de source deben ser str.")
+            raise ValueError("All elements of source must be str.")
         if block_type not in (None, "text", "image", "audio"):
-            raise ValueError("block_type debe ser None, 'text', 'image' o 'audio'.")
+            raise ValueError("block_type must be None, 'text', 'image' or 'audio'.")
         if block_index is not None and not isinstance(block_index, int):
-            raise ValueError("block_index debe ser None o int.")
+            raise ValueError("block_index must be None or int.")
         if messages is not None and not isinstance(messages, (dict, list)):
-            raise ValueError("messages debe ser None, dict o list[dict].")
-            
+            raise ValueError("messages must be None, dict or list[dict].")
+
         source_messages = []
         if messages is not None:
             source_messages = [messages] if isinstance(messages, dict) else list(messages)
@@ -4689,7 +4386,6 @@ class AgentSystemManager:
         if not source_messages:
             return None
 
-        import copy
         source_messages = copy.deepcopy(source_messages)
 
         if source:
@@ -4738,11 +4434,9 @@ class AgentSystemManager:
         if not selected_messages:
             return None
 
-        # --- 5. Determinar el formato de salida ---
         if len(selected_messages) > 1:
             return selected_messages
         
-        # A partir de aquí, solo trabajamos con un único mensaje
         single_message = selected_messages[0]
         
         if get_full_dict:
@@ -4758,12 +4452,11 @@ class AgentSystemManager:
             target_block = blocks[0]
             block_content = target_block.get("content")
             
-            # Intentar parsear JSON para bloques de texto
             if target_block.get("type") == "text" and isinstance(block_content, str):
                 try:
                     block_content = json.loads(block_content)
                 except (json.JSONDecodeError, TypeError):
-                    pass # Dejar como string si no es JSON válido
+                    pass
             
             return source, target_block.get("type"), block_content
         else:
@@ -4773,22 +4466,18 @@ class AgentSystemManager:
         self.ensure_user(user_id)
         user_id = user_id or self._uid()
 
-        # 1) lista de bloques válida
         if isinstance(value, list) and value and all(self._is_block(b) for b in value):
             return value
         
-        # 1-bis) ----- lista *mixta* → procesar elemento por elemento ----
         if isinstance(value, list):
             merged = []
             for item in value:
                 merged.extend(self._to_blocks(item, user_id=user_id, detail=detail))
             return merged
 
-        # 2) bloque suelto
         if self._is_block(value):
             return [value]
 
-        # 3) bytes  /  ruta de imagen
         if self._is_image_bytes(value):
             file_ref = self.save_file(bytes(value), user_id)
             return [{
@@ -4804,7 +4493,6 @@ class AgentSystemManager:
                 "content": {"kind": "file", "path": file_ref, "detail": detail}
             }]
 
-        # 4) dict → bloque text con el objeto en content
         if isinstance(value, dict):
             data_copy = self._persist_non_json_values(value, user_id)
             return [{
@@ -4812,39 +4500,29 @@ class AgentSystemManager:
                 "content": data_copy
             }]
 
-        # 5) todo lo demás (str, int, float, …)
         return [{
             "type": "text",
             "content": str(value)
         }]
     
     def _first_text_block(self, blocks):
-        """Devuelve el primer bloque 'text' o None."""
         for b in blocks:
             if b.get("type") == "text":
                 return b["content"]
         return None
 
     def _blocks_as_tool_input(self, blocks):
-        """
-        • Obtiene el primer bloque text, lo intenta json.loads().
-        • Si no hay bloque text → lanza ValueError (Tools no soportan imagen directa).
-        """
 
         if isinstance(blocks, str):
             try:
                 maybe = json.loads(blocks)
-                # sólo aceptamos si parece lista de bloques
                 if isinstance(maybe, list) and all(isinstance(b, dict) for b in maybe):
                     blocks = maybe
                 else:
-                    # string plano → lo tratamos como un solo bloque de texto
                     blocks = [{"type": "text", "content": blocks}]
             except json.JSONDecodeError:
-                # string plano → idem
                 blocks = [{"type": "text", "content": blocks}]
 
-        # ── 2)  Validación mínima ──────────────────────────────────────────
         if not isinstance(blocks, list):
             raise ValueError("Tool input must be a list of blocks or JSON-encoded list")
         
@@ -4862,18 +4540,15 @@ class AgentSystemManager:
                     return obj
             except json.JSONDecodeError:
                 pass
-            # texto plano → envolvemos
             return {"text_content": raw}
 
-
-        # cualquier otro tipo lo envolvemos igual
         return {"text_content": str(raw)}
     
     def get_key(self, name: str) -> Optional[str]:
         name = name.lower()
 
         variations = [
-            name,  # Try exact match first
+            name,
             f"{name}_api_key",
             f"{name}-api-key",
             f"{name}_key",
@@ -4881,36 +4556,26 @@ class AgentSystemManager:
             f"{name}key",
         ]
         
-        # Priority 1: Check the api_keys.json file content (stored in self.api_keys)
         for var in variations:
             var_lower = var.lower()
             for key_in_file in self.api_keys:
                 if key_in_file.lower() == var_lower:
                     return self.api_keys[key_in_file]
 
-        # Priority 2: Check environment variables (which includes .env file and system vars)
         for var in variations:
             value = os.environ.get(var)
 
             if value:
                 return value
             
-            # Environment variables are typically uppercase with underscores
             env_var_name = var.upper().replace('-', '_')
             value = os.environ.get(env_var_name)
             if value:
                 return value
         
-        # If not found in any source
         return None
     
     def _json_unwrap(self, value, max_depth: int = 3):
-        """
-        Intenta aplicar json.loads repetidamente para convertir:
-        '"Hola\\nMundo"'         -> 'Hola\nMundo'
-        '"{\\"response\\":...}"' -> '{"response":...}' -> {...}
-        Si deja de ser str o falla, devuelve el valor actual.
-        """
         cur = value
         for _ in range(max_depth):
             if not isinstance(cur, str):
@@ -4925,18 +4590,10 @@ class AgentSystemManager:
         return cur
     
     def _block_to_plain_text(self, blk) -> str:
-        """
-        Convierte un bloque a texto para transporte:
-        - Prioriza 'response' si el content es dict y existe.
-        - Dict/List → JSON pretty.
-        - Str → tal cual (desempaquetando niveles de JSON si hiciera falta).
-        """
-        import json
         if blk.get("type") != "text":
             return ""
         raw = blk.get("content")
 
-        # Si ya es dict/list
         if isinstance(raw, dict):
             if "response" in raw and isinstance(raw["response"], str):
                 return raw["response"]
@@ -4944,7 +4601,6 @@ class AgentSystemManager:
         if isinstance(raw, list):
             return json.dumps(raw, ensure_ascii=False, indent=2)
 
-        # String → intenta "desempacar" niveles JSON
         val = self._json_unwrap(raw)
         if isinstance(val, dict):
             if "response" in val and isinstance(val["response"], str):
@@ -5011,22 +4667,18 @@ class AgentSystemManager:
             file_path = file_path[5:]
 
         def _audio_duration_sec(path: str):
-            import os, subprocess, json
-
             if path.startswith("file:"):
                 path = path[5:]
 
             if not os.path.isfile(path):
                 return None
 
-            # --- 1 · plain WAV via stdlib ------------------------------------
             ext = os.path.splitext(path)[1].lower()
             if ext in (".wav", ".wave"):
-                import wave
+                
                 with wave.open(path, "rb") as w:
                     return w.getnframes() / w.getframerate()
 
-            # --- 2 · ffprobe if available -----------------------------------
             try:
                 ffprobe = subprocess.run(
                     ["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -5040,7 +4692,6 @@ class AgentSystemManager:
             except Exception:
                 pass
 
-            # --- 3 · mutagen fallback (pure-python) -------------------------
             try:
                 from mutagen import File as mutagen_file
                 m = mutagen_file(path)
@@ -5049,13 +4700,11 @@ class AgentSystemManager:
             except Exception:
                 pass
 
-            # couldn't figure it out
             return None
 
 
-        seconds = _audio_duration_sec(file_path) or 60.0   # flat 1-min if unknown
+        seconds = _audio_duration_sec(file_path) or 60.0
 
-        # 3) call the real HTTP endpoint
         with open(file_path, "rb") as audio_file:
             if provider == "groq":
                 transcript = self._transcribe_groq(audio_file, model)
@@ -5064,7 +4713,6 @@ class AgentSystemManager:
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
 
-        # 4) log the cost so get_usage_stats() can see it
         self._log_stt_call(provider, model, seconds, transcript)
 
         rate_pm = self._price_for_stt(provider, model)
@@ -5106,7 +4754,7 @@ class AgentSystemManager:
         )
         
         if response.status_code != 200:
-            logger.error(f"Groq API Error: {response.text}")  # Add debug output
+            logger.error(f"Groq API Error: {response.text}")
             response.raise_for_status()
             
         return response.json().get("text", "")
@@ -5144,12 +4792,6 @@ class AgentSystemManager:
         model: Optional[str] = None,
         instruction: Optional[str] = None
     ) -> str:
-        """
-        Convert text to speech using the specified provider.
-        
-        Returns:
-            The file path to the saved MP3 audio file.
-        """
 
         provider = (provider or "openai").lower()
         if provider == "openai":
@@ -5170,7 +4812,6 @@ class AgentSystemManager:
         api_key = self.get_key("openai")
         if not api_key:
             raise ValueError("OpenAI API key not found.")
-        # Set default model if not provided
         if not model:
             model = "gpt-4o-mini-tts"
         
@@ -5184,7 +4825,6 @@ class AgentSystemManager:
             "input": text,
             "voice": voice.lower()
         }
-        # Only include instructions if provided
         if instruction:
             data["instructions"] = instruction
 
@@ -5202,11 +4842,9 @@ class AgentSystemManager:
         api_key = self.get_key("elevenlabs")
         if not api_key:
             raise ValueError("ElevenLabs API key not found.")
-        # Set default model if not provided
         if not model:
             model = "eleven_multilingual_v2"
         
-        # Retrieve voices to map the voice name to a voice_id
         voices_url = "https://api.elevenlabs.io/v1/voices"
         headers = {"xi-api-key": api_key}
         voices_response = requests.get(voices_url, headers=headers)
@@ -5235,9 +4873,6 @@ class AgentSystemManager:
         return self._save_tts_file(audio_bytes)
 
     def _save_tts_file(self, audio_bytes: bytes) -> str:
-        """
-        Helper to save MP3 in files/tts as <user_id>_<random>.mp3, thread-safe.
-        """
         tts_folder = os.path.join(self.files_folder, "tts")
         os.makedirs(tts_folder, exist_ok=True)
         uid = str(self._active_user_id() or self._uid() or "unknown")
@@ -5248,7 +4883,6 @@ class AgentSystemManager:
         return file_path
     
     def _close_all_db_conns(self):
-        """Cierra todas las conexiones SQLite abiertas en el pool interno."""
         if hasattr(self, "_db_pool"):
             for _uid, conn in list(self._db_pool.items()):
                 try:
@@ -5259,18 +4893,6 @@ class AgentSystemManager:
 
 
 class Parser:
-    """
-    The result is a dictionary describing:
-      {
-        "is_function": bool,
-        "function_name": Optional[str],
-        "component_or_param": Optional[str],
-        "multiple_sources": Optional[List[dict]],
-          # if multiple sources, each dict describes: {"component":"...", "index": int, "fields": [..]}
-        "single_source": Optional[dict],
-          # describes one source with {component, index, fields} if relevant
-      }
-    """
 
     def parse_input_string(self, spec: str) -> dict:
         spec = spec.strip()
@@ -5305,12 +4927,10 @@ class Parser:
             return self._parse_input_sources(remainder)
 
         if ":" in spec:
-            # e.g. "myComponent:someInputSpec"
             parts = spec.split(":", 1)
             component_name = parts[0].strip()
             remainder = parts[1].strip()
 
-            # If remainder starts with "(" => multiple sources
             if remainder.startswith("(") and remainder.endswith(")"):
                 multiple_sources = self._parse_multiple_sources(remainder[1:-1].strip())
                 return {
@@ -5330,7 +4950,6 @@ class Parser:
                     "single_source": single_source,
                 }
 
-        # If no colon at all => either a single param or single component
         return {
             "is_function": False,
             "function_name": None,
@@ -5343,7 +4962,6 @@ class Parser:
     def _parse_input_sources(self, remainder: str) -> dict:
         remainder = remainder.strip()
         if not remainder:
-            # means just ":" was provided
             return {
                 "is_function": False,
                 "function_name": None,
@@ -5352,7 +4970,6 @@ class Parser:
                 "single_source": None,
             }
 
-        # If it starts with "(" => multiple sources
         if remainder.startswith("(") and remainder.endswith(")"):
             multiple_sources = self._parse_multiple_sources(remainder[1:-1].strip())
             return {
@@ -5403,10 +5020,6 @@ class Parser:
 
 
     def _parse_one_custom_item(self, item_str: str) -> dict:
-        """
-        Always produce: {component, index, fields}
-        If component is not found, we default to "user"
-        """
         item_str = item_str.strip()
         result = {
             "component": None,
@@ -5414,7 +5027,6 @@ class Parser:
             "fields": None,
         }
 
-        # 1) Does it contain "?[" ? Extract fields first
         fields_part = None
         bracket_start = item_str.find("[")
         bracket_end = item_str.find("]")
@@ -5427,7 +5039,6 @@ class Parser:
                 if field_list:
                     result["fields"] = field_list
 
-        # Now handle the index part if '?' is present
         if "?" in item_str:
             parts = item_str.split("?")
             maybe_comp = parts[0].strip()
@@ -5436,7 +5047,7 @@ class Parser:
             index_part = parts[1].strip()
 
             if index_part == "~":
-                result["index"] = "~"  # All messages
+                result["index"] = "~"
             elif "~" in index_part:
                 range_parts = index_part.split("~")
                 if len(range_parts) == 2:
@@ -5449,7 +5060,6 @@ class Parser:
                     range_str = range_parts[0].strip()
                     try:
                         index_val = int(range_str)
-                        # Determine if it's a start or end based on the original string
                         if index_part.startswith("~"):
                             result["index"] = (None, index_val)
                         elif index_part.endswith("~"):
@@ -5457,21 +5067,18 @@ class Parser:
                     except ValueError:
                         pass
             elif index_part:
-                # Single index
                 try:
                     idx_val = int(index_part)
                     result["index"] = idx_val
                 except ValueError:
                     pass
         elif item_str:
-            # If there's no '?', the entire string is the component name
             result["component"] = item_str
 
         return result
 
 
-import abc
-import asyncio
+
 
 class Bot(abc.ABC):
     def __init__(
@@ -5487,8 +5094,8 @@ class Bot(abc.ABC):
         on_start_msg: str = "Hey! Talk to me or type '/clear' to erase your message history.",
         on_clear_msg: str = "Message history deleted.",
         on_help_msg: str = "Here are the available commands:",
-        unknown_command_msg: Optional[str] = "I don't recognize that command. Type /help to see what I can do.", # NUEVO
-        custom_commands: Optional[Union[Dict, List[Dict]]] = None, # NUEVO
+        unknown_command_msg: Optional[str] = "I don't recognize that command. Type /help to see what I can do.",
+        custom_commands: Optional[Union[Dict, List[Dict]]] = None,
         return_token_count: bool = False,
         ensure_delivery: bool = False, 
         delivery_timeout: float = 5.0,
@@ -5518,49 +5125,23 @@ class Bot(abc.ABC):
 
         self.logger = logging.getLogger(__name__)
 
-    # --- Métodos abstractos para ser implementados por las clases hijas ---
 
     @abc.abstractmethod
     async def _parse_payload(self, payload: Any) -> Optional[Dict[str, Any]]:
-        """
-        Parsea el payload crudo de la plataforma y lo convierte en un diccionario estandarizado.
-        Debe devolver un diccionario con claves como:
-        {
-            'user_id': str,
-            'message_type': 'text' | 'image' | 'audio',
-            'text': Optional[str],         # Para texto o caption
-            'media_info': Optional[Any],   # Info necesaria para descargar el medio
-            'timestamp': datetime,         # Timestamp del mensaje
-            'original_payload': Any        # Payload original para contexto
-        }
-        o None si el mensaje no debe ser procesado.
-        """
         raise NotImplementedError
 
     @abc.abstractmethod
     async def _send_blocks(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]) -> None:
-        """
-        Envía una lista de bloques de MAS al usuario a través de la API de la plataforma.
-        """
         raise NotImplementedError
     
     @abc.abstractmethod
     async def _download_media_and_save(self, user_id: str, media_info: Any) -> str:
-        """
-        Descarga un archivo multimedia usando la información específica de la plataforma,
-        lo guarda con manager.save_file() y devuelve la referencia al archivo ("file:/...").
-        """
         raise NotImplementedError
 
     @abc.abstractmethod
     async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
-        """
-        Envía una lista de archivos de log al usuario, cada uno con su ruta y nombre de archivo.
-        Debe ser implementado por cada clase de bot específica de la plataforma.
-        """
         raise NotImplementedError
 
-    # --- Lógica de procesamiento principal (común para todos los bots) ---
 
     def _is_too_old(self, msg_dt, *, max_age=120) -> bool:
         if not isinstance(msg_dt, datetime):
@@ -5576,30 +5157,25 @@ class Bot(abc.ABC):
 
         if not parsed_message:
             if self.verbose:
-                self.logger.debug("[Bot] Payload ignorado o no parseable.")
+                self.logger.debug("[Bot] Payload ignored or not parseable.")
             return
 
         user_id = parsed_message['user_id']
         
-        # 1. Chequeo de antigüedad del mensaje
         if self._is_too_old(parsed_message['timestamp'], max_age = self.max_allowed_message_delay):
-            self.logger.debug(f"[Bot] Mensaje de {user_id} ignorado por ser demasiado antiguo.")
+            self.logger.debug(f"[Bot] Message from {user_id} ignored for being too old.")
             return
             
-        # 2. Manejo de comandos
         if parsed_message.get('message_type') == 'text' and parsed_message.get('text', '').startswith('/'):
             is_command = await self._handle_command(user_id, parsed_message['text'], parsed_message)
             if is_command:
-                return # El comando ya fue manejado y se envió respuesta
+                return
 
-        # 3. Construcción de los bloques de MAS
-        self.logger.debug("[Bot] before _build_mas_blocks")
         mas_blocks = await self._build_mas_blocks(parsed_message)
-        self.logger.debug("[Bot] after _build_mas_blocks: %s", mas_blocks)
         
         if not mas_blocks:
             if self.verbose:
-                self.logger.debug(f"[Bot] No se generaron bloques para el mensaje de {user_id}.")
+                self.logger.debug(f"[Bot] No blocks generated for message from {user_id}.")
             return
         
         callback_params = {
@@ -5609,7 +5185,6 @@ class Bot(abc.ABC):
         }
 
         def _send_response_from_callback(response):
-            """Función helper para enviar respuestas desde los callbacks síncronos."""
             if response is not None:
                 blocks = self.manager._to_blocks(response, user_id=user_id)
 
@@ -5638,8 +5213,8 @@ class Bot(abc.ABC):
             _send_response_from_callback(response)
 
         if self.verbose:
-            self.logger.debug(f"[Bot] Ejecutando manager.run para el usuario {user_id} con bloques: {mas_blocks}")
-        
+            self.logger.debug(f"[Bot] Running manager.run for user {user_id} with blocks: {mas_blocks}")
+
         self.logger.debug("[Bot] about to call manager.run (to_thread)")
         await asyncio.to_thread(
             self.manager.run,
@@ -5658,7 +5233,6 @@ class Bot(abc.ABC):
         self.logger.debug("[Bot] manager.run finished")
 
     def _register_commands(self, custom_commands: Optional[Union[Dict, List[Dict]]]):
-        # --- Comandos Integrados ---
         self.commands["/start"] = {
             "message": self.on_start_msg, "function": None, 
             "description": "Starts the conversation.", "admin_only": False
@@ -5672,7 +5246,6 @@ class Bot(abc.ABC):
             "description": "Shows this help message.", "admin_only": False
         }
         
-        # --- Comandos de Administrador ---
         if self.manager.admin_user_id:
             self.commands["/clear_all_users"] = {
                 "message": None, "function": self._clear_all_cmd,
@@ -5687,7 +5260,6 @@ class Bot(abc.ABC):
                  "description": "[Admin] Requests log files.", "admin_only": True
             }
 
-        # --- Comandos Personalizados ---
         if custom_commands:
             cmds = [custom_commands] if isinstance(custom_commands, dict) else custom_commands
             for cmd_def in cmds:
@@ -5809,19 +5381,13 @@ class Bot(abc.ABC):
 
 
     async def _build_mas_blocks(self, parsed_message: Dict[str, Any]) -> List[Dict]:
-        """
-        Construye la lista de bloques de MAS a partir del mensaje parseado.
-        """
-        
         user_id = parsed_message['user_id']
         msg_type = parsed_message['message_type']
         text = parsed_message.get('text')
         media_info = parsed_message.get('media_info')
+        is_voice = parsed_message.get('is_voice_note', False)
         blocks = []
 
-        self.logger.debug(f"[Bot] _build_mas_blocks: msg_type={msg_type}, text_len={len(text or '')}")
-
-        # 1. Transcribir audio si existe
         transcript = None
         if msg_type == 'audio':
             audio_ref = await self._download_media_and_save(user_id, media_info)
@@ -5829,32 +5395,34 @@ class Bot(abc.ABC):
             if self.speech_to_text:
                 stt_params = {
                     "manager": self.manager, 
-                    "file_path": audio_ref[5:], # quitamos "file:"
+                    "file_path": audio_ref[5:],
                 }
                 transcript = self.speech_to_text(stt_params)
             else:
                 try:
                     transcript = self.manager.stt(audio_ref, self.whisper_provider, self.whisper_model)
                 except Exception as e:
-                    self.logger.error(f"Error en STT automático para {user_id}: {e}")
-            
+                    self.logger.error(f"Error in automatic STT for {user_id}: {e}")
+
             if transcript:
-                blocks.extend(self.manager._to_blocks(transcript, user_id=user_id))
+                blocks.extend(self.manager._to_blocks({"response": transcript}, user_id=user_id))
             
-            # Siempre agregamos el bloque de audio, con o sin transcripción
             blocks.append({
                 "type": "audio",
-                "content": {"kind": "file", "path": audio_ref, "detail": "auto"}
+                "content": {
+                    "kind": "file",
+                    "path": audio_ref,
+                    "detail": "auto",
+                    "is_voice_note": is_voice
+                }
             })
 
-        # 2. Agregar texto (de mensaje de texto, caption o transcripción)
         elif msg_type == 'text' and text:
-            blocks.extend(self.manager._to_blocks(text, user_id=user_id))
+            blocks.extend(self.manager._to_blocks({"response": text}, user_id=user_id))
         
-        # 3. Procesar imagen
         elif msg_type == 'image':
-            if text: # Si hay un caption
-                 blocks.extend(self.manager._to_blocks(text, user_id=user_id))
+            if text:
+                 blocks.extend(self.manager._to_blocks({"response": text}, user_id=user_id))
             img_ref = await self._download_media_and_save(user_id, media_info)
             blocks.append({
                 "type": "image",
@@ -5864,29 +5432,39 @@ class Bot(abc.ABC):
         return blocks
     
 
+
 class TelegramBot(Bot):
     def __init__(
         self,
         manager: AgentSystemManager,
-        telegram_token: str = None, # El token ahora puede ser None aquí
+        telegram_token: str = None,
         **kwargs
     ):
         super().__init__(manager=manager, **kwargs)
         
         token = telegram_token or self.manager.get_key("telegram_token")
         if not token:
-            raise ValueError("Telegram token no fue proporcionado ni encontrado en las API keys del manager.")
-            
+            raise ValueError("Telegram token was not provided or found in the manager's API keys.")
+
         self.telegram_token = token
-        self.application = Application.builder().token(self.telegram_token).build()
+
+        request = HTTPXRequest(
+            connect_timeout=15.0,
+            read_timeout=60.0,
+            write_timeout=60.0,
+            pool_timeout=15.0,
+            http_version="1.1",
+        )
+
+
+        self.application = Application.builder().token(self.telegram_token).request(request).build()
         self.bot = self.application.bot
         self._register_handlers()
         
         if self.verbose:
-            self.logger.info("[TelegramBot] Instancia de TelegramBot creada.")
+            self.logger.info("[TelegramBot] Instance of TelegramBot created.")
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        # Log detallado del error
         self.logger.exception(
             "PTB caught an error. update=%r", getattr(update, "to_dict", lambda: update)(),
             exc_info=context.error
@@ -5903,11 +5481,9 @@ class TelegramBot(Bot):
         self.application.add_error_handler(self._on_error)
 
     async def initialize(self):
-        """Inicializa la aplicación de Telegram. Llama a esto una vez al iniciar el servidor."""
         await self.application.initialize()
 
     async def process_webhook_update(self, update_data: dict):
-        """Procesa un payload JSON entrante de un webhook de Telegram."""
         update = Update.de_json(update_data, self.bot)
         await self.application.process_update(update)
 
@@ -5923,7 +5499,18 @@ class TelegramBot(Bot):
             return None
 
         message = payload.message
-        msg_type = 'text' if message.text else 'image' if message.photo else 'audio' if (message.voice or message.audio) else None
+        
+        is_voice = message.voice is not None
+        is_audio = message.audio is not None
+        
+        msg_type = None
+        if message.text:
+            msg_type = 'text'
+        elif message.photo:
+            msg_type = 'image'
+        elif is_voice or is_audio:
+            msg_type = 'audio'
+        
         if not msg_type:
             return None
 
@@ -5932,6 +5519,7 @@ class TelegramBot(Bot):
             'message_type': msg_type,
             'text': message.text or message.caption,
             'media_info': message.photo[-1] if message.photo else message.voice or message.audio,
+            'is_voice_note': is_voice,
             'timestamp': message.date,
             'original_payload': payload 
         }
@@ -5942,9 +5530,6 @@ class TelegramBot(Bot):
         return self.manager.save_file(bytes(media_bytes), user_id)
 
     async def _send_blocks(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]):
-        """
-        Envía bloques respondiendo al mensaje original para mantener el contexto de la conversación.
-        """
         update = original_message['original_payload']
         if not blocks or not update or not update.message:
             return
@@ -5975,7 +5560,7 @@ class TelegramBot(Bot):
                     with open(content["path"][5:], "rb") as f:
                         await update.message.reply_voice(f)
             except Exception as e:
-                self.logger.error(f"Error al enviar bloque a Telegram para {user_id}: {e}\nBloque: {block}")
+                self.logger.error(f"Error sending block to Telegram for {user_id}: {e}\nBlock: {block}")
 
     async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
         sent_count = 0
@@ -5990,7 +5575,7 @@ class TelegramBot(Bot):
 
     def start_polling(self):
         if self.verbose:
-            self.logger.info("[TelegramBot] Iniciando bot en modo polling...")
+            self.logger.info("[TelegramBot] Starting bot in polling mode...")
         self.application.run_polling()
 
 class WhatsappBot(Bot):
@@ -6010,8 +5595,8 @@ class WhatsappBot(Bot):
 
         if not all([self.whatsapp_token, self.phone_number_id, self.webhook_verify_token]):
             raise ValueError(
-                "Faltan credenciales de WhatsApp. Proporciona whatsapp_token, "
-                "phone_number_id y webhook_verify_token."
+                "Whatsapp credentials are missing. Provide whatsapp_token, "
+                "phone_number_id, and webhook_verify_token."
             )
 
         self.api_version = "v18.0"
@@ -6021,7 +5606,7 @@ class WhatsappBot(Bot):
         self.persistent_loop = None
 
         if self.verbose:
-            self.logger.info("[WhatsappBot] Instancia de WhatsappBot creada y configurada.")
+            self.logger.info("[WhatsappBot] Instance of WhatsappBot created and configured.")
 
     def handle_webhook_verification(self, query_params: dict) -> tuple[str, int]:
         if query_params.get("hub.verify_token") == self.webhook_verify_token:
@@ -6030,44 +5615,71 @@ class WhatsappBot(Bot):
         return "Forbidden", 403
     
     async def process_webhook_update(self, update_data: dict):
-        """
-        Punto de entrada para un webhook. Procesa el JSON crudo de Meta.
-        """
         try:
             for entry in update_data.get("entry", []):
                 for change in entry.get("changes", []):
                     for msg in change.get("value", {}).get("messages", []):
                         await self.process_payload(msg)
         except Exception as e:
-            self.logger.exception(f"Error al procesar payload de webhook de WhatsApp: {e}")
+            self.logger.exception(f"Error processing WhatsApp webhook payload: {e}")
 
 
     async def _parse_payload(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         msg_type = payload.get("type")
-        if not msg_type or not payload.get("from"):
+        sender = payload.get("from")
+        if not msg_type or not sender:
             return None
 
-        user_id = payload["from"]
-        timestamp = datetime.fromtimestamp(int(payload.get("timestamp", 0)), timezone.utc)
-        text, media_info = None, None
+        ts_raw = payload.get("timestamp")
+        try:
+            ts = datetime.fromtimestamp(int(ts_raw), timezone.utc) if ts_raw else datetime.now(timezone.utc)
+        except (ValueError, TypeError):
+            ts = datetime.now(timezone.utc)
+
+        text = None
+        media_info = None
+        is_voice = False
 
         if msg_type == "text":
-            text = payload.get("text", {}).get("body")
-        elif msg_type in ("image", "audio", "voice"):
-            media_type = "audio" if msg_type == "voice" else msg_type
-            media_info = payload.get(media_type, {}).get("id")
-            text = payload.get(media_type, {}).get("caption")
-        else: # Ignorar otros tipos como 'sticker', 'document', etc. por ahora
+            text = (payload.get("text") or {}).get("body")
+
+        elif msg_type in ("audio", "voice", "image"):
+            if msg_type == "audio":
+                a = payload.get("audio") or {}
+                media_info = a.get("id")
+                is_voice = bool(a.get("voice", False))
+                text = a.get("caption")
+
+            elif msg_type == "voice":
+                v = payload.get("voice") or payload.get("audio") or {}
+                media_info = v.get("id")
+                text = v.get("caption")
+                is_voice = True
+
+            elif msg_type == "image":
+                img = payload.get("image") or {}
+                media_info = img.get("id")
+                text = img.get("caption")
+
+            if msg_type in ("audio", "voice", "image") and not media_info:
+                return None
+
+        else:
+            # Ignore other types for now: 'sticker', 'document', 'video', etc.
             return None
 
+        normalized_type = "audio" if msg_type == "voice" else msg_type
+
         return {
-            'user_id': user_id,
-            'message_type': "audio" if msg_type == "voice" else msg_type,
-            'text': text,
-            'media_info': media_info,
-            'timestamp': timestamp,
-            'original_payload': payload 
+            "user_id": sender,
+            "message_type": normalized_type,
+            "text": text,
+            "media_info": media_info,
+            "is_voice_note": is_voice,
+            "timestamp": ts,
+            "original_payload": payload,
         }
+
 
     async def _download_media_and_save(self, user_id: str, media_info: str) -> str:
         media_id = media_info
@@ -6080,7 +5692,7 @@ class WhatsappBot(Bot):
             media_url_info.raise_for_status()
             media_url = media_url_info.json().get("url")
             if not media_url:
-                raise ValueError("No se pudo obtener la URL del medio de WhatsApp.")
+                raise ValueError("Could not obtain WhatsApp media URL.")
 
             media_bytes_response = requests.get(media_url, headers=self.headers_auth, timeout=30)
             media_bytes_response.raise_for_status()
@@ -6114,8 +5726,8 @@ class WhatsappBot(Bot):
                         await self._send_api_request("audio", to=user_id, media_id=media_id)
 
             except Exception as e:
-                self.logger.error(f"Error al enviar bloque a WhatsApp para {user_id}: {e}\nBloque: {block}")
-    
+                self.logger.error(f"Error sending block to WhatsApp for {user_id}: {e}\nBlock: {block}")
+
 
     async def _send_document(self, to: str, path: str, filename: str = None, caption: str = None):
         media_id = await self._upload_media(path)
@@ -6144,7 +5756,6 @@ class WhatsappBot(Bot):
         )
 
         if not resp.ok:
-            # Log claro con datos útiles (recorta payload para no romper logs)
             short_payload = json.dumps(payload)[:1200]
             self.logger.error(
                 "[WA SEND] FAILED %s → %s | status=%s | resp=%s | payload=%s",
@@ -6179,12 +5790,11 @@ class WhatsappBot(Bot):
                                   data={"messaging_product": "whatsapp"}, files=files, timeout=60)
                 if r.ok:
                     return r.json().get("id")
-            self.logger.error("Fallo al subir medio a WhatsApp: %s", r.text)
+            self.logger.error("Failed to upload media to WhatsApp: %s", r.text)
             return None
         return await asyncio.to_thread(do_upload)
         
     def run_server(self, host: str = "0.0.0.0", port: int = 5000, base_path: str = "/webhook"):
-        """Inicia un servidor Flask de conveniencia para el modo "polling"."""
         self.persistent_loop = asyncio.new_event_loop()
 
         def run_asyncio_loop():
@@ -6206,12 +5816,12 @@ class WhatsappBot(Bot):
                     self.process_webhook_update(data), self.persistent_loop
                 )
                 return "OK", 200
-        if self.verbose: self.logger.info(f"[WhatsappBot] Servidor Flask corriendo en http://{host}:{port}{base_path}")
+        if self.verbose: self.logger.info(f"[WhatsappBot] Flask server running at http://{host}:{port}{base_path}")
         try:
             app.run(host=host, port=port)
         except Exception as e:
-            self.logger.exception(f"Error al iniciar el servidor Flask: {e}")
+            self.logger.exception(f"Error starting Flask server: {e}")
         finally:
             if self.persistent_loop and self.persistent_loop.is_running():
-                self.logger.info("[WhatsappBot] Deteniendo el bucle de eventos asíncrono.")
+                self.logger.info("[WhatsappBot] Stopping async event loop.")
                 self.persistent_loop.call_soon_threadsafe(self.persistent_loop.stop)
