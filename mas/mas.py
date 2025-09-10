@@ -308,16 +308,21 @@ class Agent(Component):
                         if blk["type"] == "text":
                             parts.append({"type": "text", "text": _text_as_string(blk["content"])})
                         elif blk["type"] == "image":
-                            src = blk["content"]
-                            if src["kind"] == "file":
-                                url = _image_to_datauri(src["path"])
-                            elif src["kind"] == "url":
-                                url = src["url"]
-                            else:
-                                url = f"data:image/*;base64,{src['b64']}"
-                            parts.append({"type": "image_url",
-                                          "image_url": {"url": url,
-                                                        "detail": src.get("detail","auto")}})
+                            try:
+                                src = blk["content"]
+                                if src["kind"] == "file":
+                                    url = _image_to_datauri(src["path"])
+                                elif src["kind"] == "url":
+                                    url = src["url"]
+                                else:
+                                    url = f"data:image/*;base64,{src['b64']}"
+                                parts.append({"type": "image_url",
+                                            "image_url": {"url": url,
+                                                            "detail": src.get("detail","auto")}})
+                            except:
+                                logger.warning(f"File not found in history, skipping image: {src.get('path')}")
+                                parts.append({"type": "text", "text": "[image omitted]"})
+                                continue
                     out.append({"role": role, "content": parts})
                 else:
                     text = "\n".join(
@@ -333,19 +338,24 @@ class Agent(Component):
                     if blk["type"] == "text":
                         gem_parts.append({"text": _text_as_string(blk["content"])})
                     elif blk["type"] == "image":
-                        src = blk["content"]
-                        if src["kind"] == "file":
-                            data = open(_clean_path(src["path"]),"rb").read()
-                        elif src["kind"] == "url":
-                            data = requests.get(src["url"]).content
-                        else:
-                            data = base64.b64decode(src["b64"])
-                        gem_parts.append({
-                            "inline_data": {
-                                "mime_type": "image/jpeg",
-                                "data": base64.b64encode(data).decode()
-                            }
-                        })
+                        try:
+                            src = blk["content"]
+                            if src["kind"] == "file":
+                                data = open(_clean_path(src["path"]),"rb").read()
+                            elif src["kind"] == "url":
+                                data = requests.get(src["url"]).content
+                            else:
+                                data = base64.b64decode(src["b64"])
+                            gem_parts.append({
+                                "inline_data": {
+                                    "mime_type": "image/jpeg",
+                                    "data": base64.b64encode(data).decode()
+                                }
+                            })
+                        except:
+                            logger.warning(f"File not found in history, skipping image: {src.get('path')}")
+                            gem_parts.append({"text": "[image omitted]"})
+                            continue
                 if role == "system":
                     out.append({"role": role, "parts": gem_parts})
                 else:
@@ -358,20 +368,25 @@ class Agent(Component):
                     if blk["type"] == "text":
                         c_blocks.append({"type":"text", "text": _text_as_string(blk["content"])})
                     elif blk["type"] == "image":
-                        src = blk["content"]
-                        if src["kind"] == "file":
-                            data = open(_clean_path(src["path"]),"rb").read()
-                            mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
-                            b64  = base64.b64encode(data).decode()
-                            c_blocks.append({"type":"image",
-                                             "source":{"type":"base64",
-                                                       "media_type":mime,
-                                                       "data": b64}})
-                        elif src["kind"] == "url":
-                            c_blocks.append({"type":"image",
-                                             "source":{"type":"url",
-                                                       "media_type":"image/jpeg",
-                                                       "url": src["url"]}})
+                        try:
+                            src = blk["content"]
+                            if src["kind"] == "file":
+                                data = open(_clean_path(src["path"]),"rb").read()
+                                mime = mimetypes.guess_type(src["path"])[0] or "image/jpeg"
+                                b64  = base64.b64encode(data).decode()
+                                c_blocks.append({"type":"image",
+                                                "source":{"type":"base64",
+                                                        "media_type":mime,
+                                                        "data": b64}})
+                            elif src["kind"] == "url":
+                                c_blocks.append({"type":"image",
+                                                "source":{"type":"url",
+                                                        "media_type":"image/jpeg",
+                                                        "url": src["url"]}})
+                        except:
+                            logger.warning(f"File not found in history, skipping image: {src.get('path')}")
+                            c_blocks.append({"type":"text", "text": "[image omitted]"})
+                            continue
                 out.append({"role": role, "content": c_blocks})
 
             else:
