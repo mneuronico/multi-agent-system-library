@@ -5102,6 +5102,9 @@ class Bot(abc.ABC):
 
         self.logger = logging.getLogger(__name__)
 
+        self._processing_users = set()
+        self._user_lock = asyncio.Lock()
+
 
     @abc.abstractmethod
     async def _parse_payload(self, payload: Any) -> Optional[Dict[str, Any]]:
@@ -5131,76 +5134,87 @@ class Bot(abc.ABC):
         parsed_message = await self._parse_payload(payload)
 
         if not parsed_message:
-            if self.verbose:
-                self.logger.debug("[Bot] Payload ignored or not parseable.")
+            self.logger.debug("[Bot] Payload ignored or not parseable.")
             return
 
         user_id = parsed_message['user_id']
-        
-        if self._is_too_old(parsed_message['timestamp'], max_age = self.max_allowed_message_delay):
-            self.logger.debug(f"[Bot] Message from {user_id} ignored for being too old.")
-            return
-            
-        if parsed_message.get('message_type') == 'text' and parsed_message.get('text', '').startswith('/'):
-            is_command = await self._handle_command(user_id, parsed_message['text'], parsed_message)
-            if is_command:
+
+        async with self._user_lock:
+            if user_id in self._processing_users:
+                self.logger.debug(f"[Bot] User {user_id} is already being processed. Ignoring new message.")
                 return
+            self._processing_users.add(user_id)
 
-        mas_blocks = await self._build_mas_blocks(parsed_message)
-        
-        if not mas_blocks:
-            if self.verbose:
-                self.logger.debug(f"[Bot] No blocks generated for message from {user_id}.")
-            return
-        
-        callback_params = {
-            "user_id": user_id,
-            "original_payload": parsed_message['original_payload'],
-            "event_loop": asyncio.get_running_loop()
-        }
+        try:
+            
+            if self._is_too_old(parsed_message['timestamp'], max_age = self.max_allowed_message_delay):
+                self.logger.debug(f"[Bot] Message from {user_id} ignored for being too old.")
+                return
+                
+            if parsed_message.get('message_type') == 'text' and parsed_message.get('text', '').startswith('/'):
+                is_command = await self._handle_command(user_id, parsed_message['text'], parsed_message)
+                if is_command:
+                    return
 
-        def _send_response_from_callback(response):
-            if response is not None:
-                blocks = self.manager._to_blocks(response, user_id=user_id)
+            mas_blocks = await self._build_mas_blocks(parsed_message)
+            
+            if not mas_blocks:
+                if self.verbose:
+                    self.logger.debug(f"[Bot] No blocks generated for message from {user_id}.")
+                return
+            
+            callback_params = {
+                "user_id": user_id,
+                "original_payload": parsed_message['original_payload'],
+                "event_loop": asyncio.get_running_loop()
+            }
 
-                loop = callback_params["event_loop"]
-                fut = asyncio.run_coroutine_threadsafe(
-                   self._send_blocks(user_id, blocks, parsed_message), loop
-                )
-                if self.ensure_delivery:
-                   try:
-                       fut.result(timeout=self.delivery_timeout)
-                   except Exception as e:
-                       self.logger.exception(f"Bot delivery failed or timed out: {e}")
+            def _send_response_from_callback(response):
+                if response is not None:
+                    blocks = self.manager._to_blocks(response, user_id=user_id)
 
-        def on_update_wrapper(messages, manager, params):
-            if self.on_update_user_callback:
-                response = self.on_update_user_callback(messages, manager, params)
+                    loop = callback_params["event_loop"]
+                    fut = asyncio.run_coroutine_threadsafe(
+                    self._send_blocks(user_id, blocks, parsed_message), loop
+                    )
+                    if self.ensure_delivery:
+                        try:
+                            fut.result(timeout=self.delivery_timeout)
+                        except Exception as e:
+                            self.logger.exception(f"Bot delivery failed or timed out: {e}")
+
+            def on_update_wrapper(messages, manager, params):
+                if self.on_update_user_callback:
+                    response = self.on_update_user_callback(messages, manager, params)
+                    _send_response_from_callback(response)
+
+            def on_complete_wrapper(messages, manager, params):
+                response = None
+                if self.on_complete_user_callback:
+                    response = self.on_complete_user_callback(messages, manager, params)
+                elif messages:
+                    response = messages[-1].get("message")
+                
                 _send_response_from_callback(response)
 
-        def on_complete_wrapper(messages, manager, params):
-            response = None
-            if self.on_complete_user_callback:
-                response = self.on_complete_user_callback(messages, manager, params)
-            elif messages:
-                response = messages[-1].get("message")
-            
-            _send_response_from_callback(response)
-
-        await asyncio.to_thread(
-            self.manager.run,
-            input=mas_blocks,
-            component_name=self.component_name,
-            user_id=user_id,
-            role="user",
-            verbose=self.verbose,
-            blocking=True,
-            on_update=on_update_wrapper,
-            on_update_params=callback_params,
-            on_complete=on_complete_wrapper,
-            on_complete_params=callback_params,
-            return_token_count=self.return_token_count
-        )
+            await asyncio.to_thread(
+                self.manager.run,
+                input=mas_blocks,
+                component_name=self.component_name,
+                user_id=user_id,
+                role="user",
+                verbose=self.verbose,
+                blocking=True,
+                on_update=on_update_wrapper,
+                on_update_params=callback_params,
+                on_complete=on_complete_wrapper,
+                on_complete_params=callback_params,
+                return_token_count=self.return_token_count
+            )
+        finally:
+            async with self._user_lock:
+                if user_id in self._processing_users:
+                    self._processing_users.remove(user_id)
 
     def _register_commands(self, custom_commands: Optional[Union[Dict, List[Dict]]]):
         self.commands["/start"] = {
