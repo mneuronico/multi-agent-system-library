@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "mneuronico" }]
 license = { text = "MIT" }
-dependencies = ["mas @ git+https://github.com/mneuronico/multi-agent-system-library.git"]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/mneuronico/multi-agent-system-library/tree/main/maws"
