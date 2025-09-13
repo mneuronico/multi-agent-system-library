@@ -1,4 +1,7 @@
 include LICENSE
 include README.md
+
 recursive-include mas/lib *.json
 recursive-include mas/lib *.py
+
+recursive-include maws/resources *

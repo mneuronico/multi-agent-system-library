@@ -385,3 +385,323 @@ def build_lambda_handler(bot_type: str):
         return runtime.handle_apigw_event(event, context)
 
     return _handler
+
+
+import sys
+import json as _json
+import tempfile as _tempfile
+import subprocess as _subprocess
+import shutil as _shutil
+import platform as _platform
+from pathlib import Path
+import textwrap
+
+try:
+    from importlib.resources import files as _res_files
+except Exception:  # pragma: no cover
+    import importlib_resources  # type: ignore
+    _res_files = importlib_resources.files  # type: ignore
+
+def _resource_path(name: str) -> Path:
+    return Path(_res_files("maws.resources") / name)
+
+def _ensure_script_in_cwd(name: str, dest_dir: Path, force: bool = False) -> Path:
+    dest = dest_dir / name
+    if not dest.exists() or force:
+        src = _resource_path(name)
+        data = src.read_bytes()
+        dest.write_bytes(data)
+        dest.chmod(0o755)
+    return dest
+
+def _run_bash(script: Path, args: list[str], cwd: Path | None = None, env: dict | None = None, quiet: bool = False) -> int:
+    bash = _shutil.which("bash")
+    if bash is None and _platform.system().lower().startswith("win"):
+        if _shutil.which("wsl"):
+            cmd = ["wsl", "bash", str(script), *args]
+        else:
+            raise RuntimeError(
+                "No encontré 'bash'. En Windows instalá WSL o Git Bash.\n"
+                "WSL: https://learn.microsoft.com/windows/wsl/install"
+            )
+    else:
+        cmd = [bash or "bash", str(script), *args]
+
+    proc = _subprocess.Popen(
+        cmd, cwd=str(cwd or Path.cwd()), env=env or os.environ.copy(),
+        stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT, text=True
+    )
+    assert proc.stdout is not None
+    last_lines: list[str] = []
+    for line in proc.stdout:
+        if not quiet:
+            sys.stdout.write(line)
+        last_lines.append(line)
+        if len(last_lines) > 50:
+            last_lines.pop(0)
+    proc.wait()
+    if proc.returncode != 0 and quiet:
+        sys.stderr.write("---- bootstrap output (últimas líneas) ----\n")
+        sys.stderr.writelines(last_lines[-30:])
+        sys.stderr.write("\n------------------------------------------\n")
+    return proc.returncode
+
+def _apply_overrides(base: dict, project: str | None, region: str | None, bot: str | None, kv: list[str] | None) -> dict:
+    out = dict(base)
+    if project: out["project"] = project
+    if region:  out["region"] = region
+    if bot:     out["bot"] = bot
+    for item in (kv or []):
+        if "=" not in item:
+            print(f"[maws] Ignoro override inválido: {item}")
+            continue
+        k, v = item.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        # coerción simple: true/false/int/float/JSON; de lo contrario string
+        vl = v.lower()
+        if v.startswith("{") or v.startswith("["):
+            try:
+                out[k] = _json.loads(v)
+                continue
+            except Exception:
+                pass
+        if vl in ("true","false"):
+            out[k] = (vl == "true")
+        else:
+            try:
+                out[k] = int(v)
+            except ValueError:
+                try:
+                    out[k] = float(v)
+                except ValueError:
+                    out[k] = v
+    return out
+
+
+def _is_windows() -> bool:
+    return _platform.system().lower().startswith("win")
+
+def _windows_guard(allow: bool, action_desc: str):
+    """
+    Bloquea en Windows (no WSL) salvo que:
+      - allow=True, o
+      - MAWS_ALLOW_WINDOWS=1, o
+      - el usuario confirme interactivo 'y'.
+    """
+    if not _is_windows():
+        return
+
+    if allow or os.environ.get("MAWS_ALLOW_WINDOWS") == "1":
+        print(f"⚠️  Ejecutando en Windows (no recomendado) para: {action_desc}. Continuo por override.")
+        return
+
+    msg = (
+        f"⚠️  Estás ejecutando en Windows. '{action_desc}' suele fallar fuera de WSL.\n"
+        "   Recomendado: usar WSL (Ubuntu) o Linux/macOS.\n"
+        "   Pasos rápidos WSL:  wsl --install -d Ubuntu   (reiniciar), luego abrir 'Ubuntu' y ejecutar allí.\n"
+        "¿Continuar de todos modos? [y/N]: "
+    )
+    if sys.stdin and sys.stdin.isatty():
+        ans = input(msg).strip().lower()
+        if ans == "y":
+            return
+
+    raise RuntimeError(
+        "Abortado para evitar fallos en Windows. Ejecutá en WSL/Linux/macOS, "
+        "o forzá con --allow-windows / allow_windows=True / MAWS_ALLOW_WINDOWS=1."
+    )
+
+
+def update(params: dict | None = None, config_path: str | None = None, project_dir: str | Path | None = None,
+           project: str | None = None, region: str | None = None, bot: str | None = None, set_kv: list[str] | None = None,
+           force_copy_script: bool = False, quiet: bool = False, allow_windows: bool = False) -> int:
+    """
+    Ejecuta el bootstrap:
+      - Si 'params' viene, se usa tal cual (escrito a params.tmp.json).
+      - Si no, se lee config_path (o 'params.json' si no se brinda),
+        y se aplican overrides (project/region/bot/--set clave=valor).
+    """
+    _windows_guard(allow_windows, "build/deploy (SAM)")
+    workdir = Path(project_dir or Path.cwd())
+    workdir.mkdir(parents=True, exist_ok=True)
+    script = _ensure_script_in_cwd("bootstrap.sh", workdir, force=force_copy_script)
+
+    if params is not None and config_path is not None:
+        raise ValueError("Pasá 'params' (dict) o 'config_path', pero no ambos.")
+
+    tmp_conf_path = None
+    if params is None:
+        conf_path = workdir / (config_path or "params.json")
+        base = {}
+        if conf_path.exists():
+            try:
+                base = _json.loads(conf_path.read_text(encoding="utf-8"))
+            except Exception:
+                print(f"[maws] No pude leer {conf_path}, uso base vacía.")
+        merged = _apply_overrides(base, project, region, bot, set_kv)
+        tmp_conf_path = workdir / "params.tmp.json"
+        tmp_conf_path.write_text(_json.dumps(merged, indent=2), encoding="utf-8")
+        conf = str(tmp_conf_path)
+    else:
+        merged = _apply_overrides(params, project, region, bot, set_kv)
+        tmp_conf_path = workdir / "params.tmp.json"
+        tmp_conf_path.write_text(_json.dumps(merged, indent=2), encoding="utf-8")
+        conf = str(tmp_conf_path)
+
+    try:
+        return _run_bash(script, ["--config", conf], cwd=workdir, quiet=quiet)
+    finally:
+        if tmp_conf_path and tmp_conf_path.exists():
+            try: tmp_conf_path.unlink()
+            except Exception: pass
+
+def pull_history(config_path: str | None = None, project_dir: str | Path | None = None,
+                 force_copy_script: bool = False, quiet: bool = False) -> int:
+    workdir = Path(project_dir or Path.cwd())
+    workdir.mkdir(parents=True, exist_ok=True)
+    script = _ensure_script_in_cwd("pull_history.sh", workdir, force=force_copy_script)
+    conf = config_path or "params.json"
+    return _run_bash(script, [conf], cwd=workdir, quiet=quiet)
+
+def _best_effort_install():
+    sys_os = _platform.system().lower()
+    def _run(cmd: list[str]):
+        try:
+            _subprocess.check_call(cmd)
+            return True
+        except Exception:
+            return False
+
+    ok = True
+    if sys_os == "darwin" and _shutil.which("brew"):
+        ok &= _run(["brew", "install", "awscli", "aws-sam-cli", "jq"])
+    elif sys_os.startswith("win"):
+        if _shutil.which("choco"):
+            ok &= _run(["choco", "install", "-y", "awscli"])
+            ok &= _run(["choco", "install", "-y", "aws-sam-cli"])
+            ok &= _run(["choco", "install", "-y", "jq"])
+        else:
+            print("⚠️  En Windows instalá WSL o Git Bash y usa los instaladores oficiales:")
+            print("    AWS CLI: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html")
+            print("    SAM CLI: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
+            ok = False
+    else:
+        # Linux / WSL
+        if _shutil.which("apt"):
+            ok &= _run(["sudo", "apt-get", "update"])
+            ok &= _run(["sudo", "apt-get", "install", "-y", "awscli", "jq"])
+        # SAM CLI vía pipx si se puede
+        if _shutil.which("pipx"):
+            ok &= _run(["pipx", "install", "aws-sam-cli"]) or _run(["pipx", "upgrade", "aws-sam-cli"])
+        else:
+            print("⚠️  Instalá SAM CLI manualmente si no quedó instalado:")
+            print("    https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
+    return ok
+
+def start(project: str | None = None, region: str | None = None, bot: str | None = None,
+          project_dir: str | Path | None = None, overwrite: bool = False,
+          install_deps: bool = False, run_config: bool = False, allow_windows: bool = False) -> Path:
+    _windows_guard(allow_windows, "scaffold + instalación de deps")
+
+    workdir = Path(project_dir or Path.cwd())
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    project = project or "my-bot"
+    region = region or "us-east-1"
+    bot = (bot or "whatsapp").lower()
+    if bot not in ("whatsapp", "telegram"):
+        raise ValueError("bot debe ser 'whatsapp' o 'telegram'.")
+
+    params_path = workdir / "params.json"
+
+    # Si NO existe, crear con plantilla mínima:
+    if not params_path.exists() or overwrite:
+        base = {
+            "project": project or "my-bot",
+            "region": region or "us-east-1",
+            "bot": (bot or "whatsapp").lower(),
+        }
+        params_path.write_text(_json.dumps(base, indent=2), encoding="utf-8")
+    else:
+        # Existe: si pasaron overrides, mergearlos sin pisar otras claves
+        if project or region or bot:
+            try:
+                data = _json.loads(params_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            if project is not None: data["project"] = project
+            if region  is not None: data["region"]  = region
+            if bot     is not None: data["bot"]     = (bot or "").lower() or data.get("bot", "whatsapp")
+            params_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+
+    config_path = workdir / "config.json"
+    fns_path = workdir / "fns.py"
+    env_path = workdir / ".env.prod"
+    gi_path = workdir / ".gitignore"
+
+    def _write(p: Path, content: str):
+        if p.exists() and not overwrite:
+            return
+        p.write_text(content, encoding="utf-8")
+
+    # Scaffold mínimo
+    _write(params_path, _json.dumps({"project": project, "region": region, "bot": bot}, indent=2))
+    _write(config_path, _json.dumps({
+        "agents": [{"id":"assistant","role":"assistant","model":"gpt-4o-mini","instructions":"Sos un asistente útil."}],
+        "automations": [{"id":"default","type":"chat","agent":"assistant"}]
+    }, indent=2))
+    _write(fns_path, "# define tus funciones aquí\n")
+    _write(env_path, "# TELEGRAM_TOKEN=xxx\n# WHATSAPP_VERIFY_TOKEN=xxx\n")
+    _write(gi_path, ".aws-sam/\n__pycache__/\nhistory/\nfiles/\n.env.prod\n.bootstrap_state.json\n")
+
+    # Copiar scripts si no están
+    _ensure_script_in_cwd("bootstrap.sh", workdir, force=False)
+    _ensure_script_in_cwd("pull_history.sh", workdir, force=False)
+
+    print("\n✅ Estructura creada en:", workdir)
+    print("  - params.json")
+    print("  - config.json")
+    print("  - fns.py")
+    print("  - .env.prod (vacío)")
+    print("  - .gitignore")
+
+    if install_deps:
+        print("\n🔧 Instalando dependencias del sistema (best-effort)…")
+        ok = _best_effort_install()
+        if not ok:
+            print("ℹ️  Seguí las instrucciones mostradas arriba para completar la instalación si quedó algo pendiente.")
+
+    # Probar credenciales
+    if _shutil.which("aws"):
+        try:
+            out = _subprocess.check_output(["aws", "sts", "get-caller-identity", "--output", "json"], text=True)
+            acct = _json.loads(out).get("Account")
+            print(f"🔐 AWS listo. Account: {acct}")
+        except Exception:
+            print("🔐 Configurá credenciales:  aws configure  (o usá AWS_PROFILE)")
+
+        if run_config:
+            print("▶️  Ejecutando 'aws configure'…")
+            try:
+                _subprocess.call(["aws", "configure"])
+            except Exception:
+                print("No pude correr 'aws configure' automáticamente. Corrélo manualmente cuando puedas.")
+
+    else:
+        print("\n⚠️  No encontré 'aws'. Instalá AWS CLI y configuralo con 'aws configure'.")
+
+        # Avisos no intrusivos si faltan herramientas clave
+    if not _shutil.which("sam"):
+        print("⚠️  No encontré 'sam' (AWS SAM CLI). Podés instalarlo o correr 'maws start --install-deps'.")
+
+    if not _shutil.which("jq"):
+        print("⚠️  No encontré 'jq'. Es útil para el bootstrap; instalalo si ves errores relacionados.")
+
+
+    print("\n👉 Próximos pasos:")
+    print("   1) Completá .env.prod con tus tokens.")
+    print("   2) (Opcional) Ajustá params.json, config.json y fns.py a gusto.")
+    print("   3) Deploy:   maws update   (o desde Python: maws.update())")
+
+    return workdir

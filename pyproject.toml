@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mas"
-version = "0.3.2"
+version = "0.3.3"
 description = "A powerful and flexible framework for creating and managing multi-agent systems."
 readme = "README.md"
 license = { text = "MIT" }
@@ -41,6 +41,13 @@ ffmpeg = ["ffmpeg-python>=0.2.0"]
 Homepage = "https://github.com/mneuronico/multi-agent-system-library"
 Issues = "https://github.com/mneuronico/multi-agent-system-library/issues"
 
+[project.scripts]
+maws = "maws.cli:main"
+
 [tool.setuptools]
 include-package-data = true
-packages = ["mas", "maws"]
+packages = ["mas", "maws", "maws.resources"]
+
+[tool.setuptools.package-data]
+maws = ["resources/*"]
+"maws.resources" = ["*"]
