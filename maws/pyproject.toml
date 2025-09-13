@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maws"
+version = "0.1.0"
+description = "Helpers MAS + AWS Lambda (Telegram/WhatsApp) via API Gateway"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []  # MAS/boto3 ya los instalás en tu proyecto
+
+[project.urls]
+Homepage = "https://github.com/<tu-usuario>/maws"
