@@ -1,0 +1,17 @@
+{
+  "project": "your-project-name",
+  "region": "us-east-1",
+  "bot": "whatsapp",
+  "verbose": true,
+  "stack_name": "your-project-name-stack",
+  "history_bucket": "your-project-name-history-bucket",
+  "deployment_bucket": "your-project-name-deployment-bucket",
+  "env_param_name": "/your-project-name/prod/env",
+  "api_path": "/webhook",
+  "sync_tokens_s3": true,
+  "tokens_s3_prefix": "secrets",
+  "special_token_files": [],
+  "token_env_map": {},
+  "whatsapp": { "verify_env_key": "WHATSAPP_VERIFY_TOKEN" },
+  "extra_requirements": []
+}
