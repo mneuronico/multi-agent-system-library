@@ -1,14 +1,19 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "maws"
 version = "0.1.0"
-description = "Helpers MAS + AWS Lambda (Telegram/WhatsApp) via API Gateway"
+description = "AWS helpers for MAS bots (Lambda/APIGW/S3/DynamoDB locks)"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []  # MAS/boto3 ya los instalás en tu proyecto
+authors = [{ name = "mneuronico" }]
+license = { text = "MIT" }
+dependencies = ["mas @ git+https://github.com/mneuronico/multi-agent-system-library.git"]
 
 [project.urls]
-Homepage = "https://github.com/<tu-usuario>/maws"
+Homepage = "https://github.com/mneuronico/multi-agent-system-library/tree/main/maws"
+
+[tool.setuptools]
+packages = ["maws"]
