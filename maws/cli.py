@@ -5,7 +5,7 @@ from .maws import update as _update, start as _start, pull_history as _pull
 def _add_common_update_args(p: argparse.ArgumentParser):
     p.add_argument("-c", "--config", dest="config_path", default=None, help="Ruta a params.json (default: params.json)")
     p.add_argument("--dir", dest="project_dir", default=None, help="Directorio del proyecto (default: cwd)")
-    p.add_argument("--force-copy-script", action="store_true", help="Sobrescribe bootstrap.sh con el de la librería")
+    p.add_argument("--force-copy-script", action="store_true", help="Copia bootstrap.sh/pull_history.sh al proyecto antes de ejecutar (por defecto usa el script embebido)")
     p.add_argument("--quiet", action="store_true", help="No streamea logs (muestra últimas líneas si falla)")
     p.add_argument("--allow-windows", action="store_true",
                    help="Permite ejecutar en Windows (no recomendado).")
@@ -28,12 +28,8 @@ def main(argv=None):
     sp_start.add_argument("--bot", choices=["whatsapp", "telegram"], default=None)
     sp_start.add_argument("--dir", dest="project_dir", default=None)
     
-    
-    # overwrite: ON por defecto, con forma de desactivarlo
-    sp_start.add_argument("--overwrite", dest="overwrite", action="store_true", default=True,
-                        help="Sobrescribir archivos scaffold si ya existen (default: ON)")
-    sp_start.add_argument("--no-overwrite", dest="overwrite", action="store_false",
-                        help="No sobrescribir archivos existentes")
+    sp_start.add_argument("--overwrite", action="store_true")
+
 
     # install-deps: ON por defecto, con forma de desactivarlo
     sp_start.add_argument("--install-deps", dest="install_deps", action="store_true", default=True,
@@ -46,9 +42,6 @@ def main(argv=None):
                         help="Ejecutar 'aws configure' al final (default: ON)")
     sp_start.add_argument("--no-run-config", dest="run_config", action="store_false",
                         help="No ejecutar 'aws configure' automáticamente")
-
-    sp_start.add_argument("--allow-windows", action="store_true",
-                        help="Permite ejecutar en Windows (no recomendado).")
     
     
     sp_start.add_argument("--allow-windows", action="store_true",

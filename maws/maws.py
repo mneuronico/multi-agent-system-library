@@ -408,11 +408,18 @@ def _resource_path(name: str) -> Path:
     return Path(_res_files("maws.resources") / name)
 
 def _ensure_script_in_cwd(name: str, dest_dir: Path, force: bool = False) -> Path:
+    """
+    Devuelve una ruta al script. Por defecto usa el **embebido** dentro del paquete.
+    Si 'force' es True o MAWS_COPY_SCRIPTS=1, **copia** el script al proyecto y devuelve esa ruta.
+    """
+    use_copy = force or os.environ.get("MAWS_COPY_SCRIPTS") == "1"
+    if not use_copy:
+        return _resource_path(name)
+
     dest = dest_dir / name
+    src = _resource_path(name)
     if not dest.exists() or force:
-        src = _resource_path(name)
-        data = src.read_bytes()
-        dest.write_bytes(data)
+        dest.write_bytes(src.read_bytes())
         dest.chmod(0o755)
     return dest
 
@@ -690,8 +697,8 @@ def start(
     _write(gi_path, ".aws-sam/\n__pycache__/\nhistory/\nfiles/\n.env.prod\n.bootstrap_state.json\n")
 
     # Copiar scripts si no están
-    _ensure_script_in_cwd("bootstrap.sh", workdir, force=False)
-    _ensure_script_in_cwd("pull_history.sh", workdir, force=False)
+    #_ensure_script_in_cwd("bootstrap.sh", workdir, force=False)
+    #_ensure_script_in_cwd("pull_history.sh", workdir, force=False)
 
     print("\n✅ Estructura creada en:", workdir)
     print("  - params.json")
