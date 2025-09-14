@@ -597,7 +597,7 @@ def pull_history(
     workdir.mkdir(parents=True, exist_ok=True)
     script = _ensure_script_in_cwd("pull_history.sh", workdir, force=force_copy_script)
     conf = config_path or "params.json"
-    return _run_bash(script, [conf], cwd=workdir, quiet=quiet)
+    return _run_bash(script, ["--config", conf], cwd=workdir, quiet=quiet)
 
 def _best_effort_install():
     """
