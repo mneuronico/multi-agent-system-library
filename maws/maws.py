@@ -5,6 +5,8 @@ import boto3, botocore
 # MAS
 from mas import AgentSystemManager, TelegramBot, WhatsappBot
 
+from typing import Optional, Union, List, Dict
+
 # -------------------------
 # Utilidades y configuración
 # -------------------------
@@ -414,7 +416,13 @@ def _ensure_script_in_cwd(name: str, dest_dir: Path, force: bool = False) -> Pat
         dest.chmod(0o755)
     return dest
 
-def _run_bash(script: Path, args: list[str], cwd: Path | None = None, env: dict | None = None, quiet: bool = False) -> int:
+def _run_bash(
+    script: Path,
+    args: List[str],
+    cwd: Optional[Union[str, Path]] = None,
+    env: Optional[Dict[str, str]] = None,
+    quiet: bool = False,
+) -> int:
     bash = _shutil.which("bash")
     if bash is None and _platform.system().lower().startswith("win"):
         if _shutil.which("wsl"):
@@ -446,7 +454,13 @@ def _run_bash(script: Path, args: list[str], cwd: Path | None = None, env: dict 
         sys.stderr.write("\n------------------------------------------\n")
     return proc.returncode
 
-def _apply_overrides(base: dict, project: str | None, region: str | None, bot: str | None, kv: list[str] | None) -> dict:
+def _apply_overrides(
+    base: Dict,
+    project: Optional[str],
+    region: Optional[str],
+    bot: Optional[str],
+    kv: Optional[List[str]],
+) -> Dict:
     out = dict(base)
     if project: out["project"] = project
     if region:  out["region"] = region
@@ -513,9 +527,18 @@ def _windows_guard(allow: bool, action_desc: str):
     )
 
 
-def update(params: dict | None = None, config_path: str | None = None, project_dir: str | Path | None = None,
-           project: str | None = None, region: str | None = None, bot: str | None = None, set_kv: list[str] | None = None,
-           force_copy_script: bool = False, quiet: bool = False, allow_windows: bool = False) -> int:
+def update(
+    params: Optional[Dict] = None,
+    config_path: Optional[str] = None,
+    project_dir: Optional[Union[str, Path]] = None,
+    project: Optional[str] = None,
+    region: Optional[str] = None,
+    bot: Optional[str] = None,
+    set_kv: Optional[List[str]] = None,
+    force_copy_script: bool = False,
+    quiet: bool = False,
+    allow_windows: bool = False,
+) -> int:
     """
     Ejecuta el bootstrap:
       - Si 'params' viene, se usa tal cual (escrito a params.tmp.json).
@@ -556,8 +579,12 @@ def update(params: dict | None = None, config_path: str | None = None, project_d
             try: tmp_conf_path.unlink()
             except Exception: pass
 
-def pull_history(config_path: str | None = None, project_dir: str | Path | None = None,
-                 force_copy_script: bool = False, quiet: bool = False) -> int:
+def pull_history(
+    config_path: Optional[str] = None,
+    project_dir: Optional[Union[str, Path]] = None,
+    force_copy_script: bool = False,
+    quiet: bool = False,
+) -> int:
     workdir = Path(project_dir or Path.cwd())
     workdir.mkdir(parents=True, exist_ok=True)
     script = _ensure_script_in_cwd("pull_history.sh", workdir, force=force_copy_script)
@@ -599,9 +626,16 @@ def _best_effort_install():
             print("    https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
     return ok
 
-def start(project: str | None = None, region: str | None = None, bot: str | None = None,
-          project_dir: str | Path | None = None, overwrite: bool = False,
-          install_deps: bool = False, run_config: bool = False, allow_windows: bool = False) -> Path:
+def start(
+    project: Optional[str] = None,
+    region: Optional[str] = None,
+    bot: Optional[str] = None,
+    project_dir: Optional[Union[str, Path]] = None,
+    overwrite: bool = False,
+    install_deps: bool = False,
+    run_config: bool = False,
+    allow_windows: bool = False,
+) -> Path:
     _windows_guard(allow_windows, "scaffold + instalación de deps")
 
     workdir = Path(project_dir or Path.cwd())
