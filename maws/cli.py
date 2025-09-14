@@ -1,6 +1,14 @@
 import argparse
 import sys
-from .maws import update as _update, start as _start, pull_history as _pull
+from .maws import (
+    update as _update,
+    start as _start,
+    pull_history as _pull,
+    setup as _setup,           # <- NUEVO
+    describe as _describe,     # <- NUEVO
+    list_projects as _list,    # <- NUEVO
+    remove_project as _remove  # <- NUEVO
+)
 
 def _add_common_update_args(p: argparse.ArgumentParser):
     p.add_argument("-c", "--config", dest="config_path", default=None, help="Ruta a params.json (default: params.json)")
@@ -56,6 +64,28 @@ def main(argv=None):
     sp_pull.add_argument("--force-copy-script", action="store_true")
     sp_pull.add_argument("--quiet", action="store_true")
 
+    sp_setup = sp.add_parser("setup", help="Guía interactiva para completar params.json")
+    sp_setup.add_argument("-c", "--config", dest="config_path", default=None)
+    sp_setup.add_argument("--dir", dest="project_dir", default=None)
+
+    sp_desc = sp.add_parser("describe", help="Describe el proyecto actual y su despliegue")
+    sp_desc.add_argument("-c", "--config", dest="config_path", default=None)
+    sp_desc.add_argument("--dir", dest="project_dir", default=None)
+    sp_desc.add_argument("--region", default=None)
+    sp_desc.add_argument("--no-aws", action="store_true", help="No consultar AWS")
+
+    sp_list = sp.add_parser("list", help="Lista stacks MAWS de la región actual")
+    sp_list.add_argument("--region", default=None)
+
+    sp_rm = sp.add_parser("remove", help="Elimina recursos AWS de un proyecto")
+    sp_rm.add_argument("--project", default=None, help="Si no se pasa, lo toma de params.json")
+    sp_rm.add_argument("--region", default=None)
+    sp_rm.add_argument("-y", "--yes", action="store_true", help="No pedir confirmación")
+    sp_rm.add_argument("--keep-deploy-bucket", action="store_true", help="Conservar deployment bucket")
+    sp_rm.add_argument("--wait", action="store_true", help="Esperar a que termine el delete-stack")
+    sp_rm.add_argument("-c", "--config", dest="config_path", default=None)
+    sp_rm.add_argument("--dir", dest="project_dir", default=None)
+
     args = ap.parse_args(argv)
 
     if args.cmd == "start":
@@ -83,6 +113,23 @@ def main(argv=None):
         code = _pull(config_path=args.config_path, project_dir=args.project_dir,
                      force_copy_script=args.force_copy_script, quiet=args.quiet)
         return code
+    
+    if args.cmd == "setup":
+        _setup(config_path=args.config_path, project_dir=args.project_dir)
+        return 0
+
+    if args.cmd == "describe":
+        return _describe(config_path=args.config_path, project_dir=args.project_dir,
+                         region=args.region, no_aws=args.no_aws)
+
+    if args.cmd == "list":
+        _list(region=args.region)
+        return 0
+
+    if args.cmd == "remove":
+        return _remove(project=args.project, region=args.region, yes=args.yes,
+                       keep_deploy_bucket=args.keep_deploy_bucket, config_path=args.config_path,
+                       project_dir=args.project_dir, wait=args.wait)
 
     ap.print_help()
     return 2

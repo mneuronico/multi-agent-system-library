@@ -6,6 +6,7 @@ import boto3, botocore
 from mas import AgentSystemManager, TelegramBot, WhatsappBot
 
 from typing import Optional, Union, List, Dict
+import datetime as _dt
 
 # -------------------------
 # Utilidades y configuración
@@ -930,3 +931,346 @@ def start(
     print("   3) Deploy:   maws update   (o desde Python: maws.update())")
 
     return workdir
+
+
+# --- NUEVO: helpers comunes para prompts/AWS/params ---
+import sys
+from typing import Optional, Union, List, Dict
+from pathlib import Path
+import datetime as _dt
+
+def _is_tty() -> bool:
+    return bool(getattr(sys, "stdin", None) and sys.stdin.isatty())
+
+def _ask(prompt: str, default: Optional[str] = None) -> str:
+    if not _is_tty():
+        return default or ""
+    sfx = f" [{default}]" if default else ""
+    val = input(f"{prompt}{sfx}: ").strip()
+    return val or (default or "")
+
+def _ask_bool(prompt: str, default: bool = True) -> bool:
+    if not _is_tty():
+        return default
+    sfx = "Y/n" if default else "y/N"
+    val = input(f"{prompt} ({sfx}): ").strip().lower()
+    if not val:
+        return default
+    return val in ("y", "yes", "1", "true", "si", "sí")
+
+def _effective_region(explicit: Optional[str], params: Dict) -> str:
+    return (
+        explicit
+        or params.get("region")
+        or os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    )
+
+def _load_params(conf_path: Path) -> Dict:
+    try:
+        if conf_path.exists():
+            return json.loads(conf_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_params(conf_path: Path, data: Dict):
+    conf_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def _boto(region: Optional[str] = None):
+    """Clientes boto3 con región forzada si se pasa."""
+    kw = {"region_name": region} if region else {}
+    return (
+        boto3.client("cloudformation", **kw),
+        boto3.client("s3", **kw),
+        boto3.client("lambda", **kw),  # por si se quiere usar a futuro
+    )
+
+# --- NUEVO: maws setup ---
+def setup(
+    config_path: Optional[Union[str, Path]] = None,
+    project_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    """
+    Guía interactiva para completar/actualizar params.json con defaults seguros.
+    No toca otros archivos.
+    """
+    workdir = Path(project_dir or Path.cwd())
+    conf = workdir / (config_path or "params.json")
+    data = _load_params(conf)
+
+    # defaults actuales (si existen) o razonables
+    d_project = data.get("project", "my-bot")
+    d_region  = data.get("region", "us-east-1")
+    d_bot     = (data.get("bot") or "telegram").lower()
+    if d_bot not in ("telegram", "whatsapp"):
+        d_bot = "telegram"
+
+    # prompts
+    project = _ask("Nombre del proyecto", d_project) or d_project
+    region  = _ask("Región AWS", d_region) or d_region
+    bot     = _ask("Tipo de bot (telegram/whatsapp)", d_bot) or d_bot
+    bot     = bot.lower() if bot in ("telegram", "whatsapp") else d_bot
+
+    stack_name = _ask("CloudFormation stack_name", data.get("stack_name") or f"{project}-stack")
+    history_bucket = _ask("S3 history_bucket", data.get("history_bucket") or f"{project}-history-bucket")
+    deploy_bucket  = _ask("S3 deployment_bucket", data.get("deployment_bucket") or f"{project}-deployment-bucket")
+    env_param_name = _ask("SSM env_param_name", data.get("env_param_name") or f"/{project}/prod/env")
+    api_path       = _ask("API path", data.get("api_path") or "/webhook")
+
+    sync_tokens_s3 = _ask_bool("Sincronizar tokens desde S3 (SYNC_TOKENS_S3)", bool(data.get("sync_tokens_s3", True)))
+    tokens_prefix  = _ask("Prefijo S3 para tokens (TOKENS_S3_PREFIX)",
+                          data.get("tokens_s3_prefix") or "secrets")
+    verbose        = _ask_bool("Verbose en Lambda (VERBOSE)", bool(data.get("verbose", False)))
+
+    # actualizar estructura mínima
+    data.update({
+        "project": project,
+        "region": region,
+        "bot": bot,
+        "stack_name": stack_name,
+        "history_bucket": history_bucket,
+        "deployment_bucket": deploy_bucket,
+        "env_param_name": env_param_name,
+        "api_path": api_path,
+        "sync_tokens_s3": bool(sync_tokens_s3),
+        "tokens_s3_prefix": tokens_prefix,
+        "verbose": bool(verbose),
+    })
+
+    _save_params(conf, data)
+    print(f"✅ Params escritos en {conf}")
+    return conf
+
+# --- NUEVO: maws describe ---
+def describe(
+    config_path: Optional[Union[str, Path]] = None,
+    project_dir: Optional[Union[str, Path]] = None,
+    region: Optional[str] = None,
+    no_aws: bool = False,
+) -> int:
+    """
+    Describe el proyecto actual:
+      - Muestra archivos locales
+      - Lee params.json
+      - Si hay credenciales, consulta CloudFormation para outputs (ApiUrl)
+    """
+    workdir = Path(project_dir or Path.cwd())
+    conf = workdir / (config_path or "params.json")
+    data = _load_params(conf)
+
+    print(f"\n📂 Proyecto en: {workdir}")
+    print(f"   - params.json: {'OK' if conf.exists() else 'NO'}")
+    print(f"   - config.json: {'OK' if (workdir/'config.json').exists() else 'NO'}")
+    print(f"   - fns.py     : {'OK' if (workdir/'fns.py').exists() else 'NO'}")
+    print(f"   - .env.prod  : {'OK' if (workdir/'.env.prod').exists() else 'NO'}")
+
+    if not data:
+        print("\n⚠️  No encontré params.json legible. Ejecutá 'maws setup' o 'maws start'.")
+        return 1
+
+    project = data.get("project", "my-bot")
+    reg = _effective_region(region, data)
+    stack = data.get("stack_name") or f"{project}-stack"
+    history_bucket = data.get("history_bucket") or f"{project}-history-bucket"
+    deploy_bucket  = data.get("deployment_bucket") or f"{project}-deployment-bucket"
+
+    print("\n🧾 params.json")
+    for k in ("project","region","bot","stack_name","history_bucket","deployment_bucket","env_param_name","api_path","sync_tokens_s3","tokens_s3_prefix","verbose"):
+        if k in data:
+            print(f"   - {k}: {data[k]}")
+
+    if no_aws:
+        return 0
+
+    # AWS info (best-effort)
+    try:
+        cf, s3, _ = _boto(reg)
+        ds = cf.describe_stacks(StackName=stack)
+        st = ds["Stacks"][0]
+        status = st.get("StackStatus")
+        updated = st.get("LastUpdatedTime") or st.get("CreationTime")
+        updated_s = updated.strftime("%Y-%m-%d %H:%M:%S") if isinstance(updated, _dt.datetime) else str(updated)
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in st.get("Outputs", [])}
+        api_url = outputs.get("ApiUrl")
+
+        print(f"\n☁️  CloudFormation [{reg}]")
+        print(f"   - Stack: {stack}  ({status}, {updated_s})")
+        if api_url:
+            print(f"   - ApiUrl: {api_url}")
+
+        # existencia de buckets
+        def _bucket_exists(name: str) -> bool:
+            try:
+                s3.head_bucket(Bucket=name)
+                return True
+            except Exception:
+                return False
+
+        print("\n🪣 Buckets")
+        print(f"   - history_bucket    : {history_bucket}  ({'existe' if _bucket_exists(history_bucket) else 'no existe'})")
+        print(f"   - deployment_bucket : {deploy_bucket}  ({'existe' if _bucket_exists(deploy_bucket) else 'no existe'})")
+    except Exception as e:
+        print(f"\nℹ️  AWS no disponible o sin permisos: {e}")
+
+    return 0
+
+# --- NUEVO: maws list (stacks) ---
+def list_projects(region: Optional[str] = None) -> List[Dict]:
+    """
+    Lista stacks de CloudFormation en la región (filtra los que exponen Output 'ApiUrl').
+    Devuelve lista de dicts {stack, status, updated, api_url, region}.
+    También imprime una tabla simple.
+    """
+    reg = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    cf, *_ = _boto(reg)
+
+    wanted = [
+        "CREATE_COMPLETE","UPDATE_COMPLETE","UPDATE_ROLLBACK_COMPLETE",
+        "ROLLBACK_COMPLETE","IMPORT_COMPLETE"
+    ]
+    out_rows: List[Dict] = []
+
+    try:
+        paginator = cf.get_paginator("list_stacks")
+        for page in paginator.paginate(StackStatusFilter=wanted):
+            for s in page.get("StackSummaries", []):
+                name = s.get("StackName")
+                try:
+                    ds = cf.describe_stacks(StackName=name)
+                    st = ds["Stacks"][0]
+                    outputs = {o["OutputKey"]: o["OutputValue"] for o in st.get("Outputs", [])}
+                    api_url = outputs.get("ApiUrl")
+                    if not api_url:
+                        continue  # probablemente no es un stack MAWS
+                    updated = st.get("LastUpdatedTime") or st.get("CreationTime")
+                    out_rows.append({
+                        "stack": name,
+                        "status": st.get("StackStatus"),
+                        "updated": updated.isoformat() if isinstance(updated, _dt.datetime) else str(updated),
+                        "api_url": api_url,
+                        "region": reg,
+                    })
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"ℹ️  No pude listar stacks en {reg}: {e}")
+        return []
+
+    # print simple table
+    if out_rows:
+        print("\nStacks MAWS en", reg)
+        print("".ljust(80, "-"))
+        print(f"{'STACK':35}  {'STATUS':22}  {'UPDATED':19}  {'API URL'}")
+        print("".ljust(80, "-"))
+        for r in out_rows:
+            print(f"{r['stack'][:35]:35}  {r['status'][:22]:22}  {r['updated'][:19]:19}  {r['api_url']}")
+        print("".ljust(80, "-"))
+    else:
+        print(f"\n(no hay stacks MAWS detectados en {reg})")
+
+    return out_rows
+
+# --- NUEVO: remove_project ---
+def _empty_bucket(s3, bucket: str):
+    """Borra objetos y versiones (si hay versioning) para permitir eliminar bucket/stack."""
+    try:
+        # versiones y delete-markers
+        paginator = s3.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=bucket):
+            to_del = []
+            for v in page.get("Versions", []):
+                to_del.append({"Key": v["Key"], "VersionId": v["VersionId"]})
+            for m in page.get("DeleteMarkers", []):
+                to_del.append({"Key": m["Key"], "VersionId": m["VersionId"]})
+            if to_del:
+                for chunk in [to_del[i:i+1000] for i in range(0, len(to_del), 1000)]:
+                    s3.delete_objects(Bucket=bucket, Delete={"Objects": chunk})
+        # objetos actuales (por si no hay versioning)
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket):
+            keys = [{"Key": it["Key"]} for it in page.get("Contents", [])]
+            if keys:
+                for chunk in [keys[i:i+1000] for i in range(0, len(keys), 1000)]:
+                    s3.delete_objects(Bucket=bucket, Delete={"Objects": chunk})
+    except s3.exceptions.NoSuchBucket:
+        return
+    except Exception as e:
+        print(f"⚠️  No pude vaciar bucket {bucket}: {e}")
+
+def remove_project(
+    project: Optional[str] = None,
+    region: Optional[str] = None,
+    yes: bool = False,
+    keep_deploy_bucket: bool = False,
+    config_path: Optional[Union[str, Path]] = None,
+    project_dir: Optional[Union[str, Path]] = None,
+    wait: bool = False,
+) -> int:
+    """
+    Borra recursos AWS del proyecto:
+      - Vacía bucket de historial
+      - Elimina stack de CloudFormation (API/Lambda/DDB, etc.)
+      - Opcional: elimina deployment bucket (si no keep_deploy_bucket)
+    Toma nombres desde params.json si no se pasan explícitos.
+    """
+    workdir = Path(project_dir or Path.cwd())
+    conf = workdir / (config_path or "params.json")
+    data = _load_params(conf)
+
+    proj = project or data.get("project")
+    if not proj:
+        print("❌ No pude determinar 'project'. Pasalo con --project o setealo en params.json.")
+        return 2
+
+    reg = _effective_region(region, data)
+    stack = data.get("stack_name") or f"{proj}-stack"
+    history_bucket = data.get("history_bucket") or f"{proj}-history-bucket"
+    deploy_bucket  = data.get("deployment_bucket") or f"{proj}-deployment-bucket"
+
+    print("\n🚨 Plan de eliminación")
+    print(f"   Región:           {reg}")
+    print(f"   Stack a borrar:   {stack}")
+    print(f"   Vaciar bucket:    {history_bucket}")
+    if not keep_deploy_bucket:
+        print(f"   Borrar bucket:    {deploy_bucket} (deployment)")
+    else:
+        print(f"   Conservar bucket: {deploy_bucket} (deployment)")
+
+    if not yes and not _ask_bool("¿Continuar?", False):
+        print("Abortado.")
+        return 1
+
+    cf, s3, _ = _boto(reg)
+
+    # Vaciar history bucket (para que CFN pueda borrarlo)
+    print(f"🧹 Vaciando s3://{history_bucket} …")
+    _empty_bucket(s3, history_bucket)
+
+    # Eliminar stack
+    print(f"🗑️  Eliminando stack {stack} …")
+    try:
+        cf.delete_stack(StackName=stack)
+        if wait:
+            waiter = cf.get_waiter("stack_delete_complete")
+            print("⏳ Esperando a que termine la eliminación del stack…")
+            waiter.wait(StackName=stack)
+            print("✅ Stack eliminado.")
+        else:
+            print("➡️  Eliminación iniciada (asíncrona).")
+    except Exception as e:
+        print(f"⚠️  Error al borrar stack: {e}")
+
+    # Deployment bucket (fuera del stack) – borrar si se pidió
+    if not keep_deploy_bucket:
+        print(f"🧹 Vaciando s3://{deploy_bucket} …")
+        _empty_bucket(s3, deploy_bucket)
+        try:
+            s3.delete_bucket(Bucket=deploy_bucket)
+            print("✅ Deployment bucket eliminado.")
+        except Exception as e:
+            print(f"⚠️  No pude eliminar deployment bucket: {e}")
+
+    print("🧾 Listo. Algunos recursos pueden tardar unos minutos en desaparecer por completo.")
+    return 0
