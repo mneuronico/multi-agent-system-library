@@ -655,7 +655,6 @@ def _best_effort_install():
             print("❌ No pude instalar AWS CLI. Instalá manualmente: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html")
             ok = False
 
-    # SAM CLI (instalador oficial)
     if not _shutil.which("sam"):
         tmp = tempfile.mkdtemp()
         arch = _platform.machine().lower()
@@ -665,8 +664,17 @@ def _best_effort_install():
             sam_url = "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip"
         ok &= _run(["curl", "-sSL", sam_url, "-o", f"{tmp}/aws-sam-cli.zip"])
         ok &= _run(["unzip", "-q", f"{tmp}/aws-sam-cli.zip", "-d", f"{tmp}/sam-installation"])
-        ok &= _run(["sudo", f"{tmp}/sam-installation/install"])
-        if _shutil.which("sam"):
+        # ← clave: usar --update para instalaciones preexistentes
+        ok &= _run(["sudo", f"{tmp}/sam-installation/install", "--update"])
+
+        # Si el instalador detectó una instalación previa pero no dejó el symlink:
+        sam_bin = _shutil.which("sam")
+        if not sam_bin and os.path.exists("/usr/local/aws-sam-cli/current/bin/sam"):
+            _run(["sudo", "ln", "-sf", "/usr/local/aws-sam-cli/current/bin/sam", "/usr/local/bin/sam"])
+            _subprocess.call(["hash", "-r"])  # no falla si no es bash
+            sam_bin = _shutil.which("sam")
+
+        if sam_bin:
             try:
                 out = _subprocess.check_output(["sam", "--version"], text=True)
                 print(f"✅ SAM CLI listo: {out.strip()}")
@@ -675,6 +683,7 @@ def _best_effort_install():
         else:
             print("❌ No pude instalar SAM CLI. Instalá manualmente: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
             ok = False
+
 
     return ok
 
