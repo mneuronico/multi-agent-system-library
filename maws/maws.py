@@ -599,8 +599,20 @@ def pull_history(
     return _run_bash(script, [conf], cwd=workdir, quiet=quiet)
 
 def _best_effort_install():
+    """
+    Linux/WSL only:
+      - APT para curl, unzip, jq
+      - AWS CLI v2 via instalador oficial (zip)
+      - SAM CLI via instalador oficial (zip)
+    Devuelve True si todo quedó OK o ya estaba instalado.
+    """
+    import tempfile
     sys_os = _platform.system().lower()
-    def _run(cmd: list[str]):
+    if sys_os != "linux":
+        print("⚠️  Instalación asistida soportada solo en Linux/WSL. En otros SO, instalá manualmente.")
+        return False
+
+    def _run(cmd):
         try:
             _subprocess.check_call(cmd)
             return True
@@ -608,29 +620,62 @@ def _best_effort_install():
             return False
 
     ok = True
-    if sys_os == "darwin" and _shutil.which("brew"):
-        ok &= _run(["brew", "install", "awscli", "aws-sam-cli", "jq"])
-    elif sys_os.startswith("win"):
-        if _shutil.which("choco"):
-            ok &= _run(["choco", "install", "-y", "awscli"])
-            ok &= _run(["choco", "install", "-y", "aws-sam-cli"])
-            ok &= _run(["choco", "install", "-y", "jq"])
-        else:
-            print("⚠️  En Windows instalá WSL o Git Bash y usa los instaladores oficiales:")
-            print("    AWS CLI: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html")
-            print("    SAM CLI: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
-            ok = False
+
+    # Herramientas base
+    if _shutil.which("apt"):
+        _run(["sudo", "apt-get", "update"])
+        if not _shutil.which("curl"):
+            ok &= _run(["sudo", "apt-get", "install", "-y", "curl"])
+        if not _shutil.which("unzip"):
+            ok &= _run(["sudo", "apt-get", "install", "-y", "unzip"])
+        if not _shutil.which("jq"):
+            ok &= _run(["sudo", "apt-get", "install", "-y", "jq"])
     else:
-        # Linux / WSL
-        if _shutil.which("apt"):
-            ok &= _run(["sudo", "apt-get", "update"])
-            ok &= _run(["sudo", "apt-get", "install", "-y", "awscli", "jq"])
-        # SAM CLI vía pipx si se puede
-        if _shutil.which("pipx"):
-            ok &= _run(["pipx", "install", "aws-sam-cli"]) or _run(["pipx", "upgrade", "aws-sam-cli"])
+        print("⚠️  No encontré APT. Instalá curl/unzip/jq manualmente.")
+        ok = False
+
+    # AWS CLI v2 (instalador oficial)
+    if not _shutil.which("aws"):
+        tmp = tempfile.mkdtemp()
+        arch = _platform.machine().lower()
+        if "aarch64" in arch or "arm64" in arch:
+            aws_url = "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"
         else:
-            print("⚠️  Instalá SAM CLI manualmente si no quedó instalado:")
-            print("    https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
+            aws_url = "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+        ok &= _run(["curl", "-sSL", aws_url, "-o", f"{tmp}/awscliv2.zip"])
+        ok &= _run(["unzip", "-q", f"{tmp}/awscliv2.zip", "-d", tmp])
+        ok &= _run(["sudo", f"{tmp}/aws/install", "--update"])
+        if _shutil.which("aws"):
+            try:
+                out = _subprocess.check_output(["aws", "--version"], text=True)
+                print(f"✅ AWS CLI listo: {out.strip()}")
+            except Exception:
+                pass
+        else:
+            print("❌ No pude instalar AWS CLI. Instalá manualmente: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html")
+            ok = False
+
+    # SAM CLI (instalador oficial)
+    if not _shutil.which("sam"):
+        tmp = tempfile.mkdtemp()
+        arch = _platform.machine().lower()
+        if "aarch64" in arch or "arm64" in arch:
+            sam_url = "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-aarch64.zip"
+        else:
+            sam_url = "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip"
+        ok &= _run(["curl", "-sSL", sam_url, "-o", f"{tmp}/aws-sam-cli.zip"])
+        ok &= _run(["unzip", "-q", f"{tmp}/aws-sam-cli.zip", "-d", f"{tmp}/sam-installation"])
+        ok &= _run(["sudo", f"{tmp}/sam-installation/install"])
+        if _shutil.which("sam"):
+            try:
+                out = _subprocess.check_output(["sam", "--version"], text=True)
+                print(f"✅ SAM CLI listo: {out.strip()}")
+            except Exception:
+                pass
+        else:
+            print("❌ No pude instalar SAM CLI. Instalá manualmente: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
+            ok = False
+
     return ok
 
 def start(
