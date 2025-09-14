@@ -27,9 +27,30 @@ def main(argv=None):
     sp_start.add_argument("--region", default=None)
     sp_start.add_argument("--bot", choices=["whatsapp", "telegram"], default=None)
     sp_start.add_argument("--dir", dest="project_dir", default=None)
-    sp_start.add_argument("--overwrite", action="store_true")
-    sp_start.add_argument("--install-deps", action="store_true", help="Intentar instalar awscli/sam/jq automáticamente")
-    sp_start.add_argument("--run-config", action="store_true", help="Ejecutar 'aws configure' al final")
+    
+    
+    # overwrite: ON por defecto, con forma de desactivarlo
+    sp_start.add_argument("--overwrite", dest="overwrite", action="store_true", default=True,
+                        help="Sobrescribir archivos scaffold si ya existen (default: ON)")
+    sp_start.add_argument("--no-overwrite", dest="overwrite", action="store_false",
+                        help="No sobrescribir archivos existentes")
+
+    # install-deps: ON por defecto, con forma de desactivarlo
+    sp_start.add_argument("--install-deps", dest="install_deps", action="store_true", default=True,
+                        help="Intentar instalar awscli/sam/jq automáticamente (default: ON)")
+    sp_start.add_argument("--no-install-deps", dest="install_deps", action="store_false",
+                        help="No instalar dependencias del sistema")
+
+    # run-config: ON por defecto, con forma de desactivarlo
+    sp_start.add_argument("--run-config", dest="run_config", action="store_true", default=True,
+                        help="Ejecutar 'aws configure' al final (default: ON)")
+    sp_start.add_argument("--no-run-config", dest="run_config", action="store_false",
+                        help="No ejecutar 'aws configure' automáticamente")
+
+    sp_start.add_argument("--allow-windows", action="store_true",
+                        help="Permite ejecutar en Windows (no recomendado).")
+    
+    
     sp_start.add_argument("--allow-windows", action="store_true",
                       help="Permite ejecutar en Windows (no recomendado).")
 
