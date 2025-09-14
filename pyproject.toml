@@ -31,7 +31,8 @@ dependencies = [
     "python-dotenv",
     "mutagen>=1.46",
     'backports.zoneinfo; python_version < "3.9"',
-    'tzdata; python_version < "3.9"'
+    'tzdata; python_version < "3.9"',
+    "boto3"
 ]
 
 [project.optional-dependencies]
