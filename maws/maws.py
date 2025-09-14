@@ -702,9 +702,34 @@ def start(
     workdir = Path(project_dir or Path.cwd())
     workdir.mkdir(parents=True, exist_ok=True)
 
-    project = project or "my-bot"
-    region = region or "us-east-1"
-    bot = (bot or "whatsapp").lower()
+    # Helpers de prompt (seguros si no hay TTY)
+    def _is_tty():
+        return bool(getattr(sys, "stdin", None) and sys.stdin.isatty())
+
+    def _ask(prompt, default=None):
+        if not _is_tty():
+            return default or ""
+        sfx = f" [{default}]" if default else ""
+        resp = input(f"{prompt}{sfx}: ").strip()
+        return resp or (default or "")
+
+    def _ask_choice(prompt, choices, default):
+        choices_str = "/".join(choices)
+        val = _ask(f"{prompt} ({choices_str})", default).lower()
+        if val not in choices:
+            print(f"[maws] Opción inválida '{val}', uso '{default}'.")
+            val = default
+        return val
+
+    # Preguntar solo si no vino por argumento; defaults amigables
+    if project is None:
+        project = _ask("Nombre del proyecto", "my-bot")
+    if region is None:
+        region = _ask("Región AWS", "us-east-1")
+    if bot is None:
+        bot = _ask_choice("Tipo de bot", ["telegram", "whatsapp"], "telegram")
+
+    bot = bot.lower()
     if bot not in ("whatsapp", "telegram"):
         raise ValueError("bot debe ser 'whatsapp' o 'telegram'.")
 
@@ -742,13 +767,35 @@ def start(
 
     # Scaffold mínimo
 
-    # 1) NO re-escribas params.json otra vez aquí (ya se creó/mergeó arriba)
-    # _write(params_path, _json.dumps({"project": project, "region": region, "bot": bot}, indent=2))
+    def _is_tty() -> bool:
+        return bool(getattr(sys, "stdin", None) and sys.stdin.isatty())
 
-    # 2) config.json con el esquema nuevo
+    def _ask(prompt: str, default: Optional[str] = None) -> str:
+        if not _is_tty():
+            return default or ""
+        sfx = f" [{default}]" if default else ""
+        resp = input(f"{prompt}{sfx}: ").strip()
+        return resp or (default or "")
+
+    # 2) Elegir provider/model (interactivo si es TTY), defaults: google / gemini-2.5-flash
+    _default_models_map = {
+        "google": "gemini-2.5-flash",
+        "openai": "gpt-4o-mini",
+        "groq":   "llama-3.1-70b-versatile",
+    }
+    provider = _ask("Proveedor por defecto (google/openai/groq)", "google").lower()
+    if provider not in _default_models_map:
+        print(f"[maws] Provider desconocido '{provider}', uso 'google'.")
+        provider = "google"
+    model = _ask("Modelo por defecto", _default_models_map[provider]) or _default_models_map[provider]
+
+    # 3) config.json con default_models
     config_template = {
         "general_parameters": {
-            "general_system_description": "A simple query system."
+            "general_system_description": "A simple query system.",
+            "default_models": [
+                {"provider": provider, "model": model}
+            ]
         },
         "components": [
             {
@@ -763,26 +810,70 @@ def start(
     }
     _write(config_path, _json.dumps(config_template, indent=2))
 
-    # 3) fns.py vacío (si no existe o overwrite=True)
+    # 4) fns.py vacío (si no existe o overwrite=True)
     _write(fns_path, "# define tus funciones aquí\n")
 
-    # 4) .env.prod según bot + 3 API keys siempre
-    env_lines = [
-        "# GOOGLE_API_KEY=",
-        "# OPENAI_API_KEY=",
-        "# GROQ_API_KEY=",
-    ]
+    entered = {
+        "google": "",
+        "openai": "",
+        "groq": "",
+        "telegram_token": "",
+        "whatsapp_token": "",
+        "whatsapp_phone_id": "",
+        "whatsapp_verify": "",
+    }
+
+    # Pedir key del provider elegido (opcional)
+    provider_key_env = {
+        "google": "GOOGLE_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "groq":   "GROQ_API_KEY",
+    }[provider]
+    maybe_key = _ask(f"Pegar {provider_key_env} (Enter para saltar)")
+    if maybe_key:
+        entered[provider] = maybe_key
+
+    # Pedir tokens del bot
+    if bot == "telegram":
+        tk = _ask("Pegar TELEGRAM_TOKEN (Enter para saltar)")
+        if tk:
+            entered["telegram_token"] = tk
+    else:
+        wtk = _ask("Pegar WHATSAPP_TOKEN (Enter para saltar)")
+        if wtk:
+            entered["whatsapp_token"] = wtk
+        wid = _ask("Pegar WHATSAPP_PHONE_NUMBER_ID (Enter para saltar)")
+        if wid:
+            entered["whatsapp_phone_id"] = wid
+        wv  = _ask("Pegar WHATSAPP_VERIFY_TOKEN (Enter para saltar)")
+        if wv:
+            entered["whatsapp_verify"] = wv
+
+    # Armar líneas del .env.prod
+    def _line(envname: str, value: str, commented_if_empty: bool = True) -> str:
+        if value:
+            return f"{envname}={value}"
+        return f"# {envname}=" if commented_if_empty else f"{envname}="
+
+    env_lines: list[str] = []
+    # Siempre presentes (comentadas si vacías). La seleccionada va sin '#'
+    env_lines.append(_line("GOOGLE_API_KEY", entered["google"]))
+    env_lines.append(_line("OPENAI_API_KEY", entered["openai"]))
+    env_lines.append(_line("GROQ_API_KEY",   entered["groq"]))
 
     if bot == "telegram":
-        env_lines += [
-            "# TELEGRAM_TOKEN="
-        ]
-    else:  # whatsapp
-        env_lines += [
-            "# WHATSAPP_TOKEN=",
-            "# WHATSAPP_PHONE_NUMBER_ID=",
-            "# WHATSAPP_VERIFY_TOKEN="
-        ]
+        env_lines.append(_line("TELEGRAM_TOKEN", entered["telegram_token"]))
+        # Si querés mantener este genérico, dejalo comentado:
+        env_lines.append("# WEBHOOK_VERIFY_TOKEN=")
+        env_lines.append("# WHATSAPP_TOKEN=")
+        env_lines.append("# WHATSAPP_PHONE_NUMBER_ID=")
+        env_lines.append("# WHATSAPP_VERIFY_TOKEN=")
+    else:
+        env_lines.append(_line("WHATSAPP_TOKEN",           entered["whatsapp_token"]))
+        env_lines.append(_line("WHATSAPP_PHONE_NUMBER_ID", entered["whatsapp_phone_id"]))
+        env_lines.append(_line("WHATSAPP_VERIFY_TOKEN",    entered["whatsapp_verify"]))
+        env_lines.append("# TELEGRAM_TOKEN=")
+        env_lines.append("# WEBHOOK_VERIFY_TOKEN=")
 
     _write(env_path, "\n".join(env_lines) + "\n")
 
