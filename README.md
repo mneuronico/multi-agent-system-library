@@ -2144,3 +2144,300 @@ In this case, the final responder is looking at the last 20 messages from the us
 ## Currently Under Development
 
 This is an alpha version of the `mas` library. It has not yet been tested extensively and likely contains many bugs and undesired behavior. Its use on production is **NOT RECOMMENDED**.
+
+
+# MAWS: 1-Command AWS Deploys for Telegram & WhatsApp Bots (Beta)
+
+`maws` is a tiny companion to the `mas` library that bootstraps a **serverless bot backend** on AWS (API Gateway + Lambda + S3, with optional DynamoDB locks and SSM Parameter Store). It ships with:
+
+* A **runtime** (`MawsRuntime`) that turns your MAS config into a webhook-driven bot (Telegram or WhatsApp).
+* A **CLI** (`maws`) that scaffolds a project, wires AWS resources, and deploys with AWS SAM.
+* Python helpers mirroring the CLI, if you prefer scripting over shell.
+
+> Works best on Linux/macOS or Windows Subsystem for Linux (WSL). Native Windows is supported with a guard/override (see flags below).
+
+---
+
+### Fastest Possible Start (3 steps)
+
+```bash
+# 0) Install MAS (includes MAWS)
+pip install --upgrade git+https://github.com/mneuronico/multi-agent-system-library
+
+# 1) Scaffold a bot project (interactive; chooses provider/model & bot type)
+maws start
+
+# 2) Deploy to AWS (builds & uploads a complete stack)
+maws update
+```
+
+After `maws update` finishes, if you chose to create a WhatsApp bot, in your Meta App, set the webhook URL to <ApiUrl> and the verify token to WHATSAPP_VERIFY_TOKEN (follow instructions in console).
+
+That’s it — send a message to your bot. Conversation history is automatically persisted to S3.
+
+---
+
+### What the scaffold creates
+
+Inside your chosen folder:
+
+```
+params.json     # AWS deploy settings (project, region, stack & buckets, etc.)
+config.json     # Minimal MAS config with a simple agent (edit as you like)
+fns.py          # Where your tools/processes live
+.env.prod       # Provider keys & bot tokens (stored in AWS SSM at deploy time)
+.samignore      # SAM build ignores
+```
+
+On AWS, the stack includes:
+
+* **API Gateway** (public HTTPS endpoint) → **Lambda** (your bot runtime)
+* **S3** buckets: one for **history** (per-user SQLite DB) and one for **deployment artifacts**
+* **SSM Parameter Store (SecureString)** to hold your `.env` securely
+* **(Optional)** DynamoDB table for **user locks** (prevents concurrent processing by multiple invocations)
+
+---
+
+## How MAWS works at runtime
+
+* Loads secrets from **SSM** (`ENV_PARAMETER_NAME`) into `os.environ` on cold start.
+* Optionally **syncs “token files”** (API tokens, etc.) from **S3** into `/tmp` and exposes their paths via env vars.
+* On each webhook:
+
+  1. Extracts a **chat\_id** (Telegram/WhatsApp).
+  2. **(Optional)** acquires a **DynamoDB distributed lock** for that user.
+  3. Downloads `history/<chat_id>.sqlite` from S3 and **imports** it into the MAS manager.
+  4. Feeds the update to **TelegramBot**/**WhatsappBot** (webhook mode).
+  5. **Exports** the updated SQLite back to S3 and releases the lock.
+
+You don’t have to wire any of this — the CLI’s deploy scripts generate all infra and environment linkage.
+
+---
+
+## Prerequisites
+
+* AWS account with credentials (maws start will install aws, sam and run aws config if necessary)
+* For Telegram: `TELEGRAM_TOKEN`
+  For WhatsApp Cloud API: `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN`
+
+---
+
+## CLI Reference
+
+The CLI ships as `maws`. All commands can also be called from Python (see next section).
+
+### 1) `maws start`
+
+Scaffolds a new project (interactive by default).
+
+```bash
+maws start \
+  [--project <name>] \
+  [--region <aws-region>] \
+  [--bot telegram|whatsapp] \
+  [--dir <path>] \
+  [--overwrite] \
+  [--install-deps|--no-install-deps] \
+  [--run-config|--no-run-config] \
+  [--allow-windows]
+```
+
+* Creates `params.json`, `config.json`, `fns.py`, `.env.prod`, `.samignore`.
+* Asks for default **LLM provider/model** and **bot type**.
+* Optionally installs system deps (AWS CLI, SAM) and runs `aws configure`.
+
+**Tip (non-interactive):**
+
+```bash
+maws start --project my-bot --region us-east-1 --bot telegram --no-install-deps --no-run-config
+```
+
+---
+
+### 2) `maws update`
+
+Builds & deploys the serverless stack via AWS SAM.
+
+```bash
+maws update \
+  [-c|--config params.json] \
+  [--dir <path>] \
+  [--force-copy-script] \
+  [--quiet] \
+  [--allow-windows] \
+  [--project <name>] [--region <region>] [--bot telegram|whatsapp] \
+  [--set key=value ...]        # override values in params.json on the fly
+```
+
+* Uses `params.json` (and overrides) to deploy.
+* Persists `.env.prod` to **SSM** as a secure parameter automatically.
+* Prints the **ApiUrl** output on success (use it to set your WhatsApp webhook if necessary).
+
+---
+
+### 3) `maws pull-history`
+
+Downloads your per-user SQLite histories from the **history bucket** into `./history`.
+
+```bash
+maws pull-history [-c|--config params.json] [--dir <path>] [--force-copy-script] [--quiet]
+```
+
+---
+
+### 4) `maws setup`
+
+Interactive helper to **create or refine** `params.json` safely.
+
+```bash
+maws setup [-c|--config params.json] [--dir <path>]
+```
+
+Prompts for:
+
+* `project`, `region`, `bot`
+* `stack_name`, `history_bucket`, `deployment_bucket`
+* `env_param_name` (SSM), `api_path` (API Gateway route), verbosity & token sync prefs
+
+---
+
+### 5) `maws describe`
+
+Shows local files, prints `params.json`, and (if permitted) fetches **CloudFormation outputs** (e.g., **ApiUrl**), bucket existence, and stack status.
+
+```bash
+maws describe [-c|--config params.json] [--dir <path>] [--region <region>] [--no-aws]
+```
+
+---
+
+### 6) `maws list`
+
+Lists **MAWS stacks** in a region (quick inventory with ApiUrls).
+
+```bash
+maws list [--region <region>]
+```
+
+---
+
+### 7) `maws remove`
+
+Tears down a project’s AWS resources.
+
+```bash
+maws remove \
+  [--project <name>] \
+  [--region <region>] \
+  [-y|--yes] \
+  [--keep-deploy-bucket] \
+  [--wait] \
+  [-c|--config params.json] \
+  [--dir <path>]
+```
+
+* Empties the **history bucket** and deletes the **CloudFormation stack**.
+* Optionally deletes the **deployment bucket** (`--keep-deploy-bucket` to preserve artifacts).
+* `--wait` blocks until the stack is fully deleted.
+
+---
+
+## Python API (equivalent helpers)
+
+Everything the CLI can do is also available as Python functions:
+
+```python
+from maws import start, update, pull_history, setup, describe, list_projects, remove_project
+
+# Scaffold
+start(project="my-bot", region="us-east-1", bot="telegram", install_deps=False, run_config=False)
+
+# Deploy (uses params.json in cwd)
+update()
+
+# Pull conversation DBs from S3
+pull_history()
+
+# Interactive param refinement (or use programmatic edits to params.json yourself)
+setup()
+
+# Print local + AWS state (0 = OK, nonzero = issues)
+describe()
+
+# Discover MAWS stacks in a region
+list_projects(region="us-east-1")
+
+# Tear down (DANGER)
+remove_project(project="my-bot", region="us-east-1", yes=True, wait=True)
+```
+
+Return codes mirror the CLI behavior (`0` on success, non-zero on error where applicable).
+
+---
+
+## Configuration & Environment
+
+### `params.json` keys (managed by `maws setup/start`)
+
+* `project`, `region`, `bot` (`telegram`|`whatsapp`)
+* `stack_name` – CloudFormation stack name
+* `history_bucket` – stores per-user SQLite histories
+* `deployment_bucket` – SAM artifacts
+* `env_param_name` – SSM parameter path for **.env.prod** (stored encrypted)
+* `api_path` – API Gateway route path (default `/webhook`)
+* `sync_tokens_s3` (bool) – sync “token files” from S3 into `/tmp`
+* `tokens_s3_prefix` – S3 prefix for token files (default `secrets`)
+* `verbose` (bool) – extra logging in Lambda
+
+### Lambda environment variables (read by runtime)
+
+* `ENV_PARAMETER_NAME` – SSM parameter name that contains your `.env` lines
+* `BUCKET_NAME` – history bucket name (set by the deploy)
+* `BOT_TYPE` – `telegram` or `whatsapp` (deploy sets this; defaults to `whatsapp`)
+* `SYNC_TOKENS_S3` – `"1"/"0"` (default on)
+* `TOKENS_S3_PREFIX` – S3 prefix for token files (default `secrets`)
+* `LOCKS_TABLE_NAME` – DynamoDB table name (optional; enables user locks)
+* `LOCK_TTL_SECONDS` – seconds for the lock TTL (default `180`)
+* `SPECIAL_TOKEN_FILES_JSON` – JSON list of filenames to fetch to `/tmp` (optional)
+* `TOKEN_ENV_MAP_JSON` – JSON map `{ "file.ext": "ENV_VAR_NAME" }`; MAWS sets `ENV_VAR_NAME=/tmp/file.ext`
+* `VERBOSE` – extra logs (`true/false`)
+
+### Provider & bot secrets (in `.env.prod`, then moved to SSM)
+
+Common entries:
+
+```
+# LLMs (put at least one)
+OPENAI_API_KEY=
+GOOGLE_API_KEY=
+GROQ_API_KEY=
+ANTHROPIC_API_KEY=
+DEEPSEEK_API_KEY=
+LMSTUDIO_API_KEY=
+
+# Telegram (if using Telegram)
+TELEGRAM_TOKEN=
+
+# WhatsApp Cloud API (if using WhatsApp)
+WHATSAPP_TOKEN=
+WHATSAPP_PHONE_NUMBER_ID=
+WHATSAPP_VERIFY_TOKEN=
+```
+
+> MAWS loads this env securely from **SSM** at runtime (`ENV_PARAMETER_NAME`).
+> To rotate secrets, update `.env.prod` locally and redeploy (`maws update`), or write the SSM parameter directly.
+
+---
+
+## Troubleshooting
+
+* **Windows**: Prefer **WSL**. If you must run natively, add `--allow-windows`, but this won't necessarily play nice with the Lambda environment.
+* **Missing AWS/SAM/jq**: Re-run `maws start` on Linux/WSL, or install manually.
+* **Telegram webhook not set**: Use the `setWebhook` call shown above with your **ApiUrl** (although it should be set automatically).
+* **WhatsApp verification fails**: Ensure your **webhook URL** is exactly the printed **ApiUrl** and **WHATSAPP\_VERIFY\_TOKEN** matches the Meta dashboard value.
+* **403 / 401 from LLM provider**: Double-check your provider API key is present (SSM) and the model name in `config.json` is valid.
+* **No messages saved**: Verify the **history bucket** exists (`maws describe`) and Lambda has write permissions (the provided stack template handles this automatically).
+
+---
+
+**Status:** MAWS is in **beta**. It’s designed to be safe and ergonomic, but please report issues and ideas — and don’t hesitate to peek into `config.json`/`fns.py` to evolve your bot beyond the minimal scaffold.
