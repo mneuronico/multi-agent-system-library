@@ -768,26 +768,20 @@ def start(
 
     # 4) .env.prod según bot + 3 API keys siempre
     env_lines = [
-        "GOOGLE_API_KEY=",
-        "OPENAI_API_KEY=",
-        "GROQ_API_KEY=",
+        "# GOOGLE_API_KEY=",
+        "# OPENAI_API_KEY=",
+        "# GROQ_API_KEY=",
     ]
 
     if bot == "telegram":
         env_lines += [
-            "TELEGRAM_TOKEN=",
-            "WEBHOOK_VERIFY_TOKEN=",      # genérico para verificación de webhook
-            "# WHATSAPP_TOKEN=",
-            "# WHATSAPP_PHONE_NUMBER_ID=",
-            "# WHATSAPP_VERIFY_TOKEN=",   # compat si algo espera este nombre
+            "# TELEGRAM_TOKEN="
         ]
     else:  # whatsapp
         env_lines += [
-            "WHATSAPP_TOKEN=",
-            "WHATSAPP_PHONE_NUMBER_ID=",
-            "WEBHOOK_VERIFY_TOKEN=",      # genérico (útil en bootstrap/doc)
-            "# TELEGRAM_TOKEN=",
-            "# WHATSAPP_VERIFY_TOKEN=",   # compat si tu código lo espera
+            "# WHATSAPP_TOKEN=",
+            "# WHATSAPP_PHONE_NUMBER_ID=",
+            "# WHATSAPP_VERIFY_TOKEN="
         ]
 
     _write(env_path, "\n".join(env_lines) + "\n")

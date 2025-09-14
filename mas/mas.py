@@ -5572,7 +5572,7 @@ class WhatsappBot(Bot):
 
         self.whatsapp_token = whatsapp_token or self.manager.get_key("whatsapp_token")
         self.phone_number_id = phone_number_id or self.manager.get_key("whatsapp_phone_number_id")
-        self.webhook_verify_token = webhook_verify_token or self.manager.get_key("webhook_verify_token")
+        self.webhook_verify_token = webhook_verify_token or self.manager.get_key("webhook_verify_token") or self.manager.get_key("whatsapp_verify_token")
 
         if not all([self.whatsapp_token, self.phone_number_id, self.webhook_verify_token]):
             raise ValueError(
