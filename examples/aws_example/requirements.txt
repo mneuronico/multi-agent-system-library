@@ -1,3 +1,0 @@
-requests
-boto3
-git+https://github.com/mneuronico/multi-agent-system-library.git
