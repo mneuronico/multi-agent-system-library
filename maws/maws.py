@@ -733,7 +733,7 @@ def start(
     config_path = workdir / "config.json"
     fns_path = workdir / "fns.py"
     env_path = workdir / ".env.prod"
-    gi_path = workdir / ".gitignore"
+    gi_path = workdir / ".samignore"
 
     def _write(p: Path, content: str):
         if p.exists() and not overwrite:
@@ -741,13 +741,58 @@ def start(
         p.write_text(content, encoding="utf-8")
 
     # Scaffold mínimo
-    _write(params_path, _json.dumps({"project": project, "region": region, "bot": bot}, indent=2))
-    _write(config_path, _json.dumps({
-        "agents": [{"id":"assistant","role":"assistant","model":"gpt-4o-mini","instructions":"Sos un asistente útil."}],
-        "automations": [{"id":"default","type":"chat","agent":"assistant"}]
-    }, indent=2))
+
+    # 1) NO re-escribas params.json otra vez aquí (ya se creó/mergeó arriba)
+    # _write(params_path, _json.dumps({"project": project, "region": region, "bot": bot}, indent=2))
+
+    # 2) config.json con el esquema nuevo
+    config_template = {
+        "general_parameters": {
+            "general_system_description": "A simple query system."
+        },
+        "components": [
+            {
+                "type": "agent",
+                "name": "simple_agent",
+                "system": "You are a basic assistant for answering questions.",
+                "required_outputs": {
+                    "response": "A text response to be sent to the user."
+                }
+            }
+        ]
+    }
+    _write(config_path, _json.dumps(config_template, indent=2))
+
+    # 3) fns.py vacío (si no existe o overwrite=True)
     _write(fns_path, "# define tus funciones aquí\n")
-    _write(env_path, "# TELEGRAM_TOKEN=xxx\n# WHATSAPP_VERIFY_TOKEN=xxx\n")
+
+    # 4) .env.prod según bot + 3 API keys siempre
+    env_lines = [
+        "GOOGLE_API_KEY=",
+        "OPENAI_API_KEY=",
+        "GROQ_API_KEY=",
+    ]
+
+    if bot == "telegram":
+        env_lines += [
+            "TELEGRAM_TOKEN=",
+            "WEBHOOK_VERIFY_TOKEN=",      # genérico para verificación de webhook
+            "# WHATSAPP_TOKEN=",
+            "# WHATSAPP_PHONE_NUMBER_ID=",
+            "# WHATSAPP_VERIFY_TOKEN=",   # compat si algo espera este nombre
+        ]
+    else:  # whatsapp
+        env_lines += [
+            "WHATSAPP_TOKEN=",
+            "WHATSAPP_PHONE_NUMBER_ID=",
+            "WEBHOOK_VERIFY_TOKEN=",      # genérico (útil en bootstrap/doc)
+            "# TELEGRAM_TOKEN=",
+            "# WHATSAPP_VERIFY_TOKEN=",   # compat si tu código lo espera
+        ]
+
+    _write(env_path, "\n".join(env_lines) + "\n")
+
+    # 5) .gitignore
     _write(gi_path, ".aws-sam/\n__pycache__/\nhistory/\nfiles/\n.env.prod\n.bootstrap_state.json\n")
 
     # Copiar scripts si no están
@@ -758,8 +803,8 @@ def start(
     print("  - params.json")
     print("  - config.json")
     print("  - fns.py")
-    print("  - .env.prod (vacío)")
-    print("  - .gitignore")
+    print("  - .env.prod")
+    print("  - .samignore")
 
     if install_deps:
         print("\n🔧 Instalando dependencias del sistema (best-effort)…")
