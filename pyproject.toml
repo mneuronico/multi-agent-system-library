@@ -43,6 +43,7 @@ Homepage = "https://github.com/mneuronico/multi-agent-system-library"
 Issues = "https://github.com/mneuronico/multi-agent-system-library/issues"
 
 [project.scripts]
+mas = "mas.cli.cli:main"
 maws = "maws.cli:main"
 
 [tool.setuptools]
