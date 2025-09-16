@@ -93,7 +93,8 @@ class Agent(Component):
         general_system_description: str = "",
         model_params: Optional[Dict[str, Any]] = None,
         include_timestamp: bool = False,
-        description: str = None
+        description: str = None,
+        timeout: int = 120
     ):
         super().__init__(name)
         self.system_prompt = system_prompt
@@ -111,6 +112,7 @@ class Agent(Component):
         self.model_params = model_params or {}
         self.include_timestamp = include_timestamp
         self.description = description if description else "Agent"
+        self.timeout = timeout
 
     def to_string(self) -> str:
         return (
@@ -911,7 +913,7 @@ class Agent(Component):
             response = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
-                json=data
+                json=data, timeout=self.timeout
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -974,7 +976,7 @@ class Agent(Component):
             response = requests.post(
                 url,
                 headers=headers,
-                json=data
+                json=data, timeout=self.timeout
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1034,7 +1036,7 @@ class Agent(Component):
             response = requests.post(
                 "https://api.deepseek.com/chat/completions",
                 headers=headers,
-                json=data
+                json=data, timeout=self.timeout
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1140,7 +1142,7 @@ class Agent(Component):
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1alpha/models/{model_name}:generateContent",
                 headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-                json=payload, timeout=30
+                json=payload, timeout=self.timeout
             )
             r.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1209,7 +1211,7 @@ class Agent(Component):
             response = requests.post(
                 "https://api.anthropic.com/v1/messages",
                 headers=headers,
-                json=data
+                json=data, timeout=self.timeout
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1277,7 +1279,7 @@ class Agent(Component):
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
-                json=data
+                json=data, timeout=self.timeout
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -2364,12 +2366,15 @@ class AgentSystemManager:
         timezone: str = "UTC",
         log_level=None,
         admin_user_id: Optional[str] = None,
-        usage_logging: bool = False
+        usage_logging: bool = False,
+        timeout: Optional[int] = None
     ):
 
         self._tls = threading.local()
         self.base_directory = os.path.abspath(base_directory)
         self._usage_logging_enabled = bool(usage_logging)
+
+        self.timeout = timeout
         
         description_mode = (
             isinstance(config, str)
@@ -2378,11 +2383,15 @@ class AgentSystemManager:
         )
 
         if description_mode:
+            self._resolve_api_keys_path(api_keys_path)
+            self._load_api_keys()
+
             config = self._bootstrap_from_description(
-                description    = config,
-                base_directory = base_directory,
-                default_models = bootstrap_models,
-                verbose = verbose
+                description       = config,
+                base_directory    = base_directory,
+                default_models    = bootstrap_models,
+                verbose           = verbose,
+                api_keys_path     = api_keys_path
             )
         
         if log_level is not None:
@@ -2449,6 +2458,9 @@ class AgentSystemManager:
         self._load_api_keys()
         self._load_costs()
 
+        if self.timeout is None:
+            self.timeout = 120
+
         self._process_imports()
 
         if hasattr(self, 'pending_links'):
@@ -2486,11 +2498,30 @@ class AgentSystemManager:
             self._usage_log_path   = os.path.join(self.logs_folder, "usage.log")
             self._summary_log_path = os.path.join(self.logs_folder, "summary.log")
 
+    def _recursively_parse_json_strings(self, data: Any) -> Any:
+        if isinstance(data, dict):
+            new_dict = {}
+            for key, value in data.items():
+                new_dict[key] = self._recursively_parse_json_strings(value)
+            return new_dict
+        elif isinstance(data, list):
+            return [self._recursively_parse_json_strings(item) for item in data]
+        elif isinstance(data, str):
+            try:
+                s = data.strip()
+                if (s.startswith('{') and s.endswith('}')) or \
+                   (s.startswith('[') and s.endswith(']')):
+                    return json.loads(s)
+            except (json.JSONDecodeError, TypeError):
+                return data
+        return data
+
 
     def _bootstrap_from_description(self, *, description: str,
                                     base_directory: str,
-                                    default_models: List[Dict[str, str]],
-                                    verbose: bool = False) -> str:
+                                    default_models: Optional[List[Dict[str, str]]],
+                                    verbose: bool = False,
+                                    api_keys_path: Optional[str] = None) -> str:
 
         readme_text = get_readme("mneuronico", "multi-agent-system-library")
 
@@ -2505,14 +2536,49 @@ class AgentSystemManager:
         
         if default_models is None:
             default_models = [
-                {"provider": "openai",     "model": "o3"},
-                {"provider": "google",     "model": "gemini-2.5-pro-preview-06-05"},
-                {"provider": "deepseek",   "model": "deepseek-reasoner"},
-                {"provider": "anthropic",  "model": "claude-sonnet-4-20250514"},
-                {"provider": "groq",       "model": "meta-llama/llama-4-maverick-17b-128e-instruct"}
+                {"provider": "openai", "model": "gpt-5"},
+                {"provider": "google", "model": "gemini-2.5-pro"},
+                {"provider": "anthropic", "model": "claude-sonnet-4"},
             ]
         elif isinstance(default_models, dict):
             default_models = [default_models]
+
+        
+        recommended_models = {
+            "openai": "gpt-5-nano",
+            "google": "gemini-2.5-flash",
+            "anthropic": "claude-sonnet-4",
+            "deepseek": "deepseek-chat",
+            "groq": "openai/gpt-oss-120b"
+        }
+        potential_providers = ["openai", "google", "anthropic", "deepseek", "groq"]
+
+        available_providers = [p for p in potential_providers if self.get_key(p)]
+        available_providers_str = ", ".join(available_providers) or "None"
+
+        context_prompt = textwrap.dedent(f"""
+        ## System Context & Constraints
+        You must generate a `config.json` file. Pay close attention to these rules:
+
+        1.  **Available API Providers:** The user has API keys for the following providers ONLY: **{available_providers_str}**. You MUST NOT include any other providers in the `default_models` list. If the list of available providers is empty, create an empty `default_models` list.
+        2.  **Recommended Models:** When choosing models for the `default_models` list, you MUST use these preferred models. Select only from your list of available providers:
+            - openai: {recommended_models['openai']}
+            - google: {recommended_models['google']}
+            - anthropic: {recommended_models['anthropic']}
+            - deepseek: {recommended_models['deepseek']}
+            - groq: {recommended_models['groq']}
+        3.  **Functions File:** If your configuration requires custom functions, include them in the `fns` list as full Python source code strings. Ensure that any function you reference in the components is defined here. If those functions rely on external libraries, you must include the necessary import statements at the top of the `fns.py` file, and attempt to install them via pip if the import fails.
+        """)
+
+        original_system_prompt = (
+            "You are `system_writer`, an expert MAS engineer.\n"
+            "Your job is to read the user's requirement and the MAS library README, then use the provided context and constraints to create a valid system configuration.\n"
+            "You must OUTPUT **ONE** JSON object with exactly these keys:\n"
+            "  general_parameters → A JSON object for the config.\n"
+            "  components         → A list of MAS component definitions.\n"
+            "  fns                → A list of strings, where each string is the full Python source for a function.\n"
+            "Return NOTHING ELSE. No markdown, no explanations, just the raw JSON object."
+        )
 
         bootstrap_cfg = {
             "general_parameters": {
@@ -2523,84 +2589,105 @@ class AgentSystemManager:
                 {
                     "type": "agent",
                     "name": "system_writer",
-                    "system": (
-                        "You are `system_writer`, an expert MAS engineer.\n"
-                        "Your job is to read the single user message you will receive "
-                        "(it contains the MAS README followed by the user's requirement) "
-                        "and OUTPUT **ONE** JSON object with exactly these keys:\n"
-                        "  general_parameters → dict that will go verbatim into config.json\n"
-                        "  components         → list of MAS components\n"
-                        "  fns                → list[str]  each string is full Python "
-                        "source code for a helper function (include imports INSIDE the "
-                        "function!).\n"
-                        "Return NOTHING ELSE, no markdown, no explanations."
-                    ),
+                    "system": f"{context_prompt}\n\n{original_system_prompt}",
                     "required_outputs": {
-                        "general_parameters": "Block for config.json",
-                        "components": "Component list",
-                        "fns": "Python functions"
+                        "general_parameters": "Block for config.json, respecting the provided constraints.",
+                        "components": "Component list for the user's requirement.",
+                        "fns": "Python functions needed by the components."
                     }
                 }
             ]
         }
+
+        sub_mgr = None
         bootstrap_cfg_path = os.path.join(base_directory,
                                           "_bootstrap_config.json")
-        with open(bootstrap_cfg_path, "w", encoding="utf-8") as fp:
-            json.dump(bootstrap_cfg, fp, indent=2)
-
-        sub_mgr = AgentSystemManager(config=bootstrap_cfg_path,
-                                     base_directory=base_directory)
-
-        blocks = sub_mgr.run(
-            input=combined_input,
-            component_name="system_writer",
-            verbose = verbose
-        )
-
-        agent_payload = None
-        for blk in blocks:
-            if blk.get("type") == "text":
-                raw = blk.get("content")
-                if isinstance(raw, dict):
-                    agent_payload = raw
-                else:
-                    try:
-                        agent_payload = json.loads(raw)
-                    except (TypeError, json.JSONDecodeError):
-                        agent_payload = None
-                break
-
-        if not isinstance(agent_payload, dict):
-            raise RuntimeError("system_writer did not return the expected JSON object")
         
-        gp       = agent_payload["general_parameters"]
-        comps    = agent_payload["components"]
-        fns_list = agent_payload["fns"]
-
-        final_cfg_path = os.path.join(base_directory, "config.json")
-        with open(final_cfg_path, "w", encoding="utf-8") as fp:
-            json.dump({"general_parameters": gp, "components": comps}, fp, indent=2)
-
-        final_fns_path = os.path.join(base_directory, "fns.py")
-        with open(final_fns_path, "w", encoding="utf-8") as fp:
-            fp.write("\n\n".join(fns_list))
 
         try:
-            sub_mgr._close_all_db_conns()
-        except Exception:
-            pass
+            with open(bootstrap_cfg_path, "w", encoding="utf-8") as fp:
+                json.dump(bootstrap_cfg, fp, indent=2)
 
-        for folder in ("history", "files"):
-            path = os.path.join(base_directory, folder)
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)        
+            sub_mgr = AgentSystemManager(config=bootstrap_cfg_path,
+                                        base_directory=base_directory)
 
-        try:
-            os.remove(bootstrap_cfg_path)
-        except FileNotFoundError:
-            pass
+            blocks = sub_mgr.run(
+                input=combined_input,
+                component_name="system_writer",
+                verbose = verbose
+            )
 
-        return final_cfg_path
+            agent_payload = None
+            raw_payload_excerpt = None
+            for blk in blocks:
+                if blk.get("type") == "text":
+                    raw = blk.get("content")
+                    if isinstance(raw, dict):
+                        agent_payload = raw
+                        try:
+                            raw_payload_excerpt = json.dumps(raw, ensure_ascii=False)
+                        except TypeError:
+                            raw_payload_excerpt = str(raw)
+                    else:
+                        raw_payload_excerpt = str(raw)
+                        try:
+                            agent_payload = json.loads(raw)
+                        except (TypeError, json.JSONDecodeError):
+                            agent_payload = None
+                    break
+
+            if raw_payload_excerpt and len(raw_payload_excerpt) > 500:
+                raw_payload_excerpt = raw_payload_excerpt[:497] + '...'
+
+            if not isinstance(agent_payload, dict):
+                detail = f" Received payload: {raw_payload_excerpt}" if raw_payload_excerpt else ""
+                raise RuntimeError("system_writer did not return a valid JSON object with the expected keys." + detail)
+
+            cleaned_payload = self._recursively_parse_json_strings(agent_payload)
+
+            required_keys = ("general_parameters", "components", "fns")
+            missing = [key for key in required_keys if key not in cleaned_payload]
+            if missing:
+                available = ", ".join(map(str, cleaned_payload.keys())) or 'none'
+                raise RuntimeError(
+                    f"system_writer output is missing required sections after parsing: "
+                    f"{', '.join(missing)}. Available keys: {available}."
+                )
+
+            gp       = cleaned_payload["general_parameters"]
+            comps    = cleaned_payload["components"]
+            fns_list = cleaned_payload["fns"]
+
+            final_cfg_path = os.path.join(base_directory, "config.json")
+            with open(final_cfg_path, "w", encoding="utf-8") as fp:
+                json.dump({"general_parameters": gp, "components": comps}, fp, indent=2)
+
+            final_fns_path = os.path.join(base_directory, "fns.py")
+            if isinstance(fns_list, list):
+                with open(final_fns_path, "w", encoding="utf-8") as fp:
+                    fp.write("\n\n".join(map(str, fns_list)))
+
+            return final_cfg_path
+
+        finally:
+            if sub_mgr:
+                try:
+                    sub_mgr._close_all_db_conns()
+                except Exception:
+                    pass
+
+            # Borrar las carpetas temporales creadas por el sub_mgr
+            for folder in ("history", "files"):
+                path = os.path.join(base_directory, folder)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+
+            # Borrar el archivo de config temporal
+            if os.path.exists(bootstrap_cfg_path):
+                try:
+                    os.remove(bootstrap_cfg_path)
+                except OSError:
+                    pass
 
     def _resolve_api_keys_path(self, api_keys_path):
         if api_keys_path is None:
@@ -3490,7 +3577,8 @@ class AgentSystemManager:
         negative_filter: Optional[List[str]] = None,
         model_params: Optional[Dict[str, Any]] = None,
         include_timestamp: Optional[bool] = None,
-        description: str = None
+        description: str = None,
+        timeout: Optional[int] = None
     ):
         if name is None:
             name = self._generate_agent_name()
@@ -3510,6 +3598,8 @@ class AgentSystemManager:
             system,
             required_outputs
         )
+
+        final_timeout = timeout if timeout is not None else self.timeout
     
         agent = Agent(
             name=name,
@@ -3523,7 +3613,8 @@ class AgentSystemManager:
             general_system_description=self.general_system_description,
             model_params=model_params,
             include_timestamp=include_timestamp if include_timestamp is not None else self.include_timestamp,
-            description=description
+            description=description,
+            timeout=final_timeout
         )
 
         agent.manager = self
@@ -3946,6 +4037,9 @@ class AgentSystemManager:
         self.costs_path = general_params.get("costs_path")
         self._load_costs()
 
+        if self.timeout is None:
+            self.timeout = general_params.get("timeout", 120)
+
         components = system_definition.get("components", [])
         for component in components:
             self._create_component_from_json(component)
@@ -3986,7 +4080,8 @@ class AgentSystemManager:
                 negative_filter=component.get("negative_filter"),
                 include_timestamp=component.get("include_timestamp"),
                 model_params=component.get("model_params"),
-                description=description
+                description=description,
+                timeout=component.get("timeout")
             )
 
             uses_tool = component.get("uses_tool")
@@ -4727,7 +4822,7 @@ class AgentSystemManager:
         response = requests.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             headers=headers,
-            files=files
+            files=files, timeout=self.timeout
         )
         
         if response.status_code != 200:
@@ -4753,7 +4848,7 @@ class AgentSystemManager:
         response = requests.post(
             "https://api.openai.com/v1/audio/transcriptions",
             headers=headers,
-            files=files
+            files=files, timeout=self.timeout
         )
         
         if response.status_code != 200:
@@ -4805,7 +4900,7 @@ class AgentSystemManager:
         if instruction:
             data["instructions"] = instruction
 
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(url, headers=headers, json=data, timeout=self.timeout)
         response.raise_for_status()
         audio_bytes = response.content
         return self._save_tts_file(audio_bytes)
@@ -4844,7 +4939,7 @@ class AgentSystemManager:
             "xi-api-key": api_key,
             "Content-Type": "application/json"
         }
-        response = requests.post(tts_url, headers=headers, json=payload)
+        response = requests.post(tts_url, headers=headers, json=payload, timeout=self.timeout)
         response.raise_for_status()
         audio_bytes = response.content
         return self._save_tts_file(audio_bytes)
@@ -5733,7 +5828,7 @@ class WhatsappBot(Bot):
             payload["document"] = document_payload
         
         resp = await asyncio.to_thread(
-            requests.post, f"{self.graph_url}/messages", headers=self.headers_json, json=payload, timeout=30
+            requests.post, f"{self.graph_url}/messages", headers=self.headers_json, json=payload, timeout=60
         )
 
         if not resp.ok:
