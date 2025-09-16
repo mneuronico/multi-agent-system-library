@@ -9,7 +9,7 @@ from typing import Optional, Union, List, Dict
 import datetime as _dt
 
 # -------------------------
-# Utilidades y configuración
+# Utilities and configuration
 # -------------------------
 def _as_bool(v, default=False):
     if v is None:
@@ -18,8 +18,8 @@ def _as_bool(v, default=False):
 
 def _load_env_from_ssm_if_needed():
     """
-    Carga un .env desde SSM (SecureString) y lo vuelca a os.environ,
-    sin sobreescribir claves ya presentes. Lo hace una sola vez.
+    Load a .env from SSM (SecureString) and merge it into ``os.environ``
+    without overriding existing keys. Runs only once per process.
     """
     param_name = os.environ.get("ENV_PARAMETER_NAME")
     if not param_name:
@@ -41,24 +41,24 @@ def _load_env_from_ssm_if_needed():
     print(f"[maws] Loaded env from SSM parameter: {param_name}")
 
 # -------------------------
-# Runtime principal
+# Main runtime
 # -------------------------
 class MawsRuntime:
     def __init__(self):
         _load_env_from_ssm_if_needed()
 
-        # Config general
+        # General config
         self.bucket_name = os.environ.get("BUCKET_NAME", "MISSING_BUCKET")
         self.sync_tokens_s3 = _as_bool(os.environ.get("SYNC_TOKENS_S3", "1"), default=True)
         self.tokens_prefix = os.environ.get("TOKENS_S3_PREFIX", "secrets")
         self.bot_type = os.environ.get("BOT_TYPE", "whatsapp").strip().lower()
         self.verbose = _as_bool(os.environ.get("VERBOSE", "false"), default=False)
 
-        # Locks DynamoDB (opcional)
+        # DynamoDB locks (optional)
         self.lock_table = os.environ.get("LOCKS_TABLE_NAME") or ""
         self.lock_ttl = int(os.environ.get("LOCK_TTL_SECONDS", "180"))
 
-        # Tokens especiales (opcionales)
+        # Special tokens (optional)
         self.special_files = []
         try:
             self.special_files = json.loads(os.environ.get("SPECIAL_TOKEN_FILES_JSON", "[]"))
@@ -80,18 +80,18 @@ class MawsRuntime:
         self.lambda_client = boto3.client("lambda")
         self.dynamodb = boto3.client("dynamodb") if self.lock_table else None
 
-        # Rutas
-        self.CODE_ROOT = "/var/task"  # paquete (read-only)
+        # Paths
+        self.CODE_ROOT = "/var/task"  # package (read-only)
         self.TMP_DIR = "/tmp"
         os.makedirs(f"{self.TMP_DIR}/history", exist_ok=True)
         os.makedirs(f"{self.TMP_DIR}/files", exist_ok=True)
 
-        # Estado "warm"
+        # Warm state
         self.manager = None
         self.bot_instance = None
         self._loop = None
 
-        # Si mapeaste archivos->ENV, publica paths en ENV
+        # If files were mapped to ENV variables, publish paths in ENV
         for fname, envkey in self.token_env_map.items():
             os.environ.setdefault(envkey, f"{self.TMP_DIR}/{fname}")
 
@@ -133,7 +133,7 @@ class MawsRuntime:
         return False
 
     def ensure_token_file(self, filename: str) -> str:
-        """Garantiza que /tmp/<filename> exista (S3 > paquete)."""
+        """Ensure that /tmp/<filename> exists (prefers S3 over the package)."""
         local_tmp = os.path.join(self.TMP_DIR, filename)
         if os.path.exists(local_tmp):
             return local_tmp
@@ -143,7 +143,7 @@ class MawsRuntime:
                 return local_tmp
         if self._copy_code_to_tmp_if_exists(filename, local_tmp):
             return local_tmp
-        print(f"[maws][WARN] No existe {filename} ni en S3 ni en el paquete.")
+        print(f"[maws][WARN] {filename} not found in S3 or the package.")
         return local_tmp
 
     def upload_token_back_if_exists(self, filename: str):
@@ -154,17 +154,17 @@ class MawsRuntime:
             key = self._s3_key_for(filename)
             with open(path, "rb") as f:
                 self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=f.read())
-            print(f"[maws] subido {path} -> s3://{self.bucket_name}/{key}")
+            print(f"[maws] uploaded {path} -> s3://{self.bucket_name}/{key}")
 
     # -------------------------
-    # Locks (opcionales)
+    # Locks (optional)
     # -------------------------
     def _lock_now_epoch(self):
         from time import time
         return int(time())
 
     def try_acquire_user_lock(self, user_id: str) -> bool:
-        """True si toma el lock; False si ya hay otro worker procesando ese user_id."""
+        """Return True if the lock is acquired; False if another worker is processing the user."""
         if not (self.lock_table and self.dynamodb):
             return True
         now = self._lock_now_epoch()
@@ -192,14 +192,14 @@ class MawsRuntime:
             pass
 
     # -------------------------
-    # Inicialización MAS + Bots
+    # MAS initialization + bots
     # -------------------------
     def initialize_system(self):
         if self.manager and self.bot_instance:
-            print("[maws] Warm start; sistema ya inicializado.")
+            print("[maws] Warm start; system already initialized.")
             return
 
-        # Traer tokens a /tmp si están configurados
+        # Bring tokens to /tmp if configured
         for f in self.special_files:
             self.ensure_token_file(f)
 
@@ -211,7 +211,7 @@ class MawsRuntime:
             files_folder=f"{self.TMP_DIR}/files",
             verbose=self.verbose,
         )
-        print("[maws] Manager creado.")
+        print("[maws] Manager created.")
 
         if self.bot_type == "telegram":
             self.bot_instance = self.manager.start_telegram_bot(
@@ -236,10 +236,10 @@ class MawsRuntime:
                 verbose=self.verbose,
             )
 
-        print("[maws] Inicialización completada.")
+        print("[maws] Initialization completed.")
 
     # -------------------------
-    # Extracción de chat_id
+    # chat_id extraction
     # -------------------------
     @staticmethod
     def _extract_telegram_chat_id(update: dict) -> str:
@@ -262,12 +262,12 @@ class MawsRuntime:
             return ""
 
     # -------------------------
-    # Handler principal
+    # Main handler
     # -------------------------
     def handle_apigw_event(self, event, context):
         self.initialize_system()
         if not self.bot_instance:
-            return {"statusCode": 200, "body": json.dumps("Error: Fallo en la inicialización.")}
+            return {"statusCode": 200, "body": json.dumps("Error: Initialization failed.")}
 
         http_method = (
             event.get("requestContext", {}).get("http", {}).get("method")
@@ -276,7 +276,7 @@ class MawsRuntime:
 
         # GET verification (WhatsApp)
         if http_method == "GET" and self.bot_type == "whatsapp":
-            print("[maws] Verificación (GET) WhatsApp.")
+            print("[maws] WhatsApp verification (GET).")
             try:
                 query_params = event.get("queryStringParameters", {}) or {}
                 response_body, status_code = self.bot_instance.handle_webhook_verification(query_params)
@@ -285,9 +285,9 @@ class MawsRuntime:
                 print(f"[maws][verify][ERR] {e}")
                 return {"statusCode": 200, "body": "Verification (warning)."}
 
-        # POST fan-out (ambos)
+        # POST fan-out (both)
         if http_method == "POST":
-            print("[maws] Webhook POST recibido.")
+            print("[maws] Received webhook POST.")
             try:
                 body = event.get("body", "{}")
                 data = json.loads(body)
@@ -297,16 +297,16 @@ class MawsRuntime:
                     InvocationType="Event",
                     Payload=json.dumps({payload_key: data}),
                 )
-                return {"statusCode": 200, "body": json.dumps("Webhook recibido.")}
+                return {"statusCode": 200, "body": json.dumps("Webhook received.")}
             except Exception as e:
                 print(f"[maws][POST][ERR] {e}")
-                return {"statusCode": 200, "body": json.dumps("Webhook recibido (warning).")}
+                return {"statusCode": 200, "body": json.dumps("Webhook received (warning).")}
 
         # Background: procesamiento real
         is_tg = "update" in event
         is_wa = "whatsapp_update" in event
         if not (is_tg or is_wa):
-            return {"statusCode": 400, "body": json.dumps("Invocación no reconocida.")}
+            return {"statusCode": 400, "body": json.dumps("Invocation not recognized.")}
 
         update = event["update"] if is_tg else event["whatsapp_update"]
         chat_id = (
@@ -315,7 +315,7 @@ class MawsRuntime:
             else self._extract_whatsapp_chat_id(update)
         )
         if not chat_id:
-            print("[maws] No pude extraer chat_id; saliendo.")
+            print("[maws] Could not extract chat_id; exiting.")
             return
 
         acquired_lock = False
@@ -326,11 +326,11 @@ class MawsRuntime:
         try:
             # Lock
             if not self.try_acquire_user_lock(chat_id):
-                print(f"[maws] Otro worker procesa {chat_id}. Ignoro update.")
+                print(f"[maws] Another worker is processing {chat_id}. Ignoring update.")
                 return
             acquired_lock = True
 
-            # Traer historial
+            # Fetch history
             try:
                 self.s3.download_file(self.bucket_name, s3_key, local_db)
             except botocore.exceptions.ClientError as e:
@@ -346,19 +346,19 @@ class MawsRuntime:
 
             self.manager.set_current_user(chat_id)
 
-            # Procesar
+            # Process
             loop = self.get_event_loop()
             loop.run_until_complete(self.bot_instance.process_webhook_update(update))
         except Exception as e:
             print(f"[maws][process][ERR] {e}")
             traceback.print_exc()
         finally:
-            # Persistencia sólo si importamos el historial
+            # Persistence only if we imported the history
             if imported_history:
-                # Subir tokens si cambiaron
+                # Upload tokens if they changed
                 for f in self.special_files:
                     self.upload_token_back_if_exists(f)
-                # Guardar DB
+                # Save DB
                 try:
                     sqlite_bytes = self.manager.export_history(chat_id)
                     if sqlite_bytes:
@@ -366,7 +366,7 @@ class MawsRuntime:
                 except Exception as e:
                     print(f"[maws][save][ERR] {e}")
 
-            # Liberar lock si lo tomamos
+            # Release lock if acquired
             if acquired_lock:
                 try:
                     self.release_user_lock(chat_id)
@@ -376,11 +376,11 @@ class MawsRuntime:
         return
 
 # -------------------------
-# Creador de handler Lambda
+# Lambda handler builder
 # -------------------------
 def build_lambda_handler(bot_type: str):
     runtime = MawsRuntime()
-    # Honrar BOT_TYPE pasado por env si no coincide
+    # Respect BOT_TYPE passed via env if it differs
     if bot_type:
         runtime.bot_type = bot_type.strip().lower()
 
@@ -410,8 +410,8 @@ def _resource_path(name: str) -> Path:
 
 def _ensure_script_in_cwd(name: str, dest_dir: Path, force: bool = False) -> Path:
     """
-    Devuelve una ruta al script. Por defecto usa el **embebido** dentro del paquete.
-    Si 'force' es True o MAWS_COPY_SCRIPTS=1, **copia** el script al proyecto y devuelve esa ruta.
+    Return a path to the script. By default it uses the embedded copy inside the package.
+    If ``force`` is True or MAWS_COPY_SCRIPTS=1, copy the script into the project and return that path.
     """
     use_copy = force or os.environ.get("MAWS_COPY_SCRIPTS") == "1"
     if not use_copy:
@@ -437,7 +437,7 @@ def _run_bash(
             cmd = ["wsl", "bash", str(script), *args]
         else:
             raise RuntimeError(
-                "No encontré 'bash'. En Windows instalá WSL o Git Bash.\n"
+                "Could not find 'bash'. On Windows install WSL or Git Bash.\n"
                 "WSL: https://learn.microsoft.com/windows/wsl/install"
             )
     else:
@@ -457,7 +457,7 @@ def _run_bash(
             last_lines.pop(0)
     proc.wait()
     if proc.returncode != 0 and quiet:
-        sys.stderr.write("---- bootstrap output (últimas líneas) ----\n")
+        sys.stderr.write("---- bootstrap output (last lines) ----\n")
         sys.stderr.writelines(last_lines[-30:])
         sys.stderr.write("\n------------------------------------------\n")
     return proc.returncode
@@ -475,12 +475,12 @@ def _apply_overrides(
     if bot:     out["bot"] = bot
     for item in (kv or []):
         if "=" not in item:
-            print(f"[maws] Ignoro override inválido: {item}")
+            print(f"[maws] Ignoring invalid override: {item}")
             continue
         k, v = item.split("=", 1)
         k = k.strip()
         v = v.strip()
-        # coerción simple: true/false/int/float/JSON; de lo contrario string
+        # simple coercion: true/false/int/float/JSON; otherwise string
         vl = v.lower()
         if v.startswith("{") or v.startswith("["):
             try:
@@ -506,23 +506,23 @@ def _is_windows() -> bool:
 
 def _windows_guard(allow: bool, action_desc: str):
     """
-    Bloquea en Windows (no WSL) salvo que:
-      - allow=True, o
-      - MAWS_ALLOW_WINDOWS=1, o
-      - el usuario confirme interactivo 'y'.
+    Block execution on Windows (outside WSL) unless one of the following is true:
+      - ``allow`` is True,
+      - MAWS_ALLOW_WINDOWS=1 is set,
+      - the user confirms interactively with 'y'.
     """
     if not _is_windows():
         return
 
     if allow or os.environ.get("MAWS_ALLOW_WINDOWS") == "1":
-        print(f"⚠️  Ejecutando en Windows (no recomendado) para: {action_desc}. Continuo por override.")
+        print(f"⚠️  Running on Windows (not recommended) for: {action_desc}. Proceeding due to override.")
         return
 
     msg = (
-        f"⚠️  Estás ejecutando en Windows. '{action_desc}' suele fallar fuera de WSL.\n"
-        "   Recomendado: usar WSL (Ubuntu) o Linux/macOS.\n"
-        "   Pasos rápidos WSL:  wsl --install -d Ubuntu   (reiniciar), luego abrir 'Ubuntu' y ejecutar allí.\n"
-        "¿Continuar de todos modos? [y/N]: "
+        f"⚠️  You are running on Windows. '{action_desc}' often fails outside WSL.\n"
+        "   Recommended: use WSL (Ubuntu) or Linux/macOS.\n"
+        "   Quick WSL steps:  wsl --install -d Ubuntu   (reboot), then open 'Ubuntu' and run it there.\n"
+        "Continue anyway? [y/N]: "
     )
     if sys.stdin and sys.stdin.isatty():
         ans = input(msg).strip().lower()
@@ -530,8 +530,8 @@ def _windows_guard(allow: bool, action_desc: str):
             return
 
     raise RuntimeError(
-        "Abortado para evitar fallos en Windows. Ejecutá en WSL/Linux/macOS, "
-        "o forzá con --allow-windows / allow_windows=True / MAWS_ALLOW_WINDOWS=1."
+        "Aborted to avoid failures on Windows. Use WSL/Linux/macOS, "
+        "or force with --allow-windows / allow_windows=True / MAWS_ALLOW_WINDOWS=1."
     )
 
 
@@ -548,10 +548,10 @@ def update(
     allow_windows: bool = False,
 ) -> int:
     """
-    Ejecuta el bootstrap:
-      - Si 'params' viene, se usa tal cual (escrito a params.tmp.json).
-      - Si no, se lee config_path (o 'params.json' si no se brinda),
-        y se aplican overrides (project/region/bot/--set clave=valor).
+    Run the bootstrap:
+      - If ``params`` is provided, use it as-is (written to params.tmp.json).
+      - Otherwise read config_path (or 'params.json' by default) and apply overrides
+        (project/region/bot/--set key=value).
     """
     _windows_guard(allow_windows, "build/deploy (SAM)")
     workdir = Path(project_dir or Path.cwd())
@@ -559,7 +559,7 @@ def update(
     script = _ensure_script_in_cwd("bootstrap.sh", workdir, force=force_copy_script)
 
     if params is not None and config_path is not None:
-        raise ValueError("Pasá 'params' (dict) o 'config_path', pero no ambos.")
+        raise ValueError("Pass either 'params' (dict) or 'config_path', but not both.")
 
     tmp_conf_path = None
     if params is None:
@@ -569,7 +569,7 @@ def update(
             try:
                 base = _json.loads(conf_path.read_text(encoding="utf-8"))
             except Exception:
-                print(f"[maws] No pude leer {conf_path}, uso base vacía.")
+                print(f"[maws] Could not read {conf_path}, using empty base.")
         merged = _apply_overrides(base, project, region, bot, set_kv)
         tmp_conf_path = workdir / "params.tmp.json"
         tmp_conf_path.write_text(_json.dumps(merged, indent=2), encoding="utf-8")
@@ -602,15 +602,15 @@ def pull_history(
 def _best_effort_install():
     """
     Linux/WSL only:
-      - APT para curl, unzip, jq
-      - AWS CLI v2 via instalador oficial (zip)
-      - SAM CLI via instalador oficial (zip)
-    Devuelve True si todo quedó OK o ya estaba instalado.
+      - APT for curl, unzip, jq
+      - AWS CLI v2 via official installer (zip)
+      - SAM CLI via official installer (zip)
+    Returns True if everything succeeded or was already installed.
     """
     import tempfile
     sys_os = _platform.system().lower()
     if sys_os != "linux":
-        print("⚠️  Instalación asistida soportada solo en Linux/WSL. En otros SO, instalá manualmente.")
+        print("⚠️  Assisted installation supported only on Linux/WSL. On other OSes, install manually.")
         return False
 
     def _run(cmd):
@@ -622,7 +622,7 @@ def _best_effort_install():
 
     ok = True
 
-    # Herramientas base
+    # Base tools
     if _shutil.which("apt"):
         _run(["sudo", "apt-get", "update"])
         if not _shutil.which("curl"):
@@ -632,10 +632,10 @@ def _best_effort_install():
         if not _shutil.which("jq"):
             ok &= _run(["sudo", "apt-get", "install", "-y", "jq"])
     else:
-        print("⚠️  No encontré APT. Instalá curl/unzip/jq manualmente.")
+        print("⚠️  APT not found. Install curl/unzip/jq manually.")
         ok = False
 
-    # AWS CLI v2 (instalador oficial)
+    # AWS CLI v2 (official installer)
     if not _shutil.which("aws"):
         tmp = tempfile.mkdtemp()
         arch = _platform.machine().lower()
@@ -649,11 +649,11 @@ def _best_effort_install():
         if _shutil.which("aws"):
             try:
                 out = _subprocess.check_output(["aws", "--version"], text=True)
-                print(f"✅ AWS CLI listo: {out.strip()}")
+                print(f"✅ AWS CLI ready: {out.strip()}")
             except Exception:
                 pass
         else:
-            print("❌ No pude instalar AWS CLI. Instalá manualmente: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html")
+            print("❌ Could not install AWS CLI. Install manually: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html")
             ok = False
 
     if not _shutil.which("sam"):
@@ -665,24 +665,24 @@ def _best_effort_install():
             sam_url = "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip"
         ok &= _run(["curl", "-sSL", sam_url, "-o", f"{tmp}/aws-sam-cli.zip"])
         ok &= _run(["unzip", "-q", f"{tmp}/aws-sam-cli.zip", "-d", f"{tmp}/sam-installation"])
-        # ← clave: usar --update para instalaciones preexistentes
+        # key detail: use --update for pre-existing installations
         ok &= _run(["sudo", f"{tmp}/sam-installation/install", "--update"])
 
-        # Si el instalador detectó una instalación previa pero no dejó el symlink:
+        # If the installer detected a previous installation but did not leave the symlink:
         sam_bin = _shutil.which("sam")
         if not sam_bin and os.path.exists("/usr/local/aws-sam-cli/current/bin/sam"):
             _run(["sudo", "ln", "-sf", "/usr/local/aws-sam-cli/current/bin/sam", "/usr/local/bin/sam"])
-            _subprocess.call(["hash", "-r"])  # no falla si no es bash
+            _subprocess.call(["hash", "-r"])  # does not fail if the shell is not bash
             sam_bin = _shutil.which("sam")
 
         if sam_bin:
             try:
                 out = _subprocess.check_output(["sam", "--version"], text=True)
-                print(f"✅ SAM CLI listo: {out.strip()}")
+                print(f"✅ SAM CLI ready: {out.strip()}")
             except Exception:
                 pass
         else:
-            print("❌ No pude instalar SAM CLI. Instalá manualmente: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
+            print("❌ Could not install SAM CLI. Install manually: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
             ok = False
 
 
@@ -698,12 +698,12 @@ def start(
     run_config: bool = False,
     allow_windows: bool = False,
 ) -> Path:
-    _windows_guard(allow_windows, "scaffold + instalación de deps")
+    _windows_guard(allow_windows, "scaffold + dependency installation")
 
     workdir = Path(project_dir or Path.cwd())
     workdir.mkdir(parents=True, exist_ok=True)
 
-    # Helpers de prompt (seguros si no hay TTY)
+    # Prompt helpers (safe when there is no TTY)
     def _is_tty():
         return bool(getattr(sys, "stdin", None) and sys.stdin.isatty())
 
@@ -718,25 +718,25 @@ def start(
         choices_str = "/".join(choices)
         val = _ask(f"{prompt} ({choices_str})", default).lower()
         if val not in choices:
-            print(f"[maws] Opción inválida '{val}', uso '{default}'.")
+            print(f"[maws] Invalid option '{val}', using '{default}'.")
             val = default
         return val
 
-    # Preguntar solo si no vino por argumento; defaults amigables
+    # Ask only when arguments were not provided; provide friendly defaults
     if project is None:
-        project = _ask("Nombre del proyecto", "my-bot")
+        project = _ask("Project name", "my-bot")
     if region is None:
-        region = _ask("Región AWS", "us-east-1")
+        region = _ask("AWS region", "us-east-1")
     if bot is None:
-        bot = _ask_choice("Tipo de bot", ["telegram", "whatsapp"], "telegram")
+        bot = _ask_choice("Bot type", ["telegram", "whatsapp"], "telegram")
 
     bot = bot.lower()
     if bot not in ("whatsapp", "telegram"):
-        raise ValueError("bot debe ser 'whatsapp' o 'telegram'.")
+        raise ValueError("bot must be 'whatsapp' or 'telegram'.")
 
     params_path = workdir / "params.json"
 
-    # Si NO existe, crear con plantilla mínima:
+    # If it does NOT exist, create with a minimal template:
     if not params_path.exists() or overwrite:
         base = {
             "project": project or "my-bot",
@@ -745,7 +745,7 @@ def start(
         }
         params_path.write_text(_json.dumps(base, indent=2), encoding="utf-8")
     else:
-        # Existe: si pasaron overrides, mergearlos sin pisar otras claves
+        # Exists: if overrides were provided, merge them without clobbering other keys
         if project or region or bot:
             try:
                 data = _json.loads(params_path.read_text(encoding="utf-8"))
@@ -766,7 +766,7 @@ def start(
             return
         p.write_text(content, encoding="utf-8")
 
-    # Scaffold mínimo
+    # Minimal scaffold
 
     def _is_tty() -> bool:
         return bool(getattr(sys, "stdin", None) and sys.stdin.isatty())
@@ -778,19 +778,19 @@ def start(
         resp = input(f"{prompt}{sfx}: ").strip()
         return resp or (default or "")
 
-    # 2) Elegir provider/model (interactivo si es TTY), defaults: google / gemini-2.5-flash
+    # 2) Choose provider/model (interactive when running on a TTY), defaults: google / gemini-2.5-flash
     _default_models_map = {
         "google": "gemini-2.5-flash",
         "openai": "gpt-4o-mini",
         "groq":   "llama-3.1-70b-versatile",
     }
-    provider = _ask("Proveedor por defecto (google/openai/groq)", "google").lower()
+    provider = _ask("Default provider (google/openai/groq)", "google").lower()
     if provider not in _default_models_map:
-        print(f"[maws] Provider desconocido '{provider}', uso 'google'.")
+        print(f"[maws] Unknown provider '{provider}', using 'google'.")
         provider = "google"
-    model = _ask("Modelo por defecto", _default_models_map[provider]) or _default_models_map[provider]
+    model = _ask("Default model", _default_models_map[provider]) or _default_models_map[provider]
 
-    # 3) config.json con default_models
+    # 3) config.json with default_models
     config_template = {
         "general_parameters": {
             "general_system_description": "A simple query system.",
@@ -811,8 +811,8 @@ def start(
     }
     _write(config_path, _json.dumps(config_template, indent=2))
 
-    # 4) fns.py vacío (si no existe o overwrite=True)
-    _write(fns_path, "# define tus funciones aquí\n")
+    # 4) Empty fns.py (if it does not exist or overwrite=True)
+    _write(fns_path, "# define your functions here\n")
 
     entered = {
         "google": "",
@@ -824,47 +824,47 @@ def start(
         "whatsapp_verify": "",
     }
 
-    # Pedir key del provider elegido (opcional)
+    # Ask for the selected provider key (optional)
     provider_key_env = {
         "google": "GOOGLE_API_KEY",
         "openai": "OPENAI_API_KEY",
         "groq":   "GROQ_API_KEY",
     }[provider]
-    maybe_key = _ask(f"Pegar {provider_key_env} (Enter para saltar)")
+    maybe_key = _ask(f"Paste {provider_key_env} (press Enter to skip)")
     if maybe_key:
         entered[provider] = maybe_key
 
-    # Pedir tokens del bot
+    # Ask for bot tokens
     if bot == "telegram":
-        tk = _ask("Pegar TELEGRAM_TOKEN (Enter para saltar)")
+        tk = _ask("Paste TELEGRAM_TOKEN (press Enter to skip)")
         if tk:
             entered["telegram_token"] = tk
     else:
-        wtk = _ask("Pegar WHATSAPP_TOKEN (Enter para saltar)")
+        wtk = _ask("Paste WHATSAPP_TOKEN (press Enter to skip)")
         if wtk:
             entered["whatsapp_token"] = wtk
-        wid = _ask("Pegar WHATSAPP_PHONE_NUMBER_ID (Enter para saltar)")
+        wid = _ask("Paste WHATSAPP_PHONE_NUMBER_ID (press Enter to skip)")
         if wid:
             entered["whatsapp_phone_id"] = wid
-        wv  = _ask("Pegar WHATSAPP_VERIFY_TOKEN (Enter para saltar)")
+        wv  = _ask("Paste WHATSAPP_VERIFY_TOKEN (press Enter to skip)")
         if wv:
             entered["whatsapp_verify"] = wv
 
-    # Armar líneas del .env.prod
+    # Build .env.prod lines
     def _line(envname: str, value: str, commented_if_empty: bool = True) -> str:
         if value:
             return f"{envname}={value}"
         return f"# {envname}=" if commented_if_empty else f"{envname}="
 
     env_lines: list[str] = []
-    # Siempre presentes (comentadas si vacías). La seleccionada va sin '#'
+    # Always present (commented if empty). The selected one is uncommented
     env_lines.append(_line("GOOGLE_API_KEY", entered["google"]))
     env_lines.append(_line("OPENAI_API_KEY", entered["openai"]))
     env_lines.append(_line("GROQ_API_KEY",   entered["groq"]))
 
     if bot == "telegram":
         env_lines.append(_line("TELEGRAM_TOKEN", entered["telegram_token"]))
-        # Si querés mantener este genérico, dejalo comentado:
+        # If you want to keep this generic, leave it commented:
         env_lines.append("# WEBHOOK_VERIFY_TOKEN=")
         env_lines.append("# WHATSAPP_TOKEN=")
         env_lines.append("# WHATSAPP_PHONE_NUMBER_ID=")
@@ -881,11 +881,11 @@ def start(
     # 5) .gitignore
     _write(gi_path, ".aws-sam/\n__pycache__/\nhistory/\nfiles/\n.env.prod\n.bootstrap_state.json\n")
 
-    # Copiar scripts si no están
+    # Copy scripts if they are missing
     #_ensure_script_in_cwd("bootstrap.sh", workdir, force=False)
     #_ensure_script_in_cwd("pull_history.sh", workdir, force=False)
 
-    print("\n✅ Estructura creada en:", workdir)
+    print("\n✅ Structure created at:", workdir)
     print("  - params.json")
     print("  - config.json")
     print("  - fns.py")
@@ -893,42 +893,42 @@ def start(
     print("  - .samignore")
 
     if install_deps:
-        print("\n🔧 Instalando dependencias del sistema (best-effort)…")
+        print("\n🔧 Installing system dependencies (best effort)…")
         ok = _best_effort_install()
         if not ok:
-            print("ℹ️  Seguí las instrucciones mostradas arriba para completar la instalación si quedó algo pendiente.")
+            print("ℹ️  Follow the instructions shown above to finish any pending installation steps.")
 
     # Probar credenciales
     if _shutil.which("aws"):
         try:
             out = _subprocess.check_output(["aws", "sts", "get-caller-identity", "--output", "json"], text=True)
             acct = _json.loads(out).get("Account")
-            print(f"🔐 AWS listo. Account: {acct}")
+            print(f"🔐 AWS ready. Account: {acct}")
         except Exception:
-            print("🔐 Configurá credenciales:  aws configure  (o usá AWS_PROFILE)")
+            print("🔐 Configure credentials:  aws configure  (or use AWS_PROFILE)")
 
         if run_config:
-            print("▶️  Ejecutando 'aws configure'…")
+            print("▶️  Running 'aws configure'…")
             try:
                 _subprocess.call(["aws", "configure"])
             except Exception:
-                print("No pude correr 'aws configure' automáticamente. Corrélo manualmente cuando puedas.")
+                print("Could not run 'aws configure' automatically. Please run it manually when you can.")
 
     else:
-        print("\n⚠️  No encontré 'aws'. Instalá AWS CLI y configuralo con 'aws configure'.")
+        print("\n⚠️  'aws' not found. Install AWS CLI and configure it with 'aws configure'.")
 
         # Avisos no intrusivos si faltan herramientas clave
     if not _shutil.which("sam"):
-        print("⚠️  No encontré 'sam' (AWS SAM CLI). Podés instalarlo o correr 'maws start --install-deps'.")
+        print("⚠️  'sam' (AWS SAM CLI) not found. Install it or run 'maws start --install-deps'.")
 
     if not _shutil.which("jq"):
-        print("⚠️  No encontré 'jq'. Es útil para el bootstrap; instalalo si ves errores relacionados.")
+        print("⚠️  'jq' not found. It is useful for the bootstrap; install it if you encounter related errors.")
 
 
-    print("\n👉 Próximos pasos:")
-    print("   1) Completá .env.prod con tus tokens.")
-    print("   2) (Opcional) Ajustá params.json, config.json y fns.py a gusto.")
-    print("   3) Deploy:   maws update   (o desde Python: maws.update())")
+    print("\n👉 Next steps:")
+    print("   1) Complete .env.prod with your tokens.")
+    print("   2) (Optional) Adjust params.json, config.json, and fns.py as needed.")
+    print("   3) Deploy:   maws update   (or from Python: maws.update())")
 
     return workdir
 
@@ -956,7 +956,7 @@ def _ask_bool(prompt: str, default: bool = True) -> bool:
     val = input(f"{prompt} ({sfx}): ").strip().lower()
     if not val:
         return default
-    return val in ("y", "yes", "1", "true", "si", "sí")
+    return val in ("y", "yes", "1", "true")
 
 def _effective_region(explicit: Optional[str], params: Dict) -> str:
     return (
@@ -979,12 +979,12 @@ def _save_params(conf_path: Path, data: Dict):
     conf_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 def _boto(region: Optional[str] = None):
-    """Clientes boto3 con región forzada si se pasa."""
+    """Return boto3 clients forcing the region when provided."""
     kw = {"region_name": region} if region else {}
     return (
         boto3.client("cloudformation", **kw),
         boto3.client("s3", **kw),
-        boto3.client("lambda", **kw),  # por si se quiere usar a futuro
+        boto3.client("lambda", **kw),  # kept in case it is needed later
     )
 
 # --- NUEVO: maws setup ---
@@ -993,14 +993,14 @@ def setup(
     project_dir: Optional[Union[str, Path]] = None,
 ) -> Path:
     """
-    Guía interactiva para completar/actualizar params.json con defaults seguros.
-    No toca otros archivos.
+    Interactive guide to complete/update params.json with safe defaults.
+    Leaves other files untouched.
     """
     workdir = Path(project_dir or Path.cwd())
     conf = workdir / (config_path or "params.json")
     data = _load_params(conf)
 
-    # defaults actuales (si existen) o razonables
+    # current defaults (if present) or reasonable fallbacks
     d_project = data.get("project", "my-bot")
     d_region  = data.get("region", "us-east-1")
     d_bot     = (data.get("bot") or "telegram").lower()
@@ -1008,9 +1008,9 @@ def setup(
         d_bot = "telegram"
 
     # prompts
-    project = _ask("Nombre del proyecto", d_project) or d_project
-    region  = _ask("Región AWS", d_region) or d_region
-    bot     = _ask("Tipo de bot (telegram/whatsapp)", d_bot) or d_bot
+    project = _ask("Project name", d_project) or d_project
+    region  = _ask("AWS region", d_region) or d_region
+    bot     = _ask("Bot type (telegram/whatsapp)", d_bot) or d_bot
     bot     = bot.lower() if bot in ("telegram", "whatsapp") else d_bot
 
     stack_name = _ask("CloudFormation stack_name", data.get("stack_name") or f"{project}-stack")
@@ -1019,12 +1019,12 @@ def setup(
     env_param_name = _ask("SSM env_param_name", data.get("env_param_name") or f"/{project}/prod/env")
     api_path       = _ask("API path", data.get("api_path") or "/webhook")
 
-    sync_tokens_s3 = _ask_bool("Sincronizar tokens desde S3 (SYNC_TOKENS_S3)", bool(data.get("sync_tokens_s3", True)))
-    tokens_prefix  = _ask("Prefijo S3 para tokens (TOKENS_S3_PREFIX)",
+    sync_tokens_s3 = _ask_bool("Sync tokens from S3 (SYNC_TOKENS_S3)", bool(data.get("sync_tokens_s3", True)))
+    tokens_prefix  = _ask("S3 prefix for tokens (TOKENS_S3_PREFIX)",
                           data.get("tokens_s3_prefix") or "secrets")
-    verbose        = _ask_bool("Verbose en Lambda (VERBOSE)", bool(data.get("verbose", False)))
+    verbose        = _ask_bool("Verbose mode in Lambda (VERBOSE)", bool(data.get("verbose", False)))
 
-    # actualizar estructura mínima
+    # update minimal structure
     data.update({
         "project": project,
         "region": region,
@@ -1040,7 +1040,7 @@ def setup(
     })
 
     _save_params(conf, data)
-    print(f"✅ Params escritos en {conf}")
+    print(f"✅ Params written to {conf}")
     return conf
 
 # --- NUEVO: maws describe ---
@@ -1051,23 +1051,23 @@ def describe(
     no_aws: bool = False,
 ) -> int:
     """
-    Describe el proyecto actual:
-      - Muestra archivos locales
-      - Lee params.json
-      - Si hay credenciales, consulta CloudFormation para outputs (ApiUrl)
+    Describe the current project:
+      - Show local files
+      - Read params.json
+      - If credentials are available, query CloudFormation for outputs (ApiUrl)
     """
     workdir = Path(project_dir or Path.cwd())
     conf = workdir / (config_path or "params.json")
     data = _load_params(conf)
 
-    print(f"\n📂 Proyecto en: {workdir}")
+    print(f"\n📂 Project at: {workdir}")
     print(f"   - params.json: {'OK' if conf.exists() else 'NO'}")
     print(f"   - config.json: {'OK' if (workdir/'config.json').exists() else 'NO'}")
     print(f"   - fns.py     : {'OK' if (workdir/'fns.py').exists() else 'NO'}")
     print(f"   - .env.prod  : {'OK' if (workdir/'.env.prod').exists() else 'NO'}")
 
     if not data:
-        print("\n⚠️  No encontré params.json legible. Ejecutá 'maws setup' o 'maws start'.")
+        print("\n⚠️  Could not find a readable params.json. Run 'maws setup' or 'maws start'.")
         return 1
 
     project = data.get("project", "my-bot")
@@ -1100,7 +1100,7 @@ def describe(
         if api_url:
             print(f"   - ApiUrl: {api_url}")
 
-        # existencia de buckets
+        # bucket existence
         def _bucket_exists(name: str) -> bool:
             try:
                 s3.head_bucket(Bucket=name)
@@ -1109,19 +1109,18 @@ def describe(
                 return False
 
         print("\n🪣 Buckets")
-        print(f"   - history_bucket    : {history_bucket}  ({'existe' if _bucket_exists(history_bucket) else 'no existe'})")
-        print(f"   - deployment_bucket : {deploy_bucket}  ({'existe' if _bucket_exists(deploy_bucket) else 'no existe'})")
+        print(f"   - history_bucket    : {history_bucket}  ({'exists' if _bucket_exists(history_bucket) else 'missing'})")
+        print(f"   - deployment_bucket : {deploy_bucket}  ({'exists' if _bucket_exists(deploy_bucket) else 'missing'})")
     except Exception as e:
-        print(f"\nℹ️  AWS no disponible o sin permisos: {e}")
+        print(f"\nℹ️  AWS unavailable or missing permissions: {e}")
 
     return 0
 
 # --- NUEVO: maws list (stacks) ---
 def list_projects(region: Optional[str] = None) -> List[Dict]:
     """
-    Lista stacks de CloudFormation en la región (filtra los que exponen Output 'ApiUrl').
-    Devuelve lista de dicts {stack, status, updated, api_url, region}.
-    También imprime una tabla simple.
+    List CloudFormation stacks in the region (filtering those that expose the 'ApiUrl' output).
+    Returns a list of dicts {stack, status, updated, api_url, region} and prints a simple table.
     """
     reg = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
     cf, *_ = _boto(reg)
@@ -1143,7 +1142,7 @@ def list_projects(region: Optional[str] = None) -> List[Dict]:
                     outputs = {o["OutputKey"]: o["OutputValue"] for o in st.get("Outputs", [])}
                     api_url = outputs.get("ApiUrl")
                     if not api_url:
-                        continue  # probablemente no es un stack MAWS
+                        continue  # likely not a MAWS stack
                     updated = st.get("LastUpdatedTime") or st.get("CreationTime")
                     out_rows.append({
                         "stack": name,
@@ -1155,12 +1154,12 @@ def list_projects(region: Optional[str] = None) -> List[Dict]:
                 except Exception:
                     continue
     except Exception as e:
-        print(f"ℹ️  No pude listar stacks en {reg}: {e}")
+        print(f"ℹ️  Could not list stacks in {reg}: {e}")
         return []
 
     # print simple table
     if out_rows:
-        print("\nStacks MAWS en", reg)
+        print("\nMAWS stacks in", reg)
         print("".ljust(80, "-"))
         print(f"{'STACK':35}  {'STATUS':22}  {'UPDATED':19}  {'API URL'}")
         print("".ljust(80, "-"))
@@ -1168,13 +1167,13 @@ def list_projects(region: Optional[str] = None) -> List[Dict]:
             print(f"{r['stack'][:35]:35}  {r['status'][:22]:22}  {r['updated'][:19]:19}  {r['api_url']}")
         print("".ljust(80, "-"))
     else:
-        print(f"\n(no hay stacks MAWS detectados en {reg})")
+        print(f"\n(no MAWS stacks detected in {reg})")
 
     return out_rows
 
 # --- NUEVO: remove_project ---
 def _empty_bucket(s3, bucket: str):
-    """Borra objetos y versiones (si hay versioning) para permitir eliminar bucket/stack."""
+    """Delete objects and versions (if versioning is enabled) to allow bucket/stack removal."""
     try:
         # versiones y delete-markers
         paginator = s3.get_paginator("list_object_versions")
@@ -1197,7 +1196,7 @@ def _empty_bucket(s3, bucket: str):
     except s3.exceptions.NoSuchBucket:
         return
     except Exception as e:
-        print(f"⚠️  No pude vaciar bucket {bucket}: {e}")
+        print(f"⚠️  Could not empty bucket {bucket}: {e}")
 
 def remove_project(
     project: Optional[str] = None,
@@ -1209,11 +1208,11 @@ def remove_project(
     wait: bool = False,
 ) -> int:
     """
-    Borra recursos AWS del proyecto:
-      - Vacía bucket de historial
-      - Elimina stack de CloudFormation (API/Lambda/DDB, etc.)
-      - Opcional: elimina deployment bucket (si no keep_deploy_bucket)
-    Toma nombres desde params.json si no se pasan explícitos.
+    Delete AWS resources for the project:
+      - Empty the history bucket
+      - Remove the CloudFormation stack (API/Lambda/DDB, etc.)
+      - Optionally delete the deployment bucket (if keep_deploy_bucket is False)
+    Pulls names from params.json when not provided explicitly.
     """
     workdir = Path(project_dir or Path.cwd())
     conf = workdir / (config_path or "params.json")
@@ -1221,7 +1220,7 @@ def remove_project(
 
     proj = project or data.get("project")
     if not proj:
-        print("❌ No pude determinar 'project'. Pasalo con --project o setealo en params.json.")
+        print("❌ Could not determine 'project'. Pass it with --project or set it in params.json.")
         return 2
 
     reg = _effective_region(region, data)
@@ -1229,48 +1228,48 @@ def remove_project(
     history_bucket = data.get("history_bucket") or f"{proj}-history-bucket"
     deploy_bucket  = data.get("deployment_bucket") or f"{proj}-deployment-bucket"
 
-    print("\n🚨 Plan de eliminación")
-    print(f"   Región:           {reg}")
-    print(f"   Stack a borrar:   {stack}")
-    print(f"   Vaciar bucket:    {history_bucket}")
+    print("\n🚨 Deletion plan")
+    print(f"   Region:           {reg}")
+    print(f"   Stack to delete:  {stack}")
+    print(f"   Empty bucket:     {history_bucket}")
     if not keep_deploy_bucket:
-        print(f"   Borrar bucket:    {deploy_bucket} (deployment)")
+        print(f"   Delete bucket:    {deploy_bucket} (deployment)")
     else:
-        print(f"   Conservar bucket: {deploy_bucket} (deployment)")
+        print(f"   Keep bucket:      {deploy_bucket} (deployment)")
 
-    if not yes and not _ask_bool("¿Continuar?", False):
-        print("Abortado.")
+    if not yes and not _ask_bool("Continue?", False):
+        print("Aborted.")
         return 1
 
     cf, s3, _ = _boto(reg)
 
-    # Vaciar history bucket (para que CFN pueda borrarlo)
-    print(f"🧹 Vaciando s3://{history_bucket} …")
+    # Empty history bucket (so CloudFormation can delete it)
+    print(f"🧹 Emptying s3://{history_bucket} …")
     _empty_bucket(s3, history_bucket)
 
-    # Eliminar stack
-    print(f"🗑️  Eliminando stack {stack} …")
+    # Delete stack
+    print(f"🗑️  Deleting stack {stack} …")
     try:
         cf.delete_stack(StackName=stack)
         if wait:
             waiter = cf.get_waiter("stack_delete_complete")
-            print("⏳ Esperando a que termine la eliminación del stack…")
+            print("⏳ Waiting for stack deletion to finish…")
             waiter.wait(StackName=stack)
-            print("✅ Stack eliminado.")
+            print("✅ Stack deleted.")
         else:
-            print("➡️  Eliminación iniciada (asíncrona).")
+            print("➡️  Deletion started (asynchronous).")
     except Exception as e:
-        print(f"⚠️  Error al borrar stack: {e}")
+        print(f"⚠️  Error deleting stack: {e}")
 
-    # Deployment bucket (fuera del stack) – borrar si se pidió
+    # Deployment bucket (outside the stack) – delete if requested
     if not keep_deploy_bucket:
-        print(f"🧹 Vaciando s3://{deploy_bucket} …")
+        print(f"🧹 Emptying s3://{deploy_bucket} …")
         _empty_bucket(s3, deploy_bucket)
         try:
             s3.delete_bucket(Bucket=deploy_bucket)
-            print("✅ Deployment bucket eliminado.")
+            print("✅ Deployment bucket deleted.")
         except Exception as e:
-            print(f"⚠️  No pude eliminar deployment bucket: {e}")
+            print(f"⚠️  Could not delete deployment bucket: {e}")
 
-    print("🧾 Listo. Algunos recursos pueden tardar unos minutos en desaparecer por completo.")
+    print("🧾 Done. Some resources may take a few minutes to disappear completely.")
     return 0

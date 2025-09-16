@@ -1,22 +1,22 @@
 # maws — MAS on AWS (Lambda + API Gateway)
 
-**maws** es una librería auxiliar para desplegar bots de la librería **MAS** en **AWS Lambda** detrás de **API Gateway**, con:
+**maws** is a helper library for deploying **MAS** bots on **AWS Lambda** behind **API Gateway**, featuring:
 
-* inicialización perezosa del `AgentSystemManager`
-* manejo de webhooks para **WhatsApp** y **Telegram**
-* verificación de webhook (WhatsApp)
-* **auto-invocación** para procesar en segundo plano (evita timeouts de API Gateway)
-* **locking** por usuario con **DynamoDB TTL** para evitar concurrencia cruzada
-* sincronización de **tokens/keys** entre **S3** y el FS efímero `/tmp`
-* carga de configuración desde **SSM Parameter Store** (SecureString)
+* lazy initialization of `AgentSystemManager`
+* webhook handling for **WhatsApp** and **Telegram**
+* webhook verification (WhatsApp)
+* **self-invocation** to process work in the background (avoids API Gateway timeouts)
+* per-user **locking** with **DynamoDB TTL** to avoid concurrent processing
+* synchronization of **tokens/keys** between **S3** and the ephemeral `/tmp` filesystem
+* configuration loading from **SSM Parameter Store** (SecureString)
 
-> Si ya usás MAS, maws te permite reducir tu `lambda_function.py` a \~3 líneas.
+> If you already use MAS, maws lets you shrink your `lambda_function.py` to roughly three lines.
 
 ---
 
-## Instalación
+## Installation
 
-### pip (desde subdirectorio del repo)
+### pip (from the repository subdirectory)
 
 ```bash
 pip install \
@@ -24,9 +24,9 @@ pip install \
   "git+https://github.com/mneuronico/multi-agent-system-library.git"
 ```
 
-* La primera línea instala **maws** (subcarpeta `maws`).
-* La segunda instala **MAS** (raíz del repo).
-* También podés **pinear a un commit/tag**:
+* The first line installs **maws** (the `maws` subfolder).
+* The second installs **MAS** (repository root).
+* You can also **pin to a commit/tag**:
 
 ```bash
 pip install \
@@ -34,7 +34,7 @@ pip install \
   "git+https://github.com/mneuronico/multi-agent-system-library.git@<commit>"
 ```
 
-### `requirements.txt` (ejemplo)
+### `requirements.txt` example
 
 ```txt
 boto3
@@ -43,16 +43,16 @@ git+https://github.com/mneuronico/multi-agent-system-library.git#subdirectory=ma
 git+https://github.com/mneuronico/multi-agent-system-library.git
 ```
 
-> **Notas**
+> **Notes**
 >
-> * `boto3` y `botocore` son dependencias de runtime en Lambda; incluir `boto3` en tus deps está bien aunque Lambda lo provea.
-> * MAS es dependencia de maws (se importa como `from mas import AgentSystemManager, WhatsappBot, TelegramBot`).
+> * `boto3` and `botocore` are Lambda runtime dependencies; including `boto3` in your dependencies is fine even though Lambda provides it.
+> * MAS is a dependency of maws (imported as `from mas import AgentSystemManager, WhatsappBot, TelegramBot`).
 
 ---
 
-## Uso rápido
+## Quick usage
 
-Tu `lambda_function.py` puede quedar así de simple:
+Your `lambda_function.py` can be this simple:
 
 ```python
 # lambda_function.py
@@ -63,68 +63,68 @@ BOT_TYPE = os.environ.get("BOT_TYPE", "whatsapp")  # "whatsapp" | "telegram"
 lambda_handler = build_lambda_handler(BOT_TYPE)
 ```
 
-Eso es todo. `maws` hace el wiring con MAS, maneja GET/POST del webhook, colas por auto-invocación, import/export de historial, locks, etc.
+That's it. `maws` wires everything to MAS, handles webhook GET/POST, background processing via self-invocation, history import/export, locks, and more.
 
 ---
 
-## Variables de entorno (contrato)
+## Environment variables (contract)
 
-| Variable                   | Obligatorio | Default      | Descripción                                                        |
-| -------------------------- | ----------- | ------------ | ------------------------------------------------------------------ |
-| `BOT_TYPE`                 | No          | `"whatsapp"` | `"whatsapp"` o `"telegram"`.                                       |
-| `VERBOSE`                  | No          | `"false"`    | `true/false` para logging detallado de MAS y bots.                 |
-| `BUCKET_NAME`              | **Sí**      | —            | S3 con historiales y (opcional) tokens/keys.                       |
-| `ENV_PARAMETER_NAME`       | No          | —            | Nombre del parámetro **SSM** (SecureString) con `.env` a inyectar. |
-| `SYNC_TOKENS_S3`           | No          | `"true"`     | Si está `true`, busca tokens en S3 antes que en el paquete.        |
-| `TOKENS_S3_PREFIX`         | No          | `"secrets"`  | Prefijo en S3 para tokens/keys (p. ej. `secrets/<archivo>`).       |
-| `SPECIAL_TOKEN_FILES_JSON` | No          | `"[]"`       | JSON con lista de archivos de token a sincronizar hacia `/tmp`.    |
-| `TOKEN_ENV_MAP_JSON`       | No          | `"{}"`       | JSON `{ "archivo": "ENV_VAR" }` para exponer rutas en env.         |
-| `LOCKS_TABLE_NAME`         | No          | —            | Nombre de tabla DynamoDB para **locking** por usuario.             |
-| `LOCK_TTL_SECONDS`         | No          | `"180"`      | TTL del lock (segundos).                                           |
+| Variable                   | Required | Default      | Description                                                         |
+| -------------------------- | -------- | ------------ | ------------------------------------------------------------------- |
+| `BOT_TYPE`                 | No       | `"whatsapp"` | `"whatsapp"` or `"telegram"`.                                        |
+| `VERBOSE`                  | No       | `"false"`    | `true/false` for detailed logging in MAS and the bots.               |
+| `BUCKET_NAME`              | **Yes**  | —            | S3 bucket with histories and (optionally) tokens/keys.               |
+| `ENV_PARAMETER_NAME`       | No       | —            | **SSM** (SecureString) parameter containing the `.env` to inject.    |
+| `SYNC_TOKENS_S3`           | No       | `"true"`     | When `true`, fetch tokens from S3 before falling back to the package.|
+| `TOKENS_S3_PREFIX`         | No       | `"secrets"`  | S3 prefix for tokens/keys (e.g., `secrets/<file>`).                  |
+| `SPECIAL_TOKEN_FILES_JSON` | No       | `"[]"`       | JSON list of token file names to sync into `/tmp`.                   |
+| `TOKEN_ENV_MAP_JSON`       | No       | `"{}"`       | JSON `{ "file": "ENV_VAR" }` to expose file paths via env vars.      |
+| `LOCKS_TABLE_NAME`         | No       | —            | DynamoDB table name for per-user **locking**.                        |
+| `LOCK_TTL_SECONDS`         | No       | `"180"`      | Lock TTL (seconds).                                                  |
 
-### ¿Cómo funcionan los tokens?
+### How do tokens work?
 
-* **SPECIAL\_TOKEN\_FILES\_JSON**: lista de nombres de archivos (p. ej. `["openai.key", "facebook.json"]`).
-  maws intentará:
+* **SPECIAL_TOKEN_FILES_JSON**: list of file names (e.g., `["openai.key", "facebook.json"]`).
+  maws will attempt to:
 
-  1. Descargar `s3://BUCKET_NAME/TOKENS_S3_PREFIX/<archivo>` → `/tmp/<archivo>`, o
-  2. Copiar `<archivo>` desde el **paquete** (read-only) → `/tmp/<archivo>` (fallback).
+  1. Download `s3://BUCKET_NAME/TOKENS_S3_PREFIX/<file>` → `/tmp/<file>`, or
+  2. Copy `<file>` from the **package** (read-only) → `/tmp/<file>` as fallback.
 
-* **TOKEN\_ENV\_MAP\_JSON**: mapa para **exponer** el path en env; ej:
+* **TOKEN_ENV_MAP_JSON**: map to **expose** the path via environment variables, e.g.:
 
   ```json
   { "facebook.json": "FACEBOOK_CREDENTIALS_PATH", "openai.key": "OPENAI_API_KEY_PATH" }
   ```
 
-  De esta forma, tu código puede leer `os.environ["FACEBOOK_CREDENTIALS_PATH"]` y abrir el archivo.
+  This lets your code read `os.environ["FACEBOOK_CREDENTIALS_PATH"]` and open the file.
 
 ---
 
-## API de maws
+## maws API
 
 ### `build_lambda_handler(bot_type: str) -> Callable`
 
-Devuelve un **handler de Lambda** ya configurado para el bot indicado.
+Returns a **Lambda handler** already configured for the chosen bot.
 
-* Inicializa perezosamente `AgentSystemManager`.
-* Instancia el bot MAS (`WhatsappBot` / `TelegramBot`) con `verbose` desde `VERBOSE`.
-* GET (WhatsApp): llama `handle_webhook_verification` del bot.
-* POST: **auto-invoca** a la misma Lambda con payload “de trabajo” (modo background).
-* En el “segundo salto”:
+* Lazily initializes `AgentSystemManager`.
+* Instantiates the MAS bot (`WhatsappBot` / `TelegramBot`) with `verbose` coming from `VERBOSE`.
+* GET (WhatsApp): calls `handle_webhook_verification` on the bot.
+* POST: **self-invokes** the same Lambda with a “worker” payload (background mode).
+* In the “second hop”:
 
-  * Toma **lock** por `user_id` (DynamoDB) si `LOCKS_TABLE_NAME` está definido; si el lock existe, **ignora** el update.
-  * **Importa** historial desde S3 si existe.
-  * Ejecuta `process_webhook_update`.
-  * **Exporta** historial a S3.
-  * **Libera** lock (o TTL lo limpiará).
+  * Takes a **lock** per `user_id` (DynamoDB) if `LOCKS_TABLE_NAME` is set; if the lock exists, it **ignores** the update.
+  * **Imports** history from S3 if present.
+  * Executes `process_webhook_update`.
+  * **Exports** history to S3.
+  * **Releases** the lock (or TTL cleans it up).
 
-No necesitás tocar nada en tu bot/clase base **MAS**.
+You do not need to change anything inside your MAS bot/base class.
 
 ---
 
-## IAM / CloudFormation (ejemplo SAM)
+## IAM / CloudFormation (SAM example)
 
-Agregá algo similar a esto en tu `template.yaml` (resumen):
+Add something like this to your `template.yaml` (summary):
 
 ```yaml
 Resources:
@@ -186,62 +186,62 @@ Resources:
           Properties: { Path: "/webhook", Method: post }
 ```
 
-> Cambiá GET/POST según **WhatsApp** (GET+POST) o **Telegram** (POST-only).
+> Switch GET/POST according to **WhatsApp** (GET+POST) or **Telegram** (POST only).
 
 ---
 
-## Patrón de auto-invocación
+## Self-invocation pattern
 
-Para evitar timeouts de API Gateway, maws:
+To avoid API Gateway timeouts, maws:
 
-1. Responde **rápido** al POST (200 OK).
-2. Se **auto-invoca** con el payload real para procesar en background.
-3. Usa DynamoDB TTL como cerrojo por usuario (`user_id`) para evitar duplicados si llegan mensajes muy seguidos.
+1. Responds **quickly** to the POST (200 OK).
+2. **Self-invokes** with the actual payload to process in the background.
+3. Uses DynamoDB TTL as a per-user lock (`user_id`) to avoid duplicates when messages arrive in rapid succession.
 
-Si no configurás `LOCKS_TABLE_NAME`, el locking queda **deshabilitado** (comportamiento “best-effort”).
+If you do not configure `LOCKS_TABLE_NAME`, locking is **disabled** (best-effort behavior).
 
 ---
 
-## Carga de entorno desde SSM
+## Loading environment from SSM
 
-Si definís `ENV_PARAMETER_NAME`, maws leerá ese parámetro **SecureString** (estilo `.env`) y exportará **todas** sus claves al `os.environ` **sin** pisar variables ya presentes.
+If `ENV_PARAMETER_NAME` is set, maws reads that **SecureString** parameter (in `.env` format) and exports **all** keys to `os.environ` **without** overriding already-present variables.
 
-Formato admitido:
+Accepted format:
 
 ```
-# comentario
+# comment
 KEY=VALUE
-OTRA=VAL
+ANOTHER=VAL
 ```
 
 ---
 
-## Historias de usuario / archivos
+## User histories and files
 
-* Historias por usuario se guardan como SQLite en S3 bajo `history/<chat_id>.sqlite`.
-* maws importa/expota automáticamente alrededor del procesamiento.
-* Para **tokens** definidos en `SPECIAL_TOKEN_FILES_JSON`, sincroniza S3 → `/tmp` (o paquete → `/tmp` si no hay en S3) y opcionalmente expone rutas con `TOKEN_ENV_MAP_JSON`.
+* User histories are stored as SQLite files in S3 under `history/<chat_id>.sqlite`.
+* maws automatically imports/exports around processing.
+* For **tokens** defined in `SPECIAL_TOKEN_FILES_JSON`, it syncs S3 → `/tmp` (or package → `/tmp` if missing in S3) and can optionally expose paths via `TOKEN_ENV_MAP_JSON`.
 
 ---
 
 ## Logging
 
-* `VERBOSE=true` activa trazas detalladas en bots/MAS.
-* CloudWatch Logs centraliza los logs de Lambda (costo bajo; recordá rotar).
+* `VERBOSE=true` enables detailed traces in bots/MAS.
+* CloudWatch Logs centralizes Lambda logs (low cost; remember to rotate).
 
 ---
 
-## Requisitos
+## Requirements
 
-* Python 3.9+ (compatible con runtime `python3.9` de Lambda).
-* AWS: S3, API Gateway, (opcional) DynamoDB, (opcional) SSM Parameter Store.
-* Librerías: `mas`, `boto3`, `requests` (más las transitivas).
+* Python 3.9+ (compatible with the Lambda `python3.9` runtime).
+* AWS: S3, API Gateway, (optional) DynamoDB, (optional) SSM Parameter Store.
+* Libraries: `mas`, `boto3`, `requests` (plus their transitive dependencies).
 
 ---
 
-## Ejemplo mínimo end-to-end
+## Minimal end-to-end example
 
-**lambda\_function.py**
+**lambda_function.py**
 
 ```python
 import os
@@ -259,24 +259,24 @@ git+https://github.com/mneuronico/multi-agent-system-library.git#subdirectory=ma
 git+https://github.com/mneuronico/multi-agent-system-library.git
 ```
 
-**template.yaml**: ver sección IAM / CloudFormation.
+**template.yaml**: see the IAM / CloudFormation section above.
 
 ---
 
-## Preguntas frecuentes
+## Frequently asked questions
 
-**¿Puedo usar maws sin DynamoDB?**
-Sí. Omití `LOCKS_TABLE_NAME` y se desactiva el locking.
+**Can I use maws without DynamoDB?**
+Yes. Omit `LOCKS_TABLE_NAME` to disable locking.
 
-**¿Qué pasa si no tengo tokens en S3?**
-maws intentará copiarlos desde el **paquete** (raíz del zip) a `/tmp`. Si no existen, loguea aviso y sigue.
+**What if I don't have tokens in S3?**
+maws will try to copy them from the **package** (zip root) to `/tmp`. If they do not exist, it logs a warning and continues.
 
-**¿Necesito MAS para usar maws?**
-Sí. maws hace de “pegamento” entre AWS y **MAS**.
+**Do I need MAS to use maws?**
+Yes. maws acts as the “glue” between AWS and **MAS**.
 
 ---
 
-## Versionado y licencias
+## Versioning and licensing
 
-* Versionado en `maws/__init__.py` (ej. `__version__ = "0.1.0"`).
-* Ver **LICENSE** en el repositorio principal.
+* Versioning lives in `maws/__init__.py` (e.g., `__version__ = "0.1.0"`).
+* See the main repository **LICENSE** for licensing details.

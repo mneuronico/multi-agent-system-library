@@ -201,7 +201,7 @@ def get_calendar(manager, start_date: str, end_date: str, calendar_id: str):
     service = build('calendar', 'v3', developerKey=API_KEY)
 
     try:
-        # Llamar a la API para obtener eventos
+        # Call the API to retrieve events
         events_result = service.events().list(
             calendarId=calendar_id,
             timeMin=start_datetime.isoformat(),
@@ -210,25 +210,25 @@ def get_calendar(manager, start_date: str, end_date: str, calendar_id: str):
             orderBy='startTime'
         ).execute()
 
-        # Obtener eventos
+        # Extract events
         events = events_result.get('items', [])
 
-        # Crear la lista de eventos en el formato solicitado
+        # Build the list of events in the requested format
         event_list = []
         for event in events:
             event_data = {
-                "summary": event.get("summary", "Sin título"),
-                "description": event.get("description", "No disponible"),
+                "summary": event.get("summary", "Untitled"),
+                "description": event.get("description", "Not available"),
                 "start": event['start'].get('dateTime', event['start'].get('date')),
                 "end": event['end'].get('dateTime', event['end'].get('date')),
-                "location": event.get("location", "No especificada")
+                "location": event.get("location", "Not specified")
             }
             event_list.append(event_data)
 
         return {"event_list": event_list}
 
     except Exception as e:
-        print(f"Error al obtener eventos: {e}")
+        print(f"Error retrieving events: {e}")
         return {"error": str(e)}
     
 def find_food_places(manager, radius, keyword, location):
@@ -236,7 +236,7 @@ def find_food_places(manager, radius, keyword, location):
 
     google_api_key = manager.get_key("PLACES_API_KEY")
     lat, lng = get_lat_lng(google_api_key, address=location)
-    location = f"{lat},{lng}"  # Formato "latitud,longitud"
+    location = f"{lat},{lng}"  # Format "latitude,longitude"
     endpoint = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     params = {
         "key": google_api_key,
@@ -253,7 +253,7 @@ def find_food_places(manager, radius, keyword, location):
 
     results_list = []
 
-    # Obtener detalles de los lugares
+    # Retrieve place details
     for place in food_places:
         try:
             details = get_place_details(google_api_key, place["place_id"])
@@ -279,13 +279,13 @@ def get_lat_lng(api_key, address):
     if response.status_code == 200:
         data = response.json()
         if data['status'] == 'OK':
-            # Extrae latitud y longitud del primer resultado
+            # Extract latitude and longitude from the first result
             location = data['results'][0]['geometry']['location']
             return location['lat'], location['lng']
         else:
-            raise Exception(f"Error de Geocoding API: {data['status']}")
+            raise Exception(f"Geocoding API error: {data['status']}")
     else:
-        raise Exception(f"La solicitud a la API falló con el código de estado {response.status_code}")
+        raise Exception(f"The API request failed with status code {response.status_code}")
     
 def get_place_details(api_key, place_id):
     import requests
@@ -302,16 +302,16 @@ def get_place_details(api_key, place_id):
     if response.status_code == 200:
         return response.json()
     else:
-        raise Exception(f"La solicitud a la API falló con el código de estado {response.status_code}")
+        raise Exception(f"The API request failed with status code {response.status_code}")
     
 def api_formatting(data):
     """
-    Filtra y organiza los resultados según estén dentro o fuera del radio solicitado.
+    Filter and organize the results based on whether they fall within the requested radius.
     """
     parsed_data = []
 
     for result in data.get('results', []):
-        # Arma la información básica de cada lugar
+        # Build the basic information for each place
         place_info = {
             "name": result.get("name"),
             "place_id": result.get("place_id"),
@@ -319,28 +319,28 @@ def api_formatting(data):
             "price_level": result.get("price_level"),
             "formatted_address": result.get("vicinity"),
             "opening_hours": result.get("opening_hours", {}).get("open_now", "N/A"),
-            "website": result.get("website", "No Disponible"),
-            "formatted_phone_number": result.get("formatted_phone_number", "No Disponible")
+            "website": result.get("website", "Not available"),
+            "formatted_phone_number": result.get("formatted_phone_number", "Not available")
         }
 
-        # Mantén la estructura original en parsed_data
+        # Preserve the original structure inside parsed_data
         parsed_data.append(place_info)
 
-    # Devuelve tanto los datos clasificados como la estructura original
+    # Return both the classified data and the original structure
     return parsed_data
 
 def api_formatting_2(results, max_results = 5):
     formatted_results = []
 
     for result in results:
-        # Extraer campos relevantes
+        # Extract relevant fields
         data = result.get('result', {})
         formatted_result = {
             'name': data.get('name'),
             'formatted_address': data.get('formatted_address'),
             'rating': data.get('rating', 0),
-            'user_ratings_total': data.get('user_ratings_total', 0),  # Por defecto 0 si no está disponible
-            'price_level': data.get('price_level', 'N/A'),  # 'N/A' si no está disponible
+            'user_ratings_total': data.get('user_ratings_total', 0),  # Default to 0 if not available
+            'price_level': data.get('price_level', 'N/A'),  # 'N/A' if not available
             'opening_hours': data.get('opening_hours', {}).get('weekday_text', []),
             'open_now': data.get('opening_hours', {}).get('open_now', 'N/A'),
             'phone_number': data.get('formatted_phone_number', 'N/A'),
@@ -349,7 +349,7 @@ def api_formatting_2(results, max_results = 5):
             'reviews': data.get('reviews', [])[:3]
         }
 
-        # Añadir cada resultado formateado a la lista
+        # Add each formatted result to the list
         formatted_results.append(formatted_result)
         
         if len(formatted_results) >= max_results:

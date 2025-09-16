@@ -6,24 +6,24 @@ CONF="params.json"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -c|--config) CONF="$2"; shift 2 ;;
-    *) echo "Arg desconocido: $1"; exit 1 ;;
+    *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
 
-[[ -f "${CONF}" ]] || { echo "No existe ${CONF}"; exit 1; }
+[[ -f "${CONF}" ]] || { echo "${CONF} not found"; exit 1; }
 
 # --- Checks ---
-need() { command -v "$1" >/dev/null 2>&1 || { echo "Falta '$1' en PATH"; exit 1; }; }
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing '$1' in PATH"; exit 1; }; }
 need aws
 need sam
 need jq
 need sed
 
-[[ -f ".env.prod" ]] || { echo "Falta .env.prod"; exit 1; }
-[[ -f "${CONF}" ]] || { echo "No existe ${CONF}"; exit 1; }
+[[ -f ".env.prod" ]] || { echo ".env.prod is missing"; exit 1; }
+[[ -f "${CONF}" ]] || { echo "${CONF} not found"; exit 1; }
 
-# --- Leer config ---
-echo ">> Leyendo config: ${CONF}"
+# --- Read config ---
+echo ">> Reading config: ${CONF}"
 
 PROJECT=$(jq -r '.project' "${CONF}")
 REGION=$(jq -r '.region' "${CONF}")
@@ -60,9 +60,9 @@ TOKEN_ENV_MAP=$(jq -c '.token_env_map // {}' "${CONF}")
 mapfile -t EXTRA_REQ < <(jq -r '.extra_requirements[]?' "${CONF}" 2>/dev/null || true)
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-echo ">> Cuenta AWS: ${ACCOUNT_ID}  Región: ${REGION}"
+echo ">> AWS account: ${ACCOUNT_ID}  Region: ${REGION}"
 
-# --- Helpers para logical IDs (solo letras/números y empezando con letra) ---
+# --- Helpers for logical IDs (letters/numbers only and starting with a letter) ---
 to_camel_case() {
   # "casancrem-2" -> "Casancrem2"
   local s="$1"
@@ -80,13 +80,13 @@ PROJECT_LOGICAL="$(logical_id "$PROJECT")"
 FUNC_ID="${PROJECT_LOGICAL}Function"
 BUCKET_ID="${PROJECT_LOGICAL}HistoryBucket"
 
-# --- Cargar .env.prod en ambiente (para setWebhook, etc.) ---
+# --- Load .env.prod into the environment (for setWebhook, etc.) ---
 set -a
 source ./.env.prod
 set +a
 
 # --- requirements.txt ---
-echo ">> Generando requirements.txt"
+echo ">> Generating requirements.txt"
 {
   echo "requests"
   echo "boto3"
@@ -95,7 +95,7 @@ echo ">> Generando requirements.txt"
 } | awk 'NF' | sort -u > requirements.txt
 
 # --- .samignore ---
-echo ">> Generando .samignore"
+echo ">> Generating .samignore"
 cat > .samignore <<'EOF'
 .aws-sam/
 __pycache__/
@@ -113,7 +113,7 @@ params.json
 EOF
 
 # --- samconfig.toml ---
-echo ">> Generando samconfig.toml"
+echo ">> Generating samconfig.toml"
 cat > samconfig.toml <<EOF
 version = 0.1
 [default]
@@ -128,10 +128,10 @@ capabilities = "CAPABILITY_IAM"
 image_repositories = []
 EOF
 
-# --- Lambda común (plantillas) ---
+# --- Common Lambda (templates) ---
 
-# --- Escribir lambda_function.py mínimo ---
-echo ">> Generando lambda_function.py (${BOT})"
+# --- Write minimal lambda_function.py ---
+echo ">> Generating lambda_function.py (${BOT})"
 cat > lambda_function.py <<'PY'
 import os
 from maws import build_lambda_handler
@@ -141,7 +141,7 @@ lambda_handler = build_lambda_handler(BOT_TYPE)
 PY
 
 # --- template.yaml ---
-echo ">> Generando template.yaml"
+echo ">> Generating template.yaml"
 cat > template.yaml <<EOF
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
@@ -223,7 +223,7 @@ Resources:
           BUCKET_NAME: "${HISTORY_BUCKET}"
           ENV_PARAMETER_NAME: "${ENV_PARAM}"
 
-          # Tokens / archivos
+          # Tokens / files
           SYNC_TOKENS_S3: "${SYNC_TOKENS_S3}"
           TOKENS_S3_PREFIX: "${TOKENS_PREFIX}"
           SPECIAL_TOKEN_FILES_JSON: '${SPECIAL_JSON}'
@@ -262,8 +262,8 @@ Outputs:
     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
 EOF
 
-# --- Crear deployment bucket si no existe ---
-echo ">> Asegurando bucket de deployment: ${DEPLOY_BUCKET}"
+# --- Create deployment bucket if it doesn't exist ---
+echo ">> Ensuring deployment bucket: ${DEPLOY_BUCKET}"
 if ! aws s3api head-bucket --bucket "${DEPLOY_BUCKET}" 2>/dev/null; then
   aws s3 mb "s3://${DEPLOY_BUCKET}" --region "${REGION}"
 fi
@@ -272,8 +272,8 @@ fi
 echo ">> sam build"
 sam build
 
-# --- Subir .env.prod a SSM ---
-echo ">> Subiendo .env.prod a SSM: ${ENV_PARAM}"
+# --- Upload .env.prod to SSM ---
+echo ">> Uploading .env.prod to SSM: ${ENV_PARAM}"
 aws ssm put-parameter \
   --name "${ENV_PARAM}" \
   --type "SecureString" \
@@ -285,14 +285,14 @@ aws ssm put-parameter \
 echo ">> sam deploy"
 sam deploy --no-confirm-changeset
 
-# --- Obtener API URL ---
+# --- Retrieve API URL ---
 API_URL=$(aws cloudformation describe-stacks \
   --stack-name "${STACK}" \
   --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
   --output text --region "${REGION}")
 
 if [[ -z "${API_URL}" || "${API_URL}" == "None" ]]; then
-  echo "No pude obtener ApiUrl desde outputs. Revisá CloudFormation."
+  echo "Could not get ApiUrl from outputs. Check CloudFormation."
   exit 1
 fi
 
@@ -300,7 +300,7 @@ WEBHOOK_URL="${API_URL}$(printf "%s" "${API_PATH}")"
 echo ">> API URL: ${API_URL}"
 echo ">> Webhook full URL: ${WEBHOOK_URL}"
 
-# --- Estado local para no repetir setWebhook ---
+# --- Local state to avoid repeating setWebhook ---
 STATE_FILE=".bootstrap_state.json"
 touch "${STATE_FILE}"
 
@@ -308,27 +308,27 @@ if [[ "${BOT}" == "telegram" ]]; then
   KEY="${TELEGRAM_ENV_KEY:-TELEGRAM_TOKEN}"
   TOKEN="${!KEY:-}"
   if [[ -z "${TOKEN}" ]]; then
-    echo "⚠️  No encontré ${KEY} en .env.prod; no puedo setear Telegram webhook."
+    echo "⚠️  Could not find ${KEY} in .env.prod; cannot set the Telegram webhook."
   else
     PREV=$(jq -r '."telegram_webhook" // empty' "${STATE_FILE}" 2>/dev/null || true)
     if [[ "${PREV}" != "${WEBHOOK_URL}" ]]; then
-      echo ">> Seteando webhook de Telegram…"
+      echo ">> Setting Telegram webhook…"
       curl -s "https://api.telegram.org/bot${TOKEN}/setWebhook" \
         -d "url=${WEBHOOK_URL}" >/dev/null
       tmp=$(mktemp)
       jq --arg url "${WEBHOOK_URL}" '.telegram_webhook=$url' "${STATE_FILE}" 2>/dev/null > "$tmp" || echo "{\"telegram_webhook\":\"${WEBHOOK_URL}\"}" > "$tmp"
       mv "$tmp" "${STATE_FILE}"
-      echo "✅ Telegram webhook seteado a: ${WEBHOOK_URL}"
+      echo "✅ Telegram webhook set to: ${WEBHOOK_URL}"
     else
-      echo "Webhook Telegram ya estaba seteado; omito."
+      echo "Telegram webhook was already set; skipping."
     fi
   fi
 else
-  echo "ℹ️  WhatsApp Webhooks:"
-  echo "    - Configurá en Meta Developers el callback URL:"
+  echo "ℹ️  WhatsApp webhooks:"
+  echo "    - Configure the callback URL in Meta Developers:"
   echo "      ${WEBHOOK_URL}"
-  echo "    - Verify token (de .env.prod) => clave: ${WHATSAPP_VERIFY_ENV_KEY:-WHATSAPP_VERIFY_TOKEN}"
-  echo "    - Recordá agregar el mismo verify token en tu app de Meta."
+  echo "    - Verify token (from .env.prod) => key: ${WHATSAPP_VERIFY_ENV_KEY:-WHATSAPP_VERIFY_TOKEN}"
+  echo "    - Remember to add the same verify token in your Meta app."
 fi
 
-echo "✅ Listo."
+echo "✅ Done."

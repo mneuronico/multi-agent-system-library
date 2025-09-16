@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Defaults
 CONF="params.json"
-DEST="./history"        # carpeta local destino
-PREFIX="history"        # prefijo en S3 (carpeta lógica)
+DEST="./history"        # local destination folder
+PREFIX="history"        # S3 prefix (logical folder)
 
 # Args
 while [[ $# -gt 0 ]]; do
@@ -12,34 +12,34 @@ while [[ $# -gt 0 ]]; do
     -c|--config) CONF="$2"; shift 2 ;;
     -d|--dest)   DEST="$2"; shift 2 ;;
     -p|--prefix) PREFIX="$2"; shift 2 ;;
-    *) echo "Arg desconocido: $1"; exit 1 ;;
+    *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
 
 # Checks
-need() { command -v "$1" >/dev/null 2>&1 || { echo "Falta '$1' en PATH"; exit 1; }; }
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing '$1' in PATH"; exit 1; }; }
 need aws
 need jq
 
-[[ -f "${CONF}" ]] || { echo "No existe ${CONF}"; exit 1; }
+[[ -f "${CONF}" ]] || { echo "${CONF} not found"; exit 1; }
 
-# Leer params + defaults como en bootstrap.sh
+# Read params + defaults like bootstrap.sh
 PROJECT=$(jq -r '.project' "${CONF}")
 REGION=$(jq -r '.region' "${CONF}")
 
 HISTORY_BUCKET=$(jq -r '.history_bucket // empty' "${CONF}")
 [[ -z "${HISTORY_BUCKET}" || "${HISTORY_BUCKET}" == "null" ]] && HISTORY_BUCKET="${PROJECT}-history-bucket"
 
-# Mostrar plan
-echo ">> Región: ${REGION}"
+# Show plan
+echo ">> Region: ${REGION}"
 echo ">> Bucket: ${HISTORY_BUCKET}"
-echo ">> Prefijo S3: ${PREFIX}/"
-echo ">> Destino local: ${DEST}/"
+echo ">> S3 prefix: ${PREFIX}/"
+echo ">> Local destination: ${DEST}/"
 
-# Crear carpeta destino
+# Create destination folder
 mkdir -p "${DEST}"
 
-# Sincronizar de S3 a local (solo descarga)
+# Sync from S3 to local (download only)
 aws s3 sync "s3://${HISTORY_BUCKET}/${PREFIX}/" "${DEST}/" --region "${REGION}"
 
-echo "✅ Listo: contenido de s3://${HISTORY_BUCKET}/${PREFIX}/ sincronizado en ${DEST}/"
+echo "✅ Done: contents of s3://${HISTORY_BUCKET}/${PREFIX}/ synced to ${DEST}/"
