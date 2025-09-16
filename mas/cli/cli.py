@@ -28,7 +28,7 @@ def _ask_choice(prompt: str, choices: list[str], default: str) -> str:
         return default
     return response
 
-def start(project_dir_str: str = None, config_str: str = None):
+def start(project_dir_str: str = None, config_str: str = None, verbose: bool = False):
     project_dir = Path(project_dir_str or Path.cwd())
     project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,7 +84,8 @@ def start(project_dir_str: str = None, config_str: str = None):
                 AgentSystemManager(
                     config=enhanced_description,
                     bootstrap_models={"provider": bootstrap_provider, "model": bootstrap_model},
-                    base_directory=str(project_dir)
+                    base_directory=str(project_dir),
+                    verbose=verbose
                 )
 
                 # 6. Crear el archivo .env para el sistema final
@@ -245,6 +246,7 @@ def main(argv=None):
     start_parser = subparsers.add_parser("start", help="Crea la estructura de un proyecto MAS.")
     start_parser.add_argument("--directory", "-d", default=".", help="Directorio donde crear el proyecto (defecto: actual).")
     start_parser.add_argument("--config", "-c", help="Descripción en lenguaje natural o ruta a un config.json para crear el sistema.")
+    start_parser.add_argument("--verbose", "-v", action="store_true", help="Activa el logging detallado.")
 
     # --- Comando 'run' ---
     run_parser = subparsers.add_parser("run", help="Ejecuta un sistema MAS desde un config.json.")
@@ -256,7 +258,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "start":
-        return start(project_dir_str=args.directory, config_str=args.config)
+        return start(project_dir_str=args.directory, config_str=args.config, verbose=args.verbose)
     elif args.command == "run":
         return run_system(
             project_dir_str=args.directory,

@@ -2568,7 +2568,7 @@ class AgentSystemManager:
             - deepseek: {recommended_models['deepseek']}
             - groq: {recommended_models['groq']}
         3.  **Functions File:** If your configuration requires custom functions, include them in the `fns` list as full Python source code strings. Ensure that any function you reference in the components is defined here. If those functions rely on external libraries, you must include the necessary import statements at the top of the `fns.py` file, and attempt to install them via pip if the import fails.
-        4.  **Processes and Tools:** Remember that ALL Tool components require that a previous component's outputs have keys that match the inputs required by that tool. Sometimes this means requiring outputs for an agent that produces those tool inputs. Sometimes that means building a Process that converts something (for example, the user message) into the correct tool input format.
+        4.  **Processes and Tools:** Remember that ALL Tool components require that a previous component's outputs have keys that match the inputs required by that tool. Sometimes this means requiring outputs for an agent that produces those tool inputs. Sometimes that means building a Process that converts something (for example, the user message) into the correct tool input format. Inside process or tool functions, you can use the manager passed as an argument, and in particular manager.read() might be useful to get info out of messages and blocks (check the docs).
         """)
 
         original_system_prompt = (
@@ -2590,7 +2590,7 @@ class AgentSystemManager:
                 {
                     "type": "agent",
                     "name": "system_writer",
-                    "system": f"{context_prompt}\n\n{original_system_prompt}",
+                    "system": f"{original_system_prompt}\n\n{context_prompt}",
                     "required_outputs": {
                         "general_parameters": "Block for config.json, respecting the provided constraints.",
                         "components": "Component list for the user's requirement.",
