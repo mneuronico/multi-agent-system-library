@@ -987,7 +987,6 @@ def _boto(region: Optional[str] = None):
         boto3.client("lambda", **kw),  # kept in case it is needed later
     )
 
-# --- NUEVO: maws setup ---
 def setup(
     config_path: Optional[Union[str, Path]] = None,
     project_dir: Optional[Union[str, Path]] = None,
@@ -1019,6 +1018,8 @@ def setup(
     env_param_name = _ask("SSM env_param_name", data.get("env_param_name") or f"/{project}/prod/env")
     api_path       = _ask("API path", data.get("api_path") or "/webhook")
 
+    lambda_timeout = _ask("Lambda function timeout (in seconds)", data.get("lambda_timeout") or "120")
+
     sync_tokens_s3 = _ask_bool("Sync tokens from S3 (SYNC_TOKENS_S3)", bool(data.get("sync_tokens_s3", True)))
     tokens_prefix  = _ask("S3 prefix for tokens (TOKENS_S3_PREFIX)",
                           data.get("tokens_s3_prefix") or "secrets")
@@ -1034,6 +1035,7 @@ def setup(
         "deployment_bucket": deploy_bucket,
         "env_param_name": env_param_name,
         "api_path": api_path,
+        "lambda_timeout": int(lambda_timeout),
         "sync_tokens_s3": bool(sync_tokens_s3),
         "tokens_s3_prefix": tokens_prefix,
         "verbose": bool(verbose),

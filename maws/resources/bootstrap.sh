@@ -46,7 +46,7 @@ API_PATH=$(jq -r '.api_path // "/webhook"' "${CONF}")
 SYNC_TOKENS_S3=$(jq -r '.sync_tokens_s3 // true' "${CONF}")
 TOKENS_PREFIX=$(jq -r '.tokens_s3_prefix // "secrets"' "${CONF}")
 VERBOSE=$(jq -r '.verbose // false' "${CONF}")
-
+LAMBDA_TIMEOUT=$(jq -r '.lambda_timeout // 120' "${CONF}")
 
 TELEGRAM_ENV_KEY=$(jq -r '.telegram.env_token_key // empty' "${CONF}")
 [[ -z "${TELEGRAM_ENV_KEY}" || "${TELEGRAM_ENV_KEY}" == "null" ]] && TELEGRAM_ENV_KEY="TELEGRAM_TOKEN"
@@ -149,7 +149,7 @@ Description: ${PROJECT}
 
 Globals:
   Function:
-    Timeout: 120
+    Timeout: ${LAMBDA_TIMEOUT}
     Runtime: python3.9
     MemorySize: 256
     Tracing: Active
