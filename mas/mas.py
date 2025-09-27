@@ -3110,11 +3110,10 @@ class AgentSystemManager:
                     self._tls.db_conn.close()
                 except Exception: pass
             self._tls.db_conn = None
-            logger.debug(f"Cleared thread-local DB connection for user {user_id}.")
-            
+                    
         db_path = self._get_db_path_for_user(user_id)
-        if os.path.exists(db_path):
-            logger.warning(f"Overwriting existing history for user {user_id}")
+        #if os.path.exists(db_path):
+        #    logger.warning(f"Overwriting existing history for user {user_id}")
         with open(db_path, "wb") as f:
             f.write(sqlite_bytes)
 
@@ -3357,7 +3356,7 @@ class AgentSystemManager:
             self._file_cache[file_path] = obj
             return obj
         except:
-            logger.warning(f"[Manager] File not found while loading from history: {file_path}")
+            #logger.warning(f"[Manager] File not found while loading from history: {file_path}")
             return f"Error: Archivo '{os.path.basename(file_path)}' no encontrado en el historial."
         
 
@@ -4297,7 +4296,6 @@ class AgentSystemManager:
             self.set_current_user(user_id)
 
         if not self._uid():
-            logger.warning("No user ID provided or set. Message history not cleared.")
             return
 
         conn = self._get_user_db()
@@ -4334,7 +4332,7 @@ class AgentSystemManager:
                 cleared += 1
             except Exception:
                 logger.exception(f"Error clearing history for DB: {db_path}")
-        logger.info(f"[Manager] Cleared history in {cleared} sqlite DB(s).")
+        #logger.info(f"[Manager] Cleared history in {cleared} sqlite DB(s).")
         return cleared
 
     def reset_system(self) -> None:
