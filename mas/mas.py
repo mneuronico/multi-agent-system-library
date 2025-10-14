@@ -2869,7 +2869,7 @@ class AgentSystemManager:
             except json.JSONDecodeError as e:
                 logger.error(f"Error decoding JSON from {self.api_keys_path}: {e}")
 
-        elif self.api_keys_path.endswith('.env'):
+        elif '.env' in self.api_keys_path:
             load_dotenv(self.api_keys_path, override=True)
         else:
             raise ValueError(f"Unsupported API keys format: {self.api_keys_path}")
