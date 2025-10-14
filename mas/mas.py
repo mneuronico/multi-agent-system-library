@@ -2442,10 +2442,16 @@ class AgentSystemManager:
             except (FileNotFoundError, json.JSONDecodeError) as e:
                 logger.exception(f"System build failed: {e}")
                 raise
-        else:
+        
+        if not self.general_system_description:
             self.general_system_description = general_system_description
+
+        if not self.on_update:
             self.on_update = self._resolve_callable(on_update)
+        if not self.on_complete:
             self.on_complete = self._resolve_callable(on_complete)
+
+        if not self.api_keys_path:
             self._resolve_api_keys_path(api_keys_path)
 
         try:
@@ -4032,7 +4038,6 @@ class AgentSystemManager:
             raise ValueError(f"Imports must be list or string")
         
         self._resolve_api_keys_path(general_params.get("api_keys_path"))
-        self._load_api_keys()
 
         self.costs_path = general_params.get("costs_path")
         self._load_costs()
