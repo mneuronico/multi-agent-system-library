@@ -5471,6 +5471,8 @@ class Bot(abc.ABC):
         is_voice = parsed_message.get('is_voice_note', False)
         blocks = []
 
+        self.manager.ensure_user(user_id)
+
         transcript = None
         if msg_type == 'audio':
             audio_ref = await self._download_media_and_save(user_id, media_info)
