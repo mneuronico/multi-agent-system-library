@@ -3260,16 +3260,19 @@ class AgentSystemManager:
         if not meta:
             return
 
-        entry = {
-            "user":   self._active_user_id(),
-            "type":   component_type,
-            "id":     model_str or save_role,
-            "in_toks":  meta.get("input_tokens", 0),
-            "out_toks": meta.get("output_tokens", 0),
-            "seconds": meta.get("seconds", 0),
-            "cost":    meta.get("usd_cost", 0.0)
-        }
-        self._log_if_enabled(entry)
+        try:
+            entry = {
+                "user":   self._active_user_id(),
+                "type":   component_type,
+                "id":     model_str or save_role,
+                "in_toks":  meta.get("input_tokens", 0),
+                "out_toks": meta.get("output_tokens", 0),
+                "seconds": meta.get("seconds", 0),
+                "cost":    meta.get("usd_cost", 0.0)
+            }
+            self._log_if_enabled(entry)
+        except Exception as e:
+            logger.warning(f"Could not log usage entry: {e}")
         
     def _dict_to_json_with_file_persistence(self, data: dict, user_id: str) -> str:
         data_copy = self._persist_non_json_values(data, user_id)
@@ -4723,7 +4726,7 @@ class AgentSystemManager:
         else:
             return bot_instance
 
-    def stt(self, file_path, provider=None, model=None):
+    def stt(self, file_path, provider=None, model=None, user_id=None):
         if provider:
             provider = provider.lower()
         else:
@@ -4791,18 +4794,24 @@ class AgentSystemManager:
 
         self._log_stt_call(provider, model, seconds, transcript)
 
-        rate_pm = self._price_for_stt(provider, model)
-        cost    = round(rate_pm * (seconds / 60.0), 6)
+        try:
+            rate_pm = self._price_for_stt(provider, model)
+            cost    = round(rate_pm * (seconds / 60.0), 6)
+        except Exception:
+            cost = 0.0
 
-        self._log_if_enabled({
-            "user":  self._active_user_id(),
-            "type":  "stt",
-            "id":    f"{provider}:{model}",
-            "seconds": seconds,
-            "in_toks": 0,
-            "out_toks": 0,
-            "cost":  cost
-        })
+        try:
+            self._log_if_enabled({
+                "user":  user_id or self._uid(),
+                "type":  "stt",
+                "id":    f"{provider}:{model}",
+                "seconds": seconds,
+                "in_toks": 0,
+                "out_toks": 0,
+                "cost":  cost
+            })
+        except Exception as e:
+            logger.warning(f"Could not log STT usage: {e}")
 
         return transcript
 
@@ -5471,7 +5480,10 @@ class Bot(abc.ABC):
         is_voice = parsed_message.get('is_voice_note', False)
         blocks = []
 
-        self.manager.ensure_user(user_id)
+        try:
+            self.manager.set_current_user(str(user_id))
+        except Exception:
+            pass
 
         transcript = None
         if msg_type == 'audio':
@@ -5485,13 +5497,15 @@ class Bot(abc.ABC):
                 transcript = self.speech_to_text(stt_params)
             else:
                 try:
-                    transcript = self.manager.stt(audio_ref, self.whisper_provider, self.whisper_model)
+                    transcript = self.manager.stt(audio_ref, self.whisper_provider, self.whisper_model, user_id=user_id)
                 except Exception as e:
                     self.logger.error(f"Error in automatic STT for {user_id}: {e}")
 
             if transcript:
                 blocks.extend(self.manager._to_blocks({"response": transcript}, user_id=user_id))
-            
+            else:
+                blocks.extend(self.manager._to_blocks({"response": "Could not transcribe audio."}, user_id=user_id))
+                
             blocks.append({
                 "type": "audio",
                 "content": {
