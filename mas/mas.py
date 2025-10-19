@@ -19,7 +19,7 @@ import requests
 from dotenv import load_dotenv
 import inspect
 from datetime import datetime, timezone, timedelta
-import imghdr, mimetypes, shutil
+import mimetypes, shutil
 from importlib import resources
 import logging
 import base64
