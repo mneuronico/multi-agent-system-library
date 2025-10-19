@@ -47,7 +47,53 @@ if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
 
 
 
+def what(file: Union[str, bytes, None] = None, h: Optional[bytes] = None) -> Optional[str]:
+    data = None
 
+    # imghdr.what supports either a file path/obj or a header bytes blob via h=
+    if h is not None:
+        data = h
+    elif file is not None:
+        try:
+            if hasattr(file, "read"):
+                data = file.read(32)
+            elif isinstance(file, (bytes, bytearray)):
+                data = bytes(file)
+            else:
+                with open(file, "rb") as f:
+                    data = f.read(32)
+        except Exception:
+            return None
+    else:
+        return None
+
+    # JPEG
+    if data.startswith(b"\xFF\xD8\xFF"):
+        return "jpeg"
+    # PNG
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    # GIF
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    # BMP
+    if data.startswith(b"BM"):
+        return "bmp"
+    # TIFF (little/big endian)
+    if data[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    # WebP (RIFF....WEBP)
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    # HEIC/HEIF / AVIF ('ftyp' brand)
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heix", b"hevc", b"hevx", b"heis", b"mif1", b"msf1"):
+            return "heic"
+        if brand in (b"avif", b"avis"):
+            return "avif"
+
+    return None
 
 def get_readme(owner: str, repo: str, branch: str = None,
                token: str = None) -> str:
@@ -3296,7 +3342,7 @@ class AgentSystemManager:
     
 
     def _detect_extension(self, data: bytes, fallback=".bin") -> str:
-        ext = imghdr.what(None, h=data)
+        ext = what(None, h=data)
         if ext:
             return f".{ext}"
         if data[:3] == b"ID3":
