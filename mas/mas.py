@@ -1897,7 +1897,7 @@ class Process(Component):
                 "timestamp": timestamp
             })
 
-        output = [{"source": m["source"], "message": m["message"], "type": m["type"]} for m in output]
+        output = [{"source": m["source"], "message": m["message"], "type": m["type"], "timestamp": m["timestamp"]} for m in output]
 
         return output
 
