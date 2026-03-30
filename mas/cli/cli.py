@@ -51,7 +51,12 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
 
             # 1. Ask for the LLM used during bootstrap
             print("\n--- Bootstrap LLM configuration ---")
-            bootstrap_providers = {"google": "gemini-2.5-pro", "openai": "gpt-5", "anthropic": "claude-sonnet-4"}
+            bootstrap_providers = {
+                "google": "gemini-2.5-pro",
+                "openai": "gpt-5",
+                "openrouter": "openai/gpt-5",
+                "anthropic": "claude-sonnet-4",
+            }
             bootstrap_provider = _ask_choice("Choose a provider to generate the system", list(bootstrap_providers.keys()), "google")
             bootstrap_model = _ask("Enter the bootstrap model name", bootstrap_providers[bootstrap_provider])
 
@@ -67,7 +72,12 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
 
             # 3. Ask for default models for the final system
             print("\n--- Generated system configuration ---")
-            target_providers = {"google": "gemini-2.5-flash", "openai": "gpt-5-nano", "anthropic": "claude-sonnet-4"}
+            target_providers = {
+                "google": "gemini-2.5-flash",
+                "openai": "gpt-5-nano",
+                "openrouter": "openai/gpt-5-nano",
+                "anthropic": "claude-sonnet-4",
+            }
             target_provider = _ask_choice("Choose a default provider for your final system", list(target_providers.keys()), "google")
             target_model = _ask("Enter the default model for your final system", target_providers[target_provider])
 
@@ -120,7 +130,10 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
         print(f"The project files will be created at: {project_dir.resolve()}")
 
         default_models = {
-            "google": "gemini-2.5-flash", "openai": "gpt-5-nano", "groq": "openai/gpt-oss-120b",
+            "google": "gemini-2.5-flash",
+            "openai": "gpt-5-nano",
+            "openrouter": "openai/gpt-5-nano",
+            "groq": "openai/gpt-oss-120b",
         }
         provider = _ask_choice("Choose an LLM provider", list(default_models.keys()), "google")
         model = _ask("Enter the model name", default_models[provider])

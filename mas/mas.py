@@ -229,6 +229,14 @@ class Agent(Component):
                         verbose=verbose,
                         return_token_count=return_token_count
                     )
+                elif provider == "openrouter":
+                    response = self._call_openrouter_api(
+                        model_name=model_name,
+                        conversation=formatted_conversation,
+                        api_key=api_key,
+                        verbose=verbose,
+                        return_token_count=return_token_count
+                    )
                 elif provider == "lmstudio":
                     base_url = model_info.get("base_url")
                     response = self._call_lmstudio_api(
@@ -349,7 +357,7 @@ class Agent(Component):
             role   = msg["role"]
             blocks = self._as_blocks(msg["content"])
 
-            if provider in {"openai", "groq", "deepseek", "lmstudio"}:
+            if provider in {"openai", "openrouter", "groq", "deepseek", "lmstudio"}:
                 if role == "user":
                     parts = []
                     for blk in blocks:
@@ -976,6 +984,65 @@ class Agent(Component):
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
 
+            return (content, input_tokens, output_tokens)
+        else:
+            return content
+
+    def _call_openrouter_api(
+        self,
+        model_name: str,
+        conversation: List[Dict[str, Any]],
+        api_key: str,
+        verbose: bool,
+        return_token_count: bool = False
+    ) -> str:
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_tokens": self.model_params.get("max_tokens"),
+            "top_p": self.model_params.get("top_p")
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+
+        new_messages = []
+        for msg in conversation:
+            role = msg["role"]
+            content = msg["content"]
+            new_messages.append({"role": role, "content": content})
+
+        if verbose:
+            logger.debug(f"[Agent:{self.name}] _call_openrouter_api => model={model_name} (params = {params})")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model_name,
+            "messages": new_messages,
+            **params
+        }
+
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            status = getattr(e.response, "status_code", None)
+            body = getattr(e.response, "text", None)
+            logger.error(f"[Agent:{self.name}] OPENROUTER HTTP {status} ERROR:\n{body}")
+            raise
+
+        json_response = response.json()
+        content = json_response["choices"][0]["message"]["content"]
+
+        if return_token_count:
+            usage = json_response.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
             return (content, input_tokens, output_tokens)
         else:
             return content
@@ -2598,12 +2665,13 @@ class AgentSystemManager:
         
         recommended_models = {
             "openai": "gpt-5-nano",
+            "openrouter": "openai/gpt-5-nano",
             "google": "gemini-2.5-flash",
             "anthropic": "claude-sonnet-4",
             "deepseek": "deepseek-chat",
             "groq": "openai/gpt-oss-120b"
         }
-        potential_providers = ["openai", "google", "anthropic", "deepseek", "groq"]
+        potential_providers = ["openai", "openrouter", "google", "anthropic", "deepseek", "groq"]
 
         available_providers = [p for p in potential_providers if self.get_key(p)]
         available_providers_str = ", ".join(available_providers) or "None"
@@ -2615,6 +2683,7 @@ class AgentSystemManager:
         1.  **Available API Providers:** The user has API keys for the following providers ONLY: **{available_providers_str}**. You MUST NOT include any other providers in the `default_models` list. If the list of available providers is empty, create an empty `default_models` list.
         2.  **Recommended Models:** When choosing models for the `default_models` list, you MUST use these preferred models. Select only from your list of available providers:
             - openai: {recommended_models['openai']}
+            - openrouter: {recommended_models['openrouter']}
             - google: {recommended_models['google']}
             - anthropic: {recommended_models['anthropic']}
             - deepseek: {recommended_models['deepseek']}

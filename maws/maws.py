@@ -782,9 +782,10 @@ def start(
     _default_models_map = {
         "google": "gemini-2.5-flash",
         "openai": "gpt-4o-mini",
+        "openrouter": "openai/gpt-5-nano",
         "groq":   "llama-3.1-70b-versatile",
     }
-    provider = _ask("Default provider (google/openai/groq)", "google").lower()
+    provider = _ask("Default provider (google/openai/openrouter/groq)", "google").lower()
     if provider not in _default_models_map:
         print(f"[maws] Unknown provider '{provider}', using 'google'.")
         provider = "google"
@@ -817,6 +818,7 @@ def start(
     entered = {
         "google": "",
         "openai": "",
+        "openrouter": "",
         "groq": "",
         "telegram_token": "",
         "whatsapp_token": "",
@@ -828,6 +830,7 @@ def start(
     provider_key_env = {
         "google": "GOOGLE_API_KEY",
         "openai": "OPENAI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
         "groq":   "GROQ_API_KEY",
     }[provider]
     maybe_key = _ask(f"Paste {provider_key_env} (press Enter to skip)")
@@ -860,6 +863,7 @@ def start(
     # Always present (commented if empty). The selected one is uncommented
     env_lines.append(_line("GOOGLE_API_KEY", entered["google"]))
     env_lines.append(_line("OPENAI_API_KEY", entered["openai"]))
+    env_lines.append(_line("OPENROUTER_API_KEY", entered["openrouter"]))
     env_lines.append(_line("GROQ_API_KEY",   entered["groq"]))
 
     if bot == "telegram":

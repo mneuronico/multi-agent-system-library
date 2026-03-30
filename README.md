@@ -15,7 +15,7 @@ The `mas` library is a powerful and flexible framework designed for creating and
 ### Why Choose the `mas` Library?
 
 - **Minimal Setup**: Define agents, tools, and workflows using JSON configurations or Python scripts. Start with simple setups and expand as needed.
-- **Seamless LLM Integration**: Manage interactions with multiple LLM providers (e.g., OpenAI, Google, Groq, Anthropic, DeepSeek, and local models via LM Studio) without adapting your code or message history for each one.
+- **Seamless LLM Integration**: Manage interactions with multiple LLM providers (e.g., OpenAI, OpenRouter, Google, Groq, Anthropic, DeepSeek, and local models via LM Studio) without adapting your code or message history for each one.
 - **Automated System Prompts**: Automatically generate and manage system prompts to reduce the need for complex prompt engineering, ensuring consistent and reliable agent behavior.
 - **Error-Tolerant JSON Parsing**: Includes a robust JSON parser that can recognize and correct malformed JSON structures, even when LLMs produce imperfect outputs.
 - **Scalability**: Add or modify components like agents, tools, and processes, expanding the capabilities of a system with minimal refactoring.
@@ -96,6 +96,7 @@ To define a `.env` file, you can do something like:
 
 ```dotenv
 OPENAI_API_KEY=your_openai_key
+OPENROUTER_API_KEY=your_openrouter_key
 GROQ_API_KEY=your_groq_key
 GOOGLE_API_KEY=your_google_key
 ANTHROPIC_API_KEY=your_anthropic_key
@@ -110,6 +111,7 @@ To use a `json` file to define API keys, you can do something like:
 ```json
 {
     "openai": "your-openai-key",
+    "openrouter": "your-openrouter-key",
     "groq": "your-groq-key",
     "google": "your-google-key",
     "anthropic": "your-anthropic-key",
@@ -504,7 +506,7 @@ agent_name = manager.create_agent(
             {"provider": "groq", "model": "llama-3.1-8b-instant"}
         ]
     ```
-    Supported providers so far are: `"openai"`, `"google"`, `"groq"`, `"anthropic"`, `"deepseek"`, and `"lmstudio"`. Ensure the corresponding `api_key` is available in your API key file. LM Studio models can optionally include a `base_url` in the model dictionary when connecting to a non-default server.
+    Supported providers so far are: `"openai"`, `"openrouter"`, `"google"`, `"groq"`, `"anthropic"`, `"deepseek"`, and `"lmstudio"`. Ensure the corresponding `api_key` is available in your API key file. OpenRouter models should use OpenRouter slugs such as `"openai/gpt-5"` or `"anthropic/claude-sonnet-4"`. LM Studio models can optionally include a `base_url` in the model dictionary when connecting to a non-default server.
 -   **`default_output`**: The output to use when all the models fail, should match the `required_outputs`.
 -   **`positive_filter`**: A list of `roles` to be included in the context of the agent (all other roles will be ignored if this is defined).
 -   **`negative_filter`**:  A list of `roles` to be excluded from the context.
@@ -2409,6 +2411,7 @@ Common entries:
 ```
 # LLMs (put at least one)
 OPENAI_API_KEY=
+OPENROUTER_API_KEY=
 GOOGLE_API_KEY=
 GROQ_API_KEY=
 ANTHROPIC_API_KEY=
