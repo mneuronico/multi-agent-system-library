@@ -279,6 +279,14 @@ class Agent(Component):
                         verbose=verbose,
                         return_token_count=return_token_count
                     )
+                elif provider == "wavespeed":
+                    response = self._call_wavespeed_api(
+                        model_name=model_name,
+                        conversation=formatted_conversation,
+                        api_key=api_key,
+                        verbose=verbose,
+                        return_token_count=return_token_count
+                    )
                 else:
                     raise ValueError(f"[Agent:{self.name}] Unknown provider '{provider}'")
 
@@ -357,7 +365,7 @@ class Agent(Component):
             role   = msg["role"]
             blocks = self._as_blocks(msg["content"])
 
-            if provider in {"openai", "openrouter", "groq", "deepseek", "lmstudio"}:
+            if provider in {"openai", "openrouter", "groq", "deepseek", "lmstudio", "wavespeed"}:
                 if role == "user":
                     parts = []
                     for blk in blocks:
@@ -1400,6 +1408,78 @@ class Agent(Component):
             body   = getattr(e.response, "text", None)
             logger.error(f"[Agent:{self.name}] GROQ HTTP {status} ERROR:\n{body}")
             raise
+
+        json_response = response.json()
+        content = json_response["choices"][0]["message"]["content"]
+
+        if return_token_count:
+            usage = json_response.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            return (content, input_tokens, output_tokens)
+        else:
+            return content
+
+    def _call_wavespeed_api(
+        self,
+        model_name: str,
+        conversation: List[Dict[str, Any]],
+        api_key: str,
+        verbose: bool,
+        return_token_count: bool = False
+    ) -> str:
+        schema_for_response = self._build_json_schema()
+
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_tokens": self.model_params.get("max_tokens"),
+            "top_p": self.model_params.get("top_p")
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+
+        if verbose:
+            logger.debug(f"[Agent:{self.name}] _call_wavespeed_api => model={model_name} (params = {params})")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model_name,
+            "messages": conversation,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": schema_for_response
+            },
+            **params
+        }
+
+        primary_url = "https://llm.wavespeed.ai/v1/chat/completions"
+        fallback_url = "https://tropical-llm.wavespeed.ai/v1/chat/completions"
+
+        def _post(url):
+            resp = requests.post(url, headers=headers, json=data, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp
+
+        try:
+            response = _post(primary_url)
+        except requests.exceptions.RequestException as e:
+            status = getattr(e.response, "status_code", None)
+            body = getattr(e.response, "text", None)
+            if status == 401:
+                if verbose:
+                    logger.warning(f"[Agent:{self.name}] WAVESPEED 401 on primary host; retrying against tropical-llm fallback.")
+                try:
+                    response = _post(fallback_url)
+                except requests.exceptions.RequestException as e2:
+                    status2 = getattr(e2.response, "status_code", None)
+                    body2 = getattr(e2.response, "text", None)
+                    logger.error(f"[Agent:{self.name}] WAVESPEED HTTP {status2} ERROR (fallback):\n{body2}")
+                    raise
+            else:
+                logger.error(f"[Agent:{self.name}] WAVESPEED HTTP {status} ERROR:\n{body}")
+                raise
 
         json_response = response.json()
         content = json_response["choices"][0]["message"]["content"]
@@ -2669,9 +2749,10 @@ class AgentSystemManager:
             "google": "gemini-2.5-flash",
             "anthropic": "claude-sonnet-4",
             "deepseek": "deepseek-chat",
-            "groq": "openai/gpt-oss-120b"
+            "groq": "openai/gpt-oss-120b",
+            "wavespeed": "moonshotai/kimi-k2.5"
         }
-        potential_providers = ["openai", "openrouter", "google", "anthropic", "deepseek", "groq"]
+        potential_providers = ["openai", "openrouter", "google", "anthropic", "deepseek", "groq", "wavespeed"]
 
         available_providers = [p for p in potential_providers if self.get_key(p)]
         available_providers_str = ", ".join(available_providers) or "None"
@@ -2688,6 +2769,7 @@ class AgentSystemManager:
             - anthropic: {recommended_models['anthropic']}
             - deepseek: {recommended_models['deepseek']}
             - groq: {recommended_models['groq']}
+            - wavespeed: {recommended_models['wavespeed']}
         3.  **Functions File:** If your configuration requires custom functions, include them in the `fns` list as full Python source code strings. Ensure that any function you reference in the components is defined here. If those functions rely on external libraries, you must include the necessary import statements at the top of the `fns.py` file, and attempt to install them via pip if the import fails.
         4.  **Processes and Tools:** Remember that ALL Tool components require that a previous component's outputs have keys that match the inputs required by that tool. Sometimes this means requiring outputs for an agent that produces those tool inputs. Sometimes that means building a Process that converts something (for example, the user message) into the correct tool input format. Inside process or tool functions, you can use the manager passed as an argument, and in particular manager.read() might be useful to get info out of messages and blocks (check the docs).
         """)
