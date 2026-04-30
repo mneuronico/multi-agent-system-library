@@ -10,13 +10,29 @@ from typing import Optional, List, Dict, Callable, Any, Union
 import pickle
 import importlib.util
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.request import HTTPXRequest
+try:
+    from telegram import Update
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+    from telegram.request import HTTPXRequest
+except ImportError:
+    Update = None
+    Application = None
+    CommandHandler = None
+    MessageHandler = None
+    filters = None
+    HTTPXRequest = None
+
+    class ContextTypes:
+        DEFAULT_TYPE = object
+
 import re
 import tempfile
 import requests
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        raise ImportError("python-dotenv is required to load .env files. Install mas[env].")
 import inspect
 from datetime import datetime, timezone, timedelta
 import mimetypes, shutil
@@ -25,7 +41,12 @@ import logging
 import base64
 import collections
 import textwrap
-from flask import Flask, request, jsonify
+try:
+    from flask import Flask, request, jsonify
+except ImportError:
+    Flask = None
+    request = None
+    jsonify = None
 import copy
 import subprocess
 import abc
@@ -327,6 +348,12 @@ class Agent(Component):
             except ValueError as val_err:
                 if verbose:
                     logger.error(f"[Agent:{self.name}] Value error with provider={provider}, model={model_name}: {val_err}")
+            except (KeyError, IndexError, TypeError) as parse_err:
+                if verbose:
+                    logger.error(
+                        f"[Agent:{self.name}] Invalid response shape with provider={provider}, "
+                        f"model={model_name}: {parse_err}"
+                    )
 
         if verbose:
             logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self.default_output}")
@@ -407,7 +434,7 @@ class Agent(Component):
                             if src["kind"] == "file":
                                 data = open(_clean_path(src["path"]),"rb").read()
                             elif src["kind"] == "url":
-                                data = requests.get(src["url"]).content
+                                data = requests.get(src["url"], timeout=self.timeout).content
                             else:
                                 data = base64.b64decode(src["b64"])
                             gem_parts.append({
@@ -518,7 +545,7 @@ class Agent(Component):
         if index is None or index == "~":
             chosen = subset[:]
         elif isinstance(index, int):
-            if len(subset) >= abs(index):
+            if -len(subset) <= index < len(subset):
                 chosen = [subset[index]]
             else:
                 return []
@@ -1612,10 +1639,17 @@ class Tool(Component):
                 else:
                     result = self.function(*pos_args, **func_kwargs)
 
-                if len(result) != len(self.outputs):
+                if not isinstance(result, dict):
+                    raise TypeError(
+                        f"[Tool:{self.name}] function must return a dict, "
+                        f"got {type(result).__name__}."
+                    )
+
+                missing_outputs = [key for key in self.outputs if key not in result]
+                if missing_outputs:
                     raise ValueError(
-                        f"[Tool:{self.name}] function returned {len(result)} items, "
-                        f"but {len(self.outputs)} expected."
+                        f"[Tool:{self.name}] function result is missing required "
+                        f"output keys: {missing_outputs}"
                     )
 
                 if verbose:
@@ -1626,8 +1660,8 @@ class Tool(Component):
                 return result
 
             except Exception as e:
+                logger.error(f"[Tool:{self.name}] => error: {e}")
                 if verbose:
-                    logger.error(f"[Tool:{self.name}] => error: {e}")
                     traceback.print_exc()
                 return self.default_output
 
@@ -1780,7 +1814,7 @@ class Tool(Component):
         else:
             raise IndexError(f"Index={index} must be an integer for Tools.")
 
-        if len(subset) < abs(index):
+        if not (-len(subset) <= index < len(subset)):
             return {}
 
         role, content, msg_number, msg_type, timestamp = subset[index]
@@ -1830,7 +1864,7 @@ class Tool(Component):
             if index is None:
                 chosen = [subset[-1]]
             elif isinstance(index, int):
-                if len(subset) < abs(index):
+                if not (-len(subset) <= index < len(subset)):
                     raise IndexError(f"Requested index={index} but only {len(subset)} messages found for '{comp_name}'.")
                 chosen = [subset[index]]
             else:
@@ -2010,7 +2044,7 @@ class Process(Component):
             return subset[:]
 
         if isinstance(index, int):
-            if len(subset) >= abs(index):
+            if -len(subset) <= index < len(subset):
                 return [subset[index]]
             else:
                 return []
@@ -2176,7 +2210,7 @@ class Automation(Component):
             if isinstance(comp, Automation):
                 step_output = comp.run(
                     verbose=verbose,
-                    on_update=lambda messages, manager=None: on_update(messages, manager) if on_update else None,
+                    on_update=lambda messages, manager=None: self.manager._invoke_callback(on_update, messages, manager),
                     return_token_count=return_token_count
                 )
             elif isinstance(comp, Agent):
@@ -2199,10 +2233,12 @@ class Automation(Component):
             self.manager._save_component_output(db_conn, comp, step_output, verbose)
 
             if on_update:
-                if on_update_params:
-                    on_update(self.manager.get_messages(self.manager._active_user_id()), self.manager, on_update_params)
-                else:
-                    on_update(self.manager.get_messages(self.manager._active_user_id()), self.manager)
+                self.manager._invoke_callback(
+                    on_update,
+                    self.manager.get_messages(self.manager._active_user_id()),
+                    self.manager,
+                    on_update_params,
+                )
             return step_output
 
         elif isinstance(step, dict):
@@ -2564,8 +2600,15 @@ class AgentSystemManager:
     ):
 
         self._tls = threading.local()
+        self._db_pool = {}
+        self._db_locks = {}
+        self._db_write_lock = threading.RLock()
         self.base_directory = os.path.abspath(base_directory)
         self._usage_logging_enabled = bool(usage_logging)
+        self.general_system_description = general_system_description
+        self.on_update = self._resolve_callable(on_update)
+        self.on_complete = self._resolve_callable(on_complete)
+        self.api_keys_path = None
 
         self.timeout = timeout
         
@@ -2636,14 +2679,6 @@ class AgentSystemManager:
                 logger.exception(f"System build failed: {e}")
                 raise
         
-        if not self.general_system_description:
-            self.general_system_description = general_system_description
-
-        if not self.on_update:
-            self.on_update = self._resolve_callable(on_update)
-        if not self.on_complete:
-            self.on_complete = self._resolve_callable(on_complete)
-
         if not self.api_keys_path:
             self._resolve_api_keys_path(api_keys_path)
 
@@ -2778,9 +2813,9 @@ class AgentSystemManager:
             "You are `system_writer`, an expert MAS engineer.\n"
             "Your job is to read the user's requirement and the MAS library README, then use the provided context and constraints to create a valid system configuration.\n"
             "You must OUTPUT **ONE** JSON object with exactly these keys:\n"
-            "  general_parameters → A JSON object for the config.\n"
-            "  components         → A list of MAS component definitions.\n"
-            "  fns                → A list of strings, where each string is the full Python source for a function.\n"
+            "  general_parameters -> A JSON object for the config.\n"
+            "  components         -> A list of MAS component definitions.\n"
+            "  fns                -> A list of strings, where each string is the full Python source for a function.\n"
             "Return NOTHING ELSE. No markdown, no explanations, just the raw JSON object."
         )
 
@@ -3027,6 +3062,44 @@ class AgentSystemManager:
         elif callable(func):
             return func
         return None
+
+    def _invoke_callback(
+        self,
+        callback: Optional[Callable],
+        messages,
+        manager=None,
+        params: Optional[Dict] = None,
+    ):
+        if not callback:
+            return None
+
+        manager = manager or self
+        try:
+            sig = inspect.signature(callback)
+        except (TypeError, ValueError):
+            if params is not None:
+                return callback(messages, manager, params)
+            return callback(messages, manager)
+
+        parameters = list(sig.parameters.values())
+        accepts_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in parameters)
+        positional = [
+            p for p in parameters
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+
+        if accepts_varargs or len(positional) >= 3:
+            if params is not None:
+                return callback(messages, manager, params)
+            return callback(messages, manager)
+        if len(positional) == 2:
+            return callback(messages, manager)
+        if len(positional) == 1:
+            return callback(messages)
+        return callback()
         
     def clear_file_cache(self):
         self._file_cache = {}
@@ -3251,11 +3324,25 @@ class AgentSystemManager:
         return span_data
 
     def _get_db_path_for_user(self, user_id: str) -> str:
-        return os.path.join(self.history_folder, f"{user_id}.sqlite")
+        return os.path.join(self.history_folder, f"{self._safe_user_id(user_id)}.sqlite")
+
+    def _safe_user_id(self, user_id: Any) -> str:
+        raw = str(user_id)
+        if (
+            raw
+            and raw not in {".", ".."}
+            and ".." not in raw
+            and re.fullmatch(r"[A-Za-z0-9_.-]+", raw)
+        ):
+            return raw
+        encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+        return f"u_{encoded or 'empty'}"
 
     def _ensure_user_db(self, user_id: str) -> sqlite3.Connection:
         if not hasattr(self, "_db_pool"):
             self._db_pool = {}
+        if not hasattr(self, "_db_locks"):
+            self._db_locks = {}
         user_id = str(user_id)
         if user_id in self._db_pool:
             return self._db_pool[user_id]
@@ -3263,12 +3350,7 @@ class AgentSystemManager:
 
         conn = sqlite3.connect(db_path, check_same_thread=False)
 
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='message_history';")
-        table_exists = cur.fetchone()
-
-        if not table_exists:
-            self._create_table(conn)
+        self._migrate_history_schema(conn)
 
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -3276,6 +3358,7 @@ class AgentSystemManager:
         except Exception:
             pass
         self._db_pool[user_id] = conn
+        self._db_locks.setdefault(user_id, threading.RLock())
         return conn
     
     def _active_user_id(self) -> Optional[str]:
@@ -3334,6 +3417,42 @@ class AgentSystemManager:
                 model TEXT
             )
         """)
+        conn.commit()
+
+    def _migrate_history_schema(self, conn: sqlite3.Connection):
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='message_history';")
+        if not cur.fetchone():
+            self._create_table(conn)
+
+        cur.execute("PRAGMA table_info(message_history)")
+        columns = {row[1] for row in cur.fetchall()}
+        migrations = []
+        if "msg_number" not in columns:
+            migrations.append("ALTER TABLE message_history ADD COLUMN msg_number INTEGER")
+        if "role" not in columns:
+            migrations.append("ALTER TABLE message_history ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        if "content" not in columns:
+            migrations.append("ALTER TABLE message_history ADD COLUMN content TEXT NOT NULL DEFAULT ''")
+        if "type" not in columns:
+            migrations.append("ALTER TABLE message_history ADD COLUMN type TEXT NOT NULL DEFAULT 'user'")
+        if "timestamp" not in columns:
+            migrations.append("ALTER TABLE message_history ADD COLUMN timestamp DATETIME")
+        if "model" not in columns:
+            migrations.append("ALTER TABLE message_history ADD COLUMN model TEXT")
+
+        for statement in migrations:
+            cur.execute(statement)
+
+        if "msg_number" not in columns:
+            cur.execute("UPDATE message_history SET msg_number = id WHERE msg_number IS NULL")
+        if "timestamp" not in columns:
+            cur.execute(
+                "UPDATE message_history SET timestamp = ? WHERE timestamp IS NULL",
+                (datetime.now(self.timezone).isoformat(),)
+            )
+
+        cur.execute("PRAGMA user_version = 1")
         conn.commit()
 
     def has_new_updates(self) -> bool:
@@ -3398,19 +3517,28 @@ class AgentSystemManager:
         else:
             content_str = str(content)
 
-        cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
-        next_num = cur.fetchone()[0]
-        cur.execute(
-            """
-            INSERT INTO message_history (msg_number, role, content, type, model, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (next_num, role, content_str, type, model, timestamp)
-        )
-        conn.commit()
-        return next_num
+        uid = self._uid()
+        lock = self._db_locks.get(str(uid)) if uid is not None and hasattr(self, "_db_locks") else None
+        lock = lock or getattr(self, "_db_write_lock", threading.RLock())
+
+        with lock:
+            cur = conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
+                next_num = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO message_history (msg_number, role, content, type, model, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (next_num, role, content_str, type, model, timestamp)
+                )
+                conn.commit()
+                return next_num
+            except Exception:
+                conn.rollback()
+                raise
 
 
     def add_message(self, role: str, content: Union[str, dict], msg_type: str = "developer") -> None:
@@ -3504,7 +3632,7 @@ class AgentSystemManager:
 
     def _store_file(self, obj: Any, user_id: str) -> str:
         user_id = str(user_id)
-        files_dir = os.path.join(self.files_folder, user_id)
+        files_dir = os.path.join(self.files_folder, self._safe_user_id(user_id))
         os.makedirs(files_dir, exist_ok=True)
 
         if isinstance(obj, str) and os.path.isfile(obj):
@@ -4028,13 +4156,13 @@ class AgentSystemManager:
                 output_dict = comp.run(
                     verbose=verbose,
                     on_update_params = on_update_params,
-                    on_update=lambda messages, manager, on_update_params: on_update(messages, manager, on_update_params) if on_update else None,
+                    on_update=lambda messages, manager, on_update_params: self._invoke_callback(on_update, messages, manager, on_update_params),
                     return_token_count=return_token_count
                 )
             else:
                 output_dict = comp.run(
                     verbose=verbose,
-                    on_update=lambda messages, manager: on_update(messages, manager) if on_update else None,
+                    on_update=lambda messages, manager: self._invoke_callback(on_update, messages, manager),
                     return_token_count=return_token_count
                 )
         else:
@@ -4058,10 +4186,7 @@ class AgentSystemManager:
                     target_custom=target_custom
                 )
             if on_update:
-                if on_update_params:
-                    on_update(self.get_messages(user_id), self, on_update_params)
-                else:
-                    on_update(self.get_messages(user_id), self)
+                self._invoke_callback(on_update, self.get_messages(user_id), self, on_update_params)
 
         self._save_component_output(db_conn, comp, output_dict, verbose=verbose)
 
@@ -4107,10 +4232,7 @@ class AgentSystemManager:
                 component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
             )
             if on_complete:
-                if on_complete_params:
-                    on_complete(self.get_messages(user_id), self, on_complete_params)
-                else:
-                    on_complete(self.get_messages(user_id), self)
+                self._invoke_callback(on_complete, self.get_messages(user_id), self, on_complete_params)
 
         if blocking:
             self._run_internal(
@@ -4145,8 +4267,8 @@ class AgentSystemManager:
 
                 if verbose:
                     logger.info(
-                        f"[Usage] +{delta_in} in / +{delta_out} out tokens  "
-                        f"→ ${usage_summary['total_cost']:.6f} "
+                        f"[Usage] +{delta_in} in / +{delta_out} out tokens -> "
+                        f"${usage_summary['total_cost']:.6f} "
                         f"(models: ${usage_summary['models_cost']:.6f}, "
                         f"tools: ${usage_summary['tools_cost']:.6f})"
                     )
@@ -4156,10 +4278,7 @@ class AgentSystemManager:
                     final_blocks[0]["metadata"]["usage_summary"] = usage_summary
 
             if on_complete:
-                if on_complete_params:
-                    on_complete(self.get_messages(user_id), self, on_complete_params)
-                else:
-                    on_complete(self.get_messages(user_id), self)
+                self._invoke_callback(on_complete, self.get_messages(user_id), self, on_complete_params)
             return final_blocks
         else:
             thread = threading.Thread(target=task)
@@ -4179,10 +4298,15 @@ class AgentSystemManager:
                 system_definition = json.load(f)
         except OSError as e:
             logger.error(f"Error opening JSON file at {json_path}: {e}")
-            system_definition = {}
+            raise FileNotFoundError(f"Cannot open MAS config JSON at {json_path}") from e
         except json.JSONDecodeError as e:
             logger.error(f"Error decoding JSON from file at {json_path}: {e}")
-            system_definition = {}
+            raise
+
+        if not isinstance(system_definition, dict):
+            raise ValueError(f"MAS config JSON at {json_path} must contain an object.")
+        if not system_definition:
+            raise ValueError(f"MAS config JSON at {json_path} is empty.")
 
         general_params = system_definition.get("general_parameters", {})
 
@@ -4578,7 +4702,9 @@ class AgentSystemManager:
         return isinstance(obj, dict) and "type" in obj and "content" in obj
     
     def _is_image_bytes(self, val):
-        return isinstance(val, (bytes, bytearray))
+        return isinstance(val, (bytes, bytearray)) and what(None, h=bytes(val)) in {
+            "jpeg", "png", "gif", "bmp", "tiff", "webp", "heic", "avif"
+        }
 
     def _is_valid_image_path(self, p):
         if not isinstance(p, str):
@@ -5129,7 +5255,7 @@ class AgentSystemManager:
         
         voices_url = "https://api.elevenlabs.io/v1/voices"
         headers = {"xi-api-key": api_key}
-        voices_response = requests.get(voices_url, headers=headers)
+        voices_response = requests.get(voices_url, headers=headers, timeout=self.timeout)
         voices_response.raise_for_status()
         voices_data = voices_response.json()
         voice_id = None
@@ -5490,13 +5616,17 @@ class Bot(abc.ABC):
 
             def on_update_wrapper(messages, manager, params):
                 if self.on_update_user_callback:
-                    response = self.on_update_user_callback(messages, manager, params)
+                    response = self.manager._invoke_callback(
+                        self.on_update_user_callback, messages, manager, params
+                    )
                     _send_response_from_callback(response)
 
             def on_complete_wrapper(messages, manager, params):
                 response = None
                 if self.on_complete_user_callback:
-                    response = self.on_complete_user_callback(messages, manager, params)
+                    response = self.manager._invoke_callback(
+                        self.on_complete_user_callback, messages, manager, params
+                    )
                 elif messages:
                     response = messages[-1].get("message")
                 
@@ -5737,6 +5867,8 @@ class TelegramBot(Bot):
         **kwargs
     ):
         super().__init__(manager=manager, **kwargs)
+        if Application is None or HTTPXRequest is None:
+            raise ImportError("python-telegram-bot is required for TelegramBot. Install mas[telegram].")
         
         token = telegram_token or self.manager.get_key("telegram_token")
         if not token:
@@ -6051,12 +6183,12 @@ class WhatsappBot(Bot):
         if not resp.ok:
             short_payload = json.dumps(payload)[:1200]
             self.logger.error(
-                "[WA SEND] FAILED %s → %s | status=%s | resp=%s | payload=%s",
+                "[WA SEND] FAILED %s -> %s | status=%s | resp=%s | payload=%s",
                 msg_type, to, resp.status_code, resp.text, short_payload
             )
         else:
             self.logger.debug(
-                "[WA SEND] OK %s → %s | status=%s",
+                "[WA SEND] OK %s -> %s | status=%s",
                 msg_type, to, resp.status_code
             )
 
@@ -6088,6 +6220,9 @@ class WhatsappBot(Bot):
         return await asyncio.to_thread(do_upload)
         
     def run_server(self, host: str = "0.0.0.0", port: int = 5000, base_path: str = "/webhook"):
+        if Flask is None:
+            raise ImportError("Flask is required to run the WhatsApp webhook server. Install mas[whatsapp].")
+
         self.persistent_loop = asyncio.new_event_loop()
 
         def run_asyncio_loop():

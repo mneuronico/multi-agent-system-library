@@ -42,4 +42,4 @@ mkdir -p "${DEST}"
 # Sync from S3 to local (download only)
 aws s3 sync "s3://${HISTORY_BUCKET}/${PREFIX}/" "${DEST}/" --region "${REGION}"
 
-echo "✅ Done: contents of s3://${HISTORY_BUCKET}/${PREFIX}/ synced to ${DEST}/"
+echo "[OK] Done: contents of s3://${HISTORY_BUCKET}/${PREFIX}/ synced to ${DEST}/"

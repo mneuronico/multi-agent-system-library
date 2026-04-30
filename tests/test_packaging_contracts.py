@@ -41,3 +41,41 @@ def test_python_requires_matches_annotation_syntax():
                 break
 
     assert not (requires_python == ">=3.8" and uses_pep585_annotations)
+
+
+def test_unused_pandas_is_not_a_core_runtime_dependency():
+    data = _pyproject()
+    dependencies = data["project"]["dependencies"]
+    extras = data["project"]["optional-dependencies"]
+
+    assert "pandas" not in dependencies
+    assert any(dep.startswith("pandas") for dep in extras["data"])
+
+
+def test_integration_dependencies_are_optional_extras():
+    data = _pyproject()
+    dependencies = "\n".join(data["project"]["dependencies"])
+    extras = data["project"]["optional-dependencies"]
+
+    for package_name in ["python-telegram-bot", "Flask", "boto3", "python-dotenv", "mutagen"]:
+        assert package_name not in dependencies
+
+    for extra_name in ["telegram", "whatsapp", "aws", "env", "audio", "maws", "all"]:
+        assert extra_name in extras
+
+
+def test_maws_operator_files_are_ascii_clean():
+    paths = [
+        ROOT / "maws" / "maws.py",
+        ROOT / "maws" / "README.md",
+        ROOT / "maws" / "resources" / "bootstrap.sh",
+        ROOT / "maws" / "resources" / "pull_history.sh",
+    ]
+
+    offenders = [
+        str(path.relative_to(ROOT))
+        for path in paths
+        if any(ord(ch) > 127 for ch in path.read_text(encoding="utf-8"))
+    ]
+
+    assert offenders == []

@@ -3,9 +3,6 @@ def read_google_doc(manager, messages):
 
     api_key = manager.get_key("GOOGLE_DRIVE_API")
     doc_id = manager.get_key("GOOGLE_DOC_ID")
-    
-    print(api_key)
-    print(doc_id)
 
     # Google Drive API endpoint for exporting a Google Doc as plain text
     url = f"https://www.googleapis.com/drive/v3/files/{doc_id}/export"
@@ -17,7 +14,7 @@ def read_google_doc(manager, messages):
     }
     
     # Make the GET request
-    response = requests.get(url, params=params)
+    response = requests.get(url, params=params, timeout=30)
     
     # Check if the request was successful
     if response.status_code == 200:
@@ -46,7 +43,7 @@ def weather_query(manager, location: str, unit: str = "metric") -> tuple:
     }
 
     try:
-        response = requests.get(BASE_URL, params=params)
+        response = requests.get(BASE_URL, params=params, timeout=30)
         response.raise_for_status()
         data = response.json()
 
@@ -111,12 +108,13 @@ def markdown_to_pdf(manager, messages):
     
     return {"pdf_file_path": output_file}
 
-def create_payment_url(manager, name, price, currency, qty):
+def create_payment_url(manager, name, price, currency, quantity=1, qty=None):
     import mercadopago
     from datetime import datetime, timedelta, timezone
 
     ACCESS_TOKEN = manager.get_key("MERCADOPAGO_ACCESS_TOKEN")
     sdk = mercadopago.SDK(ACCESS_TOKEN)
+    final_quantity = qty if qty is not None else quantity
 
     expiration_date = datetime.now(timezone.utc) + timedelta(days=1)
     expiration_date_iso = expiration_date.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -125,9 +123,9 @@ def create_payment_url(manager, name, price, currency, qty):
         "items": [
             {
                 "title": name,
-                "quantity": price,
+                "quantity": final_quantity,
                 "currency_id": currency,
-                "unit_price": qty
+                "unit_price": price
             }
         ],
         "expiration_date_to": expiration_date_iso
@@ -149,12 +147,14 @@ def get_video_transcript(video_id):
     except Exception as e:
         return f"Could not retrieve transcript."
 
-def youtube_search(manager, query, max_results=3):
+def youtube_search(manager, query, n_results=3, max_results=None):
     from googleapiclient.discovery import build
 
     YOUTUBE_API_SERVICE_NAME = 'youtube'
     YOUTUBE_API_VERSION = 'v3'
     API_KEY = manager.get_key('YOUTUBE_API_KEY')
+    if max_results is not None:
+        n_results = max_results
 
     youtube = build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=API_KEY)
 
@@ -163,7 +163,7 @@ def youtube_search(manager, query, max_results=3):
         q=query,
         part='id,snippet',
         type='video',
-        maxResults=max_results
+        maxResults=n_results
     ).execute()
 
     results = []
@@ -245,7 +245,7 @@ def find_food_places(manager, radius, keyword, location):
         "keyword": keyword
     }
 
-    response = requests.get(endpoint, params=params)
+    response = requests.get(endpoint, params=params, timeout=30)
 
     response = response.json()
 
@@ -274,7 +274,7 @@ def get_lat_lng(api_key, address):
         "address": address
     }
 
-    response = requests.get(endpoint, params=params)
+    response = requests.get(endpoint, params=params, timeout=30)
 
     if response.status_code == 200:
         data = response.json()
@@ -297,7 +297,7 @@ def get_place_details(api_key, place_id):
         "fields": "name,rating,price_level,formatted_address,opening_hours,website,formatted_phone_number,user_ratings_total,editorial_summary,reviews"
     }
 
-    response = requests.get(endpoint, params=params)
+    response = requests.get(endpoint, params=params, timeout=30)
 
     if response.status_code == 200:
         return response.json()

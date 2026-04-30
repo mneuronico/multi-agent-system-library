@@ -621,13 +621,15 @@ Added test files:
 - `tests/test_standard_library_contracts.py`
 - Existing `tests/test_wavespeed_provider.py`
 
-Current test status before fixes:
+Current test status after the first two implementation passes:
 
 ```text
-20 failed, 8 passed, 1 skipped
+40 passed, 1 skipped
 ```
 
-Most failures correspond to findings already listed in this plan: package inclusion, Python version metadata, provider fallback, index bounds, byte classification, MAWS POST acknowledgment, S3/local path sanitization, stdlib secret leakage, stdlib signature mismatches, MercadoPago value mapping, and weather docs mismatch. The new finding from the suite is config-less `AgentSystemManager` initialization failing before defaults are set.
+The regression suite now covers the previously failing areas: package inclusion, Python version metadata, provider fallback, index bounds, byte classification, MAWS POST acknowledgment, S3/local path sanitization, stdlib secret leakage, stdlib signature mismatches, MercadoPago value mapping, weather docs mismatch, config-less manager initialization, SQLite schema migration, config fail-fast behavior, callback signature normalization, MAWS worker return values, optional dependency metadata, and network timeouts.
+
+Remaining broad improvement work is structural rather than a narrow bug fix: incrementally breaking up `mas/mas.py` and `maws/maws.py` into smaller modules while preserving re-export compatibility.
 
 ## Verification Performed During Review
 

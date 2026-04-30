@@ -1,6 +1,19 @@
 # maws.py
-import os, json, asyncio, shutil, traceback
-import boto3, botocore
+import os, json, asyncio, shutil, traceback, base64, re, types as _types
+try:
+    import boto3, botocore
+except ImportError:
+    boto3 = None
+
+    class _MissingClientError(Exception):
+        def __init__(self, error_response=None, operation_name=None):
+            super().__init__(str(error_response or {}))
+            self.response = error_response or {"Error": {"Code": "MissingBoto3"}}
+            self.operation_name = operation_name
+
+    botocore = _types.SimpleNamespace(
+        exceptions=_types.SimpleNamespace(ClientError=_MissingClientError)
+    )
 
 # MAS
 from mas import AgentSystemManager, TelegramBot, WhatsappBot
@@ -16,6 +29,23 @@ def _as_bool(v, default=False):
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
+def _safe_key_part(value: str) -> str:
+    raw = str(value)
+    if (
+        raw
+        and raw not in {".", ".."}
+        and ".." not in raw
+        and re.fullmatch(r"[A-Za-z0-9_.-]+", raw)
+    ):
+        return raw
+    encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"u_{encoded or 'empty'}"
+
+def _require_boto3():
+    if boto3 is None:
+        raise ImportError("boto3 and botocore are required for maws AWS operations. Install mas[aws] or mas[maws].")
+    return boto3
+
 def _load_env_from_ssm_if_needed():
     """
     Load a .env from SSM (SecureString) and merge it into ``os.environ``
@@ -26,7 +56,7 @@ def _load_env_from_ssm_if_needed():
         return
     if os.environ.get("_ENV_LOADED_FROM_SSM") == "1":
         return
-    ssm = boto3.client("ssm")
+    ssm = _require_boto3().client("ssm")
     resp = ssm.get_parameter(Name=param_name, WithDecryption=True)
     raw = resp["Parameter"]["Value"]
     for line in raw.splitlines():
@@ -48,7 +78,7 @@ class MawsRuntime:
         _load_env_from_ssm_if_needed()
 
         # General config
-        self.bucket_name = os.environ.get("BUCKET_NAME", "MISSING_BUCKET")
+        self.bucket_name = os.environ.get("BUCKET_NAME", "").strip()
         self.sync_tokens_s3 = _as_bool(os.environ.get("SYNC_TOKENS_S3", "1"), default=True)
         self.tokens_prefix = os.environ.get("TOKENS_S3_PREFIX", "secrets")
         self.bot_type = os.environ.get("BOT_TYPE", "whatsapp").strip().lower()
@@ -75,10 +105,11 @@ class MawsRuntime:
         except Exception:
             self.token_env_map = {}
 
-        # AWS clients
-        self.s3 = boto3.client("s3")
-        self.lambda_client = boto3.client("lambda")
-        self.dynamodb = boto3.client("dynamodb") if self.lock_table else None
+        # AWS clients are created lazily so config-only paths and tests do not
+        # contact AWS before the handler knows which path it is serving.
+        self._s3 = None
+        self._lambda_client = None
+        self._dynamodb = None
 
         # Paths
         self.CODE_ROOT = "/var/task"  # package (read-only)
@@ -95,6 +126,44 @@ class MawsRuntime:
         for fname, envkey in self.token_env_map.items():
             os.environ.setdefault(envkey, f"{self.TMP_DIR}/{fname}")
 
+    @property
+    def s3(self):
+        if self._s3 is None:
+            self._s3 = _require_boto3().client("s3")
+        return self._s3
+
+    @s3.setter
+    def s3(self, client):
+        self._s3 = client
+
+    @property
+    def lambda_client(self):
+        if self._lambda_client is None:
+            self._lambda_client = _require_boto3().client("lambda")
+        return self._lambda_client
+
+    @lambda_client.setter
+    def lambda_client(self, client):
+        self._lambda_client = client
+
+    @property
+    def dynamodb(self):
+        if not self.lock_table:
+            return None
+        if self._dynamodb is None:
+            self._dynamodb = _require_boto3().client("dynamodb")
+        return self._dynamodb
+
+    @dynamodb.setter
+    def dynamodb(self, client):
+        self._dynamodb = client
+
+    def _missing_bucket_response(self):
+        return {
+            "statusCode": 500,
+            "body": json.dumps("BUCKET_NAME is required for MAWS worker history persistence."),
+        }
+
     # -------------------------
     # Helpers event loop / S3 / paths
     # -------------------------
@@ -105,7 +174,7 @@ class MawsRuntime:
         return self._loop
 
     def s3_sqlite_key(self, chat_id: str) -> str:
-        return f"history/{chat_id}.sqlite"
+        return f"history/{_safe_key_part(chat_id)}.sqlite"
 
     def _s3_key_for(self, filename: str) -> str:
         prefix = (self.tokens_prefix or "").strip().strip("/")
@@ -137,10 +206,12 @@ class MawsRuntime:
         local_tmp = os.path.join(self.TMP_DIR, filename)
         if os.path.exists(local_tmp):
             return local_tmp
-        if self.sync_tokens_s3:
+        if self.sync_tokens_s3 and self.bucket_name:
             key = self._s3_key_for(filename)
             if self._download_s3_if_exists(self.bucket_name, key, local_tmp):
                 return local_tmp
+        elif self.sync_tokens_s3:
+            print("[maws][WARN] BUCKET_NAME is not set; skipping S3 token sync.")
         if self._copy_code_to_tmp_if_exists(filename, local_tmp):
             return local_tmp
         print(f"[maws][WARN] {filename} not found in S3 or the package.")
@@ -148,6 +219,9 @@ class MawsRuntime:
 
     def upload_token_back_if_exists(self, filename: str):
         if not self.sync_tokens_s3:
+            return
+        if not self.bucket_name:
+            print("[maws][WARN] BUCKET_NAME is not set; skipping S3 token upload.")
             return
         path = os.path.join(self.TMP_DIR, filename)
         if os.path.exists(path):
@@ -265,25 +339,10 @@ class MawsRuntime:
     # Main handler
     # -------------------------
     def handle_apigw_event(self, event, context):
-        self.initialize_system()
-        if not self.bot_instance:
-            return {"statusCode": 200, "body": json.dumps("Error: Initialization failed.")}
-
         http_method = (
             event.get("requestContext", {}).get("http", {}).get("method")
             or event.get("httpMethod")
         )
-
-        # GET verification (WhatsApp)
-        if http_method == "GET" and self.bot_type == "whatsapp":
-            print("[maws] WhatsApp verification (GET).")
-            try:
-                query_params = event.get("queryStringParameters", {}) or {}
-                response_body, status_code = self.bot_instance.handle_webhook_verification(query_params)
-                return {"statusCode": status_code, "body": response_body}
-            except Exception as e:
-                print(f"[maws][verify][ERR] {e}")
-                return {"statusCode": 200, "body": "Verification (warning)."}
 
         # POST fan-out (both)
         if http_method == "POST":
@@ -302,6 +361,20 @@ class MawsRuntime:
                 print(f"[maws][POST][ERR] {e}")
                 return {"statusCode": 200, "body": json.dumps("Webhook received (warning).")}
 
+        # GET verification (WhatsApp)
+        if http_method == "GET" and self.bot_type == "whatsapp":
+            self.initialize_system()
+            if not self.bot_instance:
+                return {"statusCode": 200, "body": json.dumps("Error: Initialization failed.")}
+            print("[maws] WhatsApp verification (GET).")
+            try:
+                query_params = event.get("queryStringParameters", {}) or {}
+                response_body, status_code = self.bot_instance.handle_webhook_verification(query_params)
+                return {"statusCode": status_code, "body": response_body}
+            except Exception as e:
+                print(f"[maws][verify][ERR] {e}")
+                return {"statusCode": 200, "body": "Verification (warning)."}
+
         # Background: procesamiento real
         is_tg = "update" in event
         is_wa = "whatsapp_update" in event
@@ -316,18 +389,26 @@ class MawsRuntime:
         )
         if not chat_id:
             print("[maws] Could not extract chat_id; exiting.")
-            return
+            return {"statusCode": 200, "body": json.dumps("No chat_id found; update ignored.")}
+
+        if not self.bucket_name:
+            print("[maws][config][ERR] BUCKET_NAME is required for worker events.")
+            return self._missing_bucket_response()
+
+        self.initialize_system()
+        if not self.bot_instance:
+            return {"statusCode": 200, "body": json.dumps("Error: Initialization failed.")}
 
         acquired_lock = False
         imported_history = False
         s3_key = self.s3_sqlite_key(chat_id)
-        local_db = f"{self.TMP_DIR}/history/{chat_id}.sqlite"
+        local_db = os.path.join(self.TMP_DIR, "history", f"{_safe_key_part(chat_id)}.sqlite")
 
         try:
             # Lock
             if not self.try_acquire_user_lock(chat_id):
                 print(f"[maws] Another worker is processing {chat_id}. Ignoring update.")
-                return
+                return {"statusCode": 200, "body": json.dumps("Already processing; update ignored.")}
             acquired_lock = True
 
             # Fetch history
@@ -352,6 +433,9 @@ class MawsRuntime:
         except Exception as e:
             print(f"[maws][process][ERR] {e}")
             traceback.print_exc()
+            result = {"statusCode": 200, "body": json.dumps("Processed with warning.")}
+        else:
+            result = {"statusCode": 200, "body": json.dumps("Processed.")}
         finally:
             # Persistence only if we imported the history
             if imported_history:
@@ -373,7 +457,7 @@ class MawsRuntime:
                 except Exception as e:
                     print(f"[maws][unlock][WARN] {e}")
 
-        return
+        return result
 
 # -------------------------
 # Lambda handler builder
@@ -515,11 +599,11 @@ def _windows_guard(allow: bool, action_desc: str):
         return
 
     if allow or os.environ.get("MAWS_ALLOW_WINDOWS") == "1":
-        print(f"⚠️  Running on Windows (not recommended) for: {action_desc}. Proceeding due to override.")
+        print(f"[WARN] Running on Windows (not recommended) for: {action_desc}. Proceeding due to override.")
         return
 
     msg = (
-        f"⚠️  You are running on Windows. '{action_desc}' often fails outside WSL.\n"
+        f"[WARN] You are running on Windows. '{action_desc}' often fails outside WSL.\n"
         "   Recommended: use WSL (Ubuntu) or Linux/macOS.\n"
         "   Quick WSL steps:  wsl --install -d Ubuntu   (reboot), then open 'Ubuntu' and run it there.\n"
         "Continue anyway? [y/N]: "
@@ -610,7 +694,7 @@ def _best_effort_install():
     import tempfile
     sys_os = _platform.system().lower()
     if sys_os != "linux":
-        print("⚠️  Assisted installation supported only on Linux/WSL. On other OSes, install manually.")
+        print("[WARN] Assisted installation supported only on Linux/WSL. On other OSes, install manually.")
         return False
 
     def _run(cmd):
@@ -632,7 +716,7 @@ def _best_effort_install():
         if not _shutil.which("jq"):
             ok &= _run(["sudo", "apt-get", "install", "-y", "jq"])
     else:
-        print("⚠️  APT not found. Install curl/unzip/jq manually.")
+        print("[WARN] APT not found. Install curl/unzip/jq manually.")
         ok = False
 
     # AWS CLI v2 (official installer)
@@ -649,11 +733,11 @@ def _best_effort_install():
         if _shutil.which("aws"):
             try:
                 out = _subprocess.check_output(["aws", "--version"], text=True)
-                print(f"✅ AWS CLI ready: {out.strip()}")
+                print(f"[OK] AWS CLI ready: {out.strip()}")
             except Exception:
                 pass
         else:
-            print("❌ Could not install AWS CLI. Install manually: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html")
+            print("[ERR] Could not install AWS CLI. Install manually: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html")
             ok = False
 
     if not _shutil.which("sam"):
@@ -678,11 +762,11 @@ def _best_effort_install():
         if sam_bin:
             try:
                 out = _subprocess.check_output(["sam", "--version"], text=True)
-                print(f"✅ SAM CLI ready: {out.strip()}")
+                print(f"[OK] SAM CLI ready: {out.strip()}")
             except Exception:
                 pass
         else:
-            print("❌ Could not install SAM CLI. Install manually: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
+            print("[ERR] Could not install SAM CLI. Install manually: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html")
             ok = False
 
 
@@ -889,7 +973,7 @@ def start(
     #_ensure_script_in_cwd("bootstrap.sh", workdir, force=False)
     #_ensure_script_in_cwd("pull_history.sh", workdir, force=False)
 
-    print("\n✅ Structure created at:", workdir)
+    print("\n[OK] Structure created at:", workdir)
     print("  - params.json")
     print("  - config.json")
     print("  - fns.py")
@@ -897,39 +981,39 @@ def start(
     print("  - .samignore")
 
     if install_deps:
-        print("\n🔧 Installing system dependencies (best effort)…")
+        print("\n[INFO] Installing system dependencies (best effort)...")
         ok = _best_effort_install()
         if not ok:
-            print("ℹ️  Follow the instructions shown above to finish any pending installation steps.")
+            print("[INFO] Follow the instructions shown above to finish any pending installation steps.")
 
     # Probar credenciales
     if _shutil.which("aws"):
         try:
             out = _subprocess.check_output(["aws", "sts", "get-caller-identity", "--output", "json"], text=True)
             acct = _json.loads(out).get("Account")
-            print(f"🔐 AWS ready. Account: {acct}")
+            print(f"[OK] AWS ready. Account: {acct}")
         except Exception:
-            print("🔐 Configure credentials:  aws configure  (or use AWS_PROFILE)")
+            print("[INFO] Configure credentials:  aws configure  (or use AWS_PROFILE)")
 
         if run_config:
-            print("▶️  Running 'aws configure'…")
+            print("[INFO] Running 'aws configure'...")
             try:
                 _subprocess.call(["aws", "configure"])
             except Exception:
                 print("Could not run 'aws configure' automatically. Please run it manually when you can.")
 
     else:
-        print("\n⚠️  'aws' not found. Install AWS CLI and configure it with 'aws configure'.")
+        print("\n[WARN] 'aws' not found. Install AWS CLI and configure it with 'aws configure'.")
 
         # Avisos no intrusivos si faltan herramientas clave
     if not _shutil.which("sam"):
-        print("⚠️  'sam' (AWS SAM CLI) not found. Install it or run 'maws start --install-deps'.")
+        print("[WARN] 'sam' (AWS SAM CLI) not found. Install it or run 'maws start --install-deps'.")
 
     if not _shutil.which("jq"):
-        print("⚠️  'jq' not found. It is useful for the bootstrap; install it if you encounter related errors.")
+        print("[WARN] 'jq' not found. It is useful for the bootstrap; install it if you encounter related errors.")
 
 
-    print("\n👉 Next steps:")
+    print("\nNext steps:")
     print("   1) Complete .env.prod with your tokens.")
     print("   2) (Optional) Adjust params.json, config.json, and fns.py as needed.")
     print("   3) Deploy:   maws update   (or from Python: maws.update())")
@@ -985,10 +1069,11 @@ def _save_params(conf_path: Path, data: Dict):
 def _boto(region: Optional[str] = None):
     """Return boto3 clients forcing the region when provided."""
     kw = {"region_name": region} if region else {}
+    boto = _require_boto3()
     return (
-        boto3.client("cloudformation", **kw),
-        boto3.client("s3", **kw),
-        boto3.client("lambda", **kw),  # kept in case it is needed later
+        boto.client("cloudformation", **kw),
+        boto.client("s3", **kw),
+        boto.client("lambda", **kw),  # kept in case it is needed later
     )
 
 def setup(
@@ -1046,7 +1131,7 @@ def setup(
     })
 
     _save_params(conf, data)
-    print(f"✅ Params written to {conf}")
+    print(f"[OK] Params written to {conf}")
     return conf
 
 # --- NUEVO: maws describe ---
@@ -1066,14 +1151,14 @@ def describe(
     conf = workdir / (config_path or "params.json")
     data = _load_params(conf)
 
-    print(f"\n📂 Project at: {workdir}")
+    print(f"\nProject at: {workdir}")
     print(f"   - params.json: {'OK' if conf.exists() else 'NO'}")
     print(f"   - config.json: {'OK' if (workdir/'config.json').exists() else 'NO'}")
     print(f"   - fns.py     : {'OK' if (workdir/'fns.py').exists() else 'NO'}")
     print(f"   - .env.prod  : {'OK' if (workdir/'.env.prod').exists() else 'NO'}")
 
     if not data:
-        print("\n⚠️  Could not find a readable params.json. Run 'maws setup' or 'maws start'.")
+        print("\n[WARN] Could not find a readable params.json. Run 'maws setup' or 'maws start'.")
         return 1
 
     project = data.get("project", "my-bot")
@@ -1082,7 +1167,7 @@ def describe(
     history_bucket = data.get("history_bucket") or f"{project}-history-bucket"
     deploy_bucket  = data.get("deployment_bucket") or f"{project}-deployment-bucket"
 
-    print("\n🧾 params.json")
+    print("\nparams.json")
     for k in ("project","region","bot","stack_name","history_bucket","deployment_bucket","env_param_name","api_path","sync_tokens_s3","tokens_s3_prefix","verbose"):
         if k in data:
             print(f"   - {k}: {data[k]}")
@@ -1101,7 +1186,7 @@ def describe(
         outputs = {o["OutputKey"]: o["OutputValue"] for o in st.get("Outputs", [])}
         api_url = outputs.get("ApiUrl")
 
-        print(f"\n☁️  CloudFormation [{reg}]")
+        print(f"\nCloudFormation [{reg}]")
         print(f"   - Stack: {stack}  ({status}, {updated_s})")
         if api_url:
             print(f"   - ApiUrl: {api_url}")
@@ -1114,11 +1199,11 @@ def describe(
             except Exception:
                 return False
 
-        print("\n🪣 Buckets")
+        print("\nBuckets")
         print(f"   - history_bucket    : {history_bucket}  ({'exists' if _bucket_exists(history_bucket) else 'missing'})")
         print(f"   - deployment_bucket : {deploy_bucket}  ({'exists' if _bucket_exists(deploy_bucket) else 'missing'})")
     except Exception as e:
-        print(f"\nℹ️  AWS unavailable or missing permissions: {e}")
+        print(f"\n[INFO] AWS unavailable or missing permissions: {e}")
 
     return 0
 
@@ -1160,7 +1245,7 @@ def list_projects(region: Optional[str] = None) -> List[Dict]:
                 except Exception:
                     continue
     except Exception as e:
-        print(f"ℹ️  Could not list stacks in {reg}: {e}")
+        print(f"[INFO] Could not list stacks in {reg}: {e}")
         return []
 
     # print simple table
@@ -1202,7 +1287,7 @@ def _empty_bucket(s3, bucket: str):
     except s3.exceptions.NoSuchBucket:
         return
     except Exception as e:
-        print(f"⚠️  Could not empty bucket {bucket}: {e}")
+        print(f"[WARN] Could not empty bucket {bucket}: {e}")
 
 def remove_project(
     project: Optional[str] = None,
@@ -1226,7 +1311,7 @@ def remove_project(
 
     proj = project or data.get("project")
     if not proj:
-        print("❌ Could not determine 'project'. Pass it with --project or set it in params.json.")
+        print("[ERR] Could not determine 'project'. Pass it with --project or set it in params.json.")
         return 2
 
     reg = _effective_region(region, data)
@@ -1234,7 +1319,7 @@ def remove_project(
     history_bucket = data.get("history_bucket") or f"{proj}-history-bucket"
     deploy_bucket  = data.get("deployment_bucket") or f"{proj}-deployment-bucket"
 
-    print("\n🚨 Deletion plan")
+    print("\nDeletion plan")
     print(f"   Region:           {reg}")
     print(f"   Stack to delete:  {stack}")
     print(f"   Empty bucket:     {history_bucket}")
@@ -1250,32 +1335,32 @@ def remove_project(
     cf, s3, _ = _boto(reg)
 
     # Empty history bucket (so CloudFormation can delete it)
-    print(f"🧹 Emptying s3://{history_bucket} …")
+    print(f"[INFO] Emptying s3://{history_bucket} ...")
     _empty_bucket(s3, history_bucket)
 
     # Delete stack
-    print(f"🗑️  Deleting stack {stack} …")
+    print(f"[INFO] Deleting stack {stack} ...")
     try:
         cf.delete_stack(StackName=stack)
         if wait:
             waiter = cf.get_waiter("stack_delete_complete")
-            print("⏳ Waiting for stack deletion to finish…")
+            print("[INFO] Waiting for stack deletion to finish...")
             waiter.wait(StackName=stack)
-            print("✅ Stack deleted.")
+            print("[OK] Stack deleted.")
         else:
-            print("➡️  Deletion started (asynchronous).")
+            print("[INFO] Deletion started (asynchronous).")
     except Exception as e:
-        print(f"⚠️  Error deleting stack: {e}")
+        print(f"[WARN] Error deleting stack: {e}")
 
-    # Deployment bucket (outside the stack) – delete if requested
+    # Deployment bucket (outside the stack) - delete if requested
     if not keep_deploy_bucket:
-        print(f"🧹 Emptying s3://{deploy_bucket} …")
+        print(f"[INFO] Emptying s3://{deploy_bucket} ...")
         _empty_bucket(s3, deploy_bucket)
         try:
             s3.delete_bucket(Bucket=deploy_bucket)
-            print("✅ Deployment bucket deleted.")
+            print("[OK] Deployment bucket deleted.")
         except Exception as e:
-            print(f"⚠️  Could not delete deployment bucket: {e}")
+            print(f"[WARN] Could not delete deployment bucket: {e}")
 
-    print("🧾 Done. Some resources may take a few minutes to disappear completely.")
+    print("[OK] Done. Some resources may take a few minutes to disappear completely.")
     return 0

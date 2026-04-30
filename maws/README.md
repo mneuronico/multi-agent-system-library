@@ -1,4 +1,4 @@
-# maws — MAS on AWS (Lambda + API Gateway)
+# maws - MAS on AWS (Lambda + API Gateway)
 
 **maws** is a helper library for deploying **MAS** bots on **AWS Lambda** behind **API Gateway**, featuring:
 
@@ -16,22 +16,19 @@
 
 ## Installation
 
-### pip (from the repository subdirectory)
+### pip (from the repository root)
 
 ```bash
 pip install \
-  "git+https://github.com/mneuronico/multi-agent-system-library.git#subdirectory=maws" \
-  "git+https://github.com/mneuronico/multi-agent-system-library.git"
+  "mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git"
 ```
 
-* The first line installs **maws** (the `maws` subfolder).
-* The second installs **MAS** (repository root).
+The repository root package includes both **MAS** and **maws**.
 * You can also **pin to a commit/tag**:
 
 ```bash
 pip install \
-  "git+https://github.com/mneuronico/multi-agent-system-library.git@<commit>#subdirectory=maws" \
-  "git+https://github.com/mneuronico/multi-agent-system-library.git@<commit>"
+  "mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git@<commit>"
 ```
 
 ### `requirements.txt` example
@@ -39,13 +36,12 @@ pip install \
 ```txt
 boto3
 requests
-git+https://github.com/mneuronico/multi-agent-system-library.git#subdirectory=maws
-git+https://github.com/mneuronico/multi-agent-system-library.git
+mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git
 ```
 
 > **Notes**
 >
-> * `boto3` and `botocore` are Lambda runtime dependencies; including `boto3` in your dependencies is fine even though Lambda provides it.
+> * `boto3` and `botocore` are Lambda runtime dependencies; the `maws` extra includes `boto3` for local tooling even though Lambda provides it.
 > * MAS is a dependency of maws (imported as `from mas import AgentSystemManager, WhatsappBot, TelegramBot`).
 
 ---
@@ -73,13 +69,13 @@ That's it. `maws` wires everything to MAS, handles webhook GET/POST, background 
 | -------------------------- | -------- | ------------ | ------------------------------------------------------------------- |
 | `BOT_TYPE`                 | No       | `"whatsapp"` | `"whatsapp"` or `"telegram"`.                                        |
 | `VERBOSE`                  | No       | `"false"`    | `true/false` for detailed logging in MAS and the bots.               |
-| `BUCKET_NAME`              | **Yes**  | —            | S3 bucket with histories and (optionally) tokens/keys.               |
-| `ENV_PARAMETER_NAME`       | No       | —            | **SSM** (SecureString) parameter containing the `.env` to inject.    |
+| `BUCKET_NAME`              | **Yes**  | none         | S3 bucket with histories and (optionally) tokens/keys.               |
+| `ENV_PARAMETER_NAME`       | No       | none         | **SSM** (SecureString) parameter containing the `.env` to inject.    |
 | `SYNC_TOKENS_S3`           | No       | `"true"`     | When `true`, fetch tokens from S3 before falling back to the package.|
 | `TOKENS_S3_PREFIX`         | No       | `"secrets"`  | S3 prefix for tokens/keys (e.g., `secrets/<file>`).                  |
 | `SPECIAL_TOKEN_FILES_JSON` | No       | `"[]"`       | JSON list of token file names to sync into `/tmp`.                   |
 | `TOKEN_ENV_MAP_JSON`       | No       | `"{}"`       | JSON `{ "file": "ENV_VAR" }` to expose file paths via env vars.      |
-| `LOCKS_TABLE_NAME`         | No       | —            | DynamoDB table name for per-user **locking**.                        |
+| `LOCKS_TABLE_NAME`         | No       | none         | DynamoDB table name for per-user **locking**.                        |
 | `LOCK_TTL_SECONDS`         | No       | `"180"`      | Lock TTL (seconds).                                                  |
 
 ### How do tokens work?
@@ -87,8 +83,8 @@ That's it. `maws` wires everything to MAS, handles webhook GET/POST, background 
 * **SPECIAL_TOKEN_FILES_JSON**: list of file names (e.g., `["openai.key", "facebook.json"]`).
   maws will attempt to:
 
-  1. Download `s3://BUCKET_NAME/TOKENS_S3_PREFIX/<file>` → `/tmp/<file>`, or
-  2. Copy `<file>` from the **package** (read-only) → `/tmp/<file>` as fallback.
+  1. Download `s3://BUCKET_NAME/TOKENS_S3_PREFIX/<file>` to `/tmp/<file>`, or
+  2. Copy `<file>` from the **package** (read-only) to `/tmp/<file>` as fallback.
 
 * **TOKEN_ENV_MAP_JSON**: map to **expose** the path via environment variables, e.g.:
 
@@ -109,8 +105,8 @@ Returns a **Lambda handler** already configured for the chosen bot.
 * Lazily initializes `AgentSystemManager`.
 * Instantiates the MAS bot (`WhatsappBot` / `TelegramBot`) with `verbose` coming from `VERBOSE`.
 * GET (WhatsApp): calls `handle_webhook_verification` on the bot.
-* POST: **self-invokes** the same Lambda with a “worker” payload (background mode).
-* In the “second hop”:
+* POST: **self-invokes** the same Lambda with a "worker" payload (background mode).
+* In the "second hop":
 
   * Takes a **lock** per `user_id` (DynamoDB) if `LOCKS_TABLE_NAME` is set; if the lock exists, it **ignores** the update.
   * **Imports** history from S3 if present.
@@ -220,7 +216,7 @@ ANOTHER=VAL
 
 * User histories are stored as SQLite files in S3 under `history/<chat_id>.sqlite`.
 * maws automatically imports/exports around processing.
-* For **tokens** defined in `SPECIAL_TOKEN_FILES_JSON`, it syncs S3 → `/tmp` (or package → `/tmp` if missing in S3) and can optionally expose paths via `TOKEN_ENV_MAP_JSON`.
+* For **tokens** defined in `SPECIAL_TOKEN_FILES_JSON`, it syncs S3 to `/tmp` (or package to `/tmp` if missing in S3) and can optionally expose paths via `TOKEN_ENV_MAP_JSON`.
 
 ---
 
@@ -255,8 +251,7 @@ lambda_handler = build_lambda_handler(os.environ.get("BOT_TYPE", "whatsapp"))
 ```txt
 boto3
 requests
-git+https://github.com/mneuronico/multi-agent-system-library.git#subdirectory=maws
-git+https://github.com/mneuronico/multi-agent-system-library.git
+mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git
 ```
 
 **template.yaml**: see the IAM / CloudFormation section above.
@@ -272,7 +267,7 @@ Yes. Omit `LOCKS_TABLE_NAME` to disable locking.
 maws will try to copy them from the **package** (zip root) to `/tmp`. If they do not exist, it logs a warning and continues.
 
 **Do I need MAS to use maws?**
-Yes. maws acts as the “glue” between AWS and **MAS**.
+Yes. maws acts as the "glue" between AWS and **MAS**.
 
 ---
 

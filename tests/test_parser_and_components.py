@@ -33,6 +33,28 @@ def test_tool_invokes_manager_aware_function_with_keyword_inputs(workspace_tmp_p
     assert out["metadata"]["usd_cost"] == 0.0
 
 
+def test_tool_rejects_non_dict_and_missing_output_returns(workspace_tmp_path):
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
+
+    manager.create_tool(
+        name="bad_type",
+        inputs={},
+        outputs={"value": "Value"},
+        function=lambda: "not a dict",
+        default_output={"value": "default"},
+    )
+    assert manager.tools["bad_type"].run(input_data={}) == {"value": "default"}
+
+    manager.create_tool(
+        name="missing_key",
+        inputs={},
+        outputs={"value": "Value"},
+        function=lambda: {"other": 1},
+        default_output={"value": "default"},
+    )
+    assert manager.tools["missing_key"].run(input_data={}) == {"value": "default"}
+
+
 def test_process_accepts_manager_and_messages_in_any_order(workspace_tmp_path):
     manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
     manager.add_blocks({"response": "hello"}, user_id="user-1")
@@ -44,3 +66,31 @@ def test_process_accepts_manager_and_messages_in_any_order(workspace_tmp_path):
     out = manager.processes["summarizer"].run()
 
     assert out == {"count": 1, "base": True}
+
+
+def test_run_callbacks_accept_two_or_three_arguments(workspace_tmp_path):
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
+    calls = []
+
+    def generate(manager):
+        return {"response": "done"}
+
+    def on_update(messages, manager):
+        calls.append(("update", len(messages), bool(manager.base_directory)))
+
+    def on_complete(messages, manager, params):
+        calls.append(("complete", len(messages), params["marker"]))
+
+    manager.create_process("generate", generate)
+    manager.run(
+        component_name="generate",
+        user_id="callback-user",
+        on_update=on_update,
+        on_complete=on_complete,
+        on_complete_params={"marker": "ok"},
+    )
+
+    assert calls == [
+        ("update", 0, True),
+        ("complete", 1, "ok"),
+    ]

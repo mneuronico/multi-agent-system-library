@@ -84,7 +84,7 @@
             "name": "weather_search",
             "inputs": {
                 "location": "The name of the location to query weather for.",
-                "unit": "The unit system for temperature ('metric', 'imperial', 'standard')."
+                "unit": "The unit system for temperature ('metric' or 'imperial')."
               },
             "outputs": {
                 "temperature": "Current temperature in the specified unit.",

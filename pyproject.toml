@@ -9,14 +9,13 @@ name = "mas"
 version = "0.3.3"
 description = "A powerful and flexible framework for creating and managing multi-agent systems."
 readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.8"
+license = "MIT"
+requires-python = ">=3.9"
 authors = [
   { name="Nicolas Martorell", email="mneuronico@gmail.com" },
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -24,19 +23,28 @@ classifiers = [
 ]
 
 dependencies = [
-    "python-telegram-bot",
-    "Flask>=3,<4",
     "requests",
-    "pandas",
-    "python-dotenv",
-    "mutagen>=1.46",
-    'backports.zoneinfo; python_version < "3.9"',
-    'tzdata; python_version < "3.9"',
-    "boto3"
 ]
 
 [project.optional-dependencies]
+aws = ["boto3"]
+audio = ["mutagen>=1.46"]
+env = ["python-dotenv"]
 ffmpeg = ["ffmpeg-python>=0.2.0"]
+maws = ["boto3"]
+telegram = ["python-telegram-bot"]
+whatsapp = ["Flask>=3,<4"]
+bots = ["python-telegram-bot", "Flask>=3,<4"]
+data = ["pandas>=2,<3"]
+dev = ["pytest>=9,<10", "build>=1,<2"]
+all = [
+    "boto3",
+    "Flask>=3,<4",
+    "mutagen>=1.46",
+    "pandas>=2,<3",
+    "python-dotenv",
+    "python-telegram-bot",
+]
 
 [project.urls]
 Homepage = "https://github.com/mneuronico/multi-agent-system-library"
@@ -47,7 +55,7 @@ maws = "maws.cli:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["mas", "maws", "maws.resources"]
+packages = ["mas", "mas.cli", "mas.lib", "maws", "maws.resources"]
 
 [tool.setuptools.package-data]
 maws = ["resources/*"]

@@ -90,7 +90,7 @@ echo ">> Generating requirements.txt"
 {
   echo "requests"
   echo "boto3"
-  echo "mas @ git+https://github.com/mneuronico/multi-agent-system-library.git"
+  echo "mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git"
   for r in "${EXTRA_REQ[@]}"; do echo "$r"; done
 } | awk 'NF' | sort -u > requirements.txt
 
@@ -308,27 +308,27 @@ if [[ "${BOT}" == "telegram" ]]; then
   KEY="${TELEGRAM_ENV_KEY:-TELEGRAM_TOKEN}"
   TOKEN="${!KEY:-}"
   if [[ -z "${TOKEN}" ]]; then
-    echo "⚠️  Could not find ${KEY} in .env.prod; cannot set the Telegram webhook."
+    echo "[WARN] Could not find ${KEY} in .env.prod; cannot set the Telegram webhook."
   else
     PREV=$(jq -r '."telegram_webhook" // empty' "${STATE_FILE}" 2>/dev/null || true)
     if [[ "${PREV}" != "${WEBHOOK_URL}" ]]; then
-      echo ">> Setting Telegram webhook…"
+      echo ">> Setting Telegram webhook..."
       curl -s "https://api.telegram.org/bot${TOKEN}/setWebhook" \
         -d "url=${WEBHOOK_URL}" >/dev/null
       tmp=$(mktemp)
       jq --arg url "${WEBHOOK_URL}" '.telegram_webhook=$url' "${STATE_FILE}" 2>/dev/null > "$tmp" || echo "{\"telegram_webhook\":\"${WEBHOOK_URL}\"}" > "$tmp"
       mv "$tmp" "${STATE_FILE}"
-      echo "✅ Telegram webhook set to: ${WEBHOOK_URL}"
+      echo "[OK] Telegram webhook set to: ${WEBHOOK_URL}"
     else
       echo "Telegram webhook was already set; skipping."
     fi
   fi
 else
-  echo "ℹ️  WhatsApp webhooks:"
+  echo "[INFO] WhatsApp webhooks:"
   echo "    - Configure the callback URL in Meta Developers:"
   echo "      ${WEBHOOK_URL}"
   echo "    - Verify token (from .env.prod) => key: ${WHATSAPP_VERIFY_ENV_KEY:-WHATSAPP_VERIFY_TOKEN}"
   echo "    - Remember to add the same verify token in your Meta app."
 fi
 
-echo "✅ Done."
+echo "[OK] Done."
