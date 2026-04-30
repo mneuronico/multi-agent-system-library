@@ -60,3 +60,26 @@ This file tracks fixes completed during coding sessions. It is separate from `CO
 - `python setup.py bdist_wheel --dist-dir test_workdir\wheelhouse_setup` -> passed
 - Wheel content smoke check -> `mas.cli`, `mas.lib`, `maws`, and MAWS resources present
 - Wheel import smoke check with a stubbed core `requests` dependency -> passed
+
+### Structural Split Completed
+
+- Split `mas/mas.py` into focused modules while preserving the existing `mas.mas` facade:
+  - `mas/_shared.py` for shared imports, optional dependency guards, logging, and small utility functions.
+  - `mas/components.py` for `Component`, `Agent`, `Tool`, `Process`, and `Automation`.
+  - `mas/manager.py` for `AgentSystemManager`.
+  - `mas/parser.py` for `Parser`.
+  - `mas/bots.py` for `Bot`, `TelegramBot`, and `WhatsappBot`.
+- Split `maws/maws.py` into focused modules while preserving the existing `maws.maws` facade:
+  - `maws/runtime.py` for AWS runtime, `MawsRuntime`, and `build_lambda_handler`.
+  - `maws/operations.py` for local CLI/project operations such as `start`, `update`, `setup`, `describe`, `list_projects`, and `remove_project`.
+- Kept compatibility imports working from both old facades and new split modules.
+- Added a regression test that imports the new split modules and verifies facade objects resolve to the same classes.
+
+### Structural Split Verification
+
+- `python -m pytest -q --tb=short` -> `41 passed, 1 skipped`
+- `python -m py_compile mas/mas.py mas/_shared.py mas/components.py mas/manager.py mas/parser.py mas/bots.py mas/cli/cli.py mas/lib/std.py maws/maws.py maws/runtime.py maws/operations.py maws/cli.py` -> passed
+- `git diff --check` -> passed, with Windows LF/CRLF warnings only
+- `python setup.py bdist_wheel --dist-dir test_workdir\wheelhouse_split` -> passed
+- Split wheel content smoke check -> split MAS/MAWS modules and resources present
+- Split wheel import smoke check with a stubbed core `requests` dependency -> passed

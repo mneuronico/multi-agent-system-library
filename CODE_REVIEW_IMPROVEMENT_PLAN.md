@@ -621,15 +621,20 @@ Added test files:
 - `tests/test_standard_library_contracts.py`
 - Existing `tests/test_wavespeed_provider.py`
 
-Current test status after the first two implementation passes:
+Current test status after the implementation and structural split passes:
 
 ```text
-40 passed, 1 skipped
+41 passed, 1 skipped
 ```
 
-The regression suite now covers the previously failing areas: package inclusion, Python version metadata, provider fallback, index bounds, byte classification, MAWS POST acknowledgment, S3/local path sanitization, stdlib secret leakage, stdlib signature mismatches, MercadoPago value mapping, weather docs mismatch, config-less manager initialization, SQLite schema migration, config fail-fast behavior, callback signature normalization, MAWS worker return values, optional dependency metadata, and network timeouts.
+The regression suite now covers the previously failing areas: package inclusion, Python version metadata, provider fallback, index bounds, byte classification, MAWS POST acknowledgment, S3/local path sanitization, stdlib secret leakage, stdlib signature mismatches, MercadoPago value mapping, weather docs mismatch, config-less manager initialization, SQLite schema migration, config fail-fast behavior, callback signature normalization, MAWS worker return values, optional dependency metadata, network timeouts, and split-module facade compatibility.
 
-Remaining broad improvement work is structural rather than a narrow bug fix: incrementally breaking up `mas/mas.py` and `maws/maws.py` into smaller modules while preserving re-export compatibility.
+The structural split has been completed with compatibility facades:
+
+- `mas/mas.py` now re-exports from `mas/_shared.py`, `mas/components.py`, `mas/manager.py`, `mas/parser.py`, and `mas/bots.py`.
+- `maws/maws.py` now re-exports from `maws/runtime.py` and `maws/operations.py`.
+
+Future work can further split `mas/components.py` and `mas/manager.py` into smaller submodules, but the original monoliths have been removed from the public implementation path.
 
 ## Verification Performed During Review
 
@@ -642,4 +647,4 @@ Remaining broad improvement work is structural rather than a narrow bug fix: inc
   - `maws/cli.py`
 - Installed `pytest` into the bundled local runtime after sandboxed network access was blocked and escalation was approved.
 - Added offline import stubs for optional integrations in `tests/conftest.py`, so tests do not need real Telegram, Flask, requests, boto3, botocore, or network access for the covered paths.
-- Ran `python -m pytest -q --tb=short`; current result is `20 failed, 8 passed, 1 skipped`.
+- Ran `python -m pytest -q --tb=short`; current result is `41 passed, 1 skipped`.

@@ -64,6 +64,24 @@ def test_integration_dependencies_are_optional_extras():
         assert extra_name in extras
 
 
+def test_split_modules_preserve_public_facades():
+    from mas.manager import AgentSystemManager as SplitManager
+    from mas.mas import AgentSystemManager as FacadeManager
+    from mas.components import Agent, Tool, Process, Automation
+    from mas.parser import Parser
+    from mas.bots import TelegramBot, WhatsappBot
+    from maws.runtime import MawsRuntime as SplitRuntime, build_lambda_handler
+    from maws.operations import start, update, setup
+    from maws.maws import MawsRuntime as FacadeRuntime
+
+    assert FacadeManager is SplitManager
+    assert FacadeRuntime is SplitRuntime
+    assert all(obj is not None for obj in [
+        Agent, Tool, Process, Automation, Parser, TelegramBot, WhatsappBot,
+        build_lambda_handler, start, update, setup,
+    ])
+
+
 def test_maws_operator_files_are_ascii_clean():
     paths = [
         ROOT / "maws" / "maws.py",
