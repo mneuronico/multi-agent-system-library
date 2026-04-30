@@ -1,2 +1,7 @@
 mas.egg-info/
 **/__pycache__/
+.pytest_cache/
+.pytest_tmp/
+pytest_tmp/
+test_workdir/
+pytest-cache-files-*/
