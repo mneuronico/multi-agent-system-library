@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import ast
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]

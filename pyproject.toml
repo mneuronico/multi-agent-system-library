@@ -36,7 +36,7 @@ telegram = ["python-telegram-bot"]
 whatsapp = ["Flask>=3,<4"]
 bots = ["python-telegram-bot", "Flask>=3,<4"]
 data = ["pandas>=2,<3"]
-dev = ["pytest>=9,<10", "build>=1,<2"]
+dev = ["pytest>=8,<10", "build>=1,<2", "tomli>=2,<3; python_version < '3.11'"]
 all = [
     "boto3",
     "Flask>=3,<4",

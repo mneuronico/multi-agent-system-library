@@ -122,3 +122,10 @@ This file tracks fixes completed during coding sessions. It is separate from `CO
 - `python -m pytest -q --tb=short` -> `46 passed, 1 skipped`
 - `python -m py_compile mas/mas.py mas/_shared.py mas/components.py mas/manager.py mas/parser.py mas/bots.py maws/maws.py maws/runtime.py maws/operations.py tests/test_nvidia_provider.py tests/test_automation_control_flow.py` -> passed
 - `git diff --check` -> passed, with Windows LF/CRLF warnings only
+
+### CI Compatibility Follow-Up
+
+- Fixed Python 3.9 and 3.10 test compatibility by falling back from stdlib `tomllib` to `tomli` in packaging-contract tests.
+- Relaxed the `dev` extra from `pytest>=9,<10` to `pytest>=8,<10` so CI can install test dependencies on the declared Python floor.
+- Added conditional `tomli` to the `dev` extra for Python versions before 3.11.
+- Updated the test workflow to Node 24-compatible `actions/checkout@v6` and `actions/setup-python@v6`.
