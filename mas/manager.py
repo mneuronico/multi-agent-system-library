@@ -217,9 +217,10 @@ class AgentSystemManager:
             "anthropic": "claude-sonnet-4",
             "deepseek": "deepseek-chat",
             "groq": "openai/gpt-oss-120b",
-            "wavespeed": "moonshotai/kimi-k2.5"
+            "wavespeed": "moonshotai/kimi-k2.5",
+            "nvidia": "nvidia/llama-3.1-nemotron-nano-8b-v1"
         }
-        potential_providers = ["openai", "openrouter", "google", "anthropic", "deepseek", "groq", "wavespeed"]
+        potential_providers = ["openai", "openrouter", "google", "anthropic", "deepseek", "groq", "wavespeed", "nvidia"]
 
         available_providers = [p for p in potential_providers if self.get_key(p)]
         available_providers_str = ", ".join(available_providers) or "None"
@@ -237,6 +238,7 @@ class AgentSystemManager:
             - deepseek: {recommended_models['deepseek']}
             - groq: {recommended_models['groq']}
             - wavespeed: {recommended_models['wavespeed']}
+            - nvidia: {recommended_models['nvidia']}
         3.  **Functions File:** If your configuration requires custom functions, include them in the `fns` list as full Python source code strings. Ensure that any function you reference in the components is defined here. If those functions rely on external libraries, you must include the necessary import statements at the top of the `fns.py` file, and attempt to install them via pip if the import fails.
         4.  **Processes and Tools:** Remember that ALL Tool components require that a previous component's outputs have keys that match the inputs required by that tool. Sometimes this means requiring outputs for an agent that produces those tool inputs. Sometimes that means building a Process that converts something (for example, the user message) into the correct tool input format. Inside process or tool functions, you can use the manager passed as an argument, and in particular manager.read() might be useful to get info out of messages and blocks (check the docs).
         """)
@@ -2003,7 +2005,9 @@ class AgentSystemManager:
 
                     if "condition" not in step and "end_condition" not in step:
                         raise ValueError("While must have either 'condition' or 'end_condition'.")
-                    step["condition"] = self._resolve_condition(step.get("condition"))
+
+                    if "condition" in step:
+                        step["condition"] = self._resolve_condition(step["condition"])
                     step["run_first_pass"] = step.get("run_first_pass", True)
                     step["start_condition"] = self._resolve_condition(step.get("start_condition", step.get("condition", step["run_first_pass"])))
                     step["end_condition"] = self._resolve_condition(step.get("end_condition", step.get("condition")))

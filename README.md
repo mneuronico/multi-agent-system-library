@@ -15,7 +15,7 @@ The `mas` library is a powerful and flexible framework designed for creating and
 ### Why Choose the `mas` Library?
 
 - **Minimal Setup**: Define agents, tools, and workflows using JSON configurations or Python scripts. Start with simple setups and expand as needed.
-- **Seamless LLM Integration**: Manage interactions with multiple LLM providers (e.g., OpenAI, OpenRouter, Google, Groq, Anthropic, DeepSeek, Wavespeed, and local models via LM Studio) without adapting your code or message history for each one.
+- **Seamless LLM Integration**: Manage interactions with multiple LLM providers (e.g., OpenAI, OpenRouter, Google, Groq, Anthropic, DeepSeek, Wavespeed, NVIDIA NIM, and local models via LM Studio) without adapting your code or message history for each one.
 - **Automated System Prompts**: Automatically generate and manage system prompts to reduce the need for complex prompt engineering, ensuring consistent and reliable agent behavior.
 - **Error-Tolerant JSON Parsing**: Includes a robust JSON parser that can recognize and correct malformed JSON structures, even when LLMs produce imperfect outputs.
 - **Scalability**: Add or modify components like agents, tools, and processes, expanding the capabilities of a system with minimal refactoring.
@@ -102,6 +102,7 @@ GOOGLE_API_KEY=your_google_key
 ANTHROPIC_API_KEY=your_anthropic_key
 DEEPSEEK_API_KEY=your_deepseek_key
 LMSTUDIO_API_KEY=your_mock_lmstudio_key
+NVIDIA_API_KEY=your_nvidia_key
 ```
 
 Provider names can be defined as `<PROVIDER>-API-KEY`, `<PROVIDER>`, `<PROVIDER>-KEY`, `<PROVIDER>_KEY`, and other similar variations (the names are handled as case-insensitive).
@@ -117,7 +118,8 @@ To use a `json` file to define API keys, you can do something like:
     "anthropic": "your-anthropic-key",
     "deepseek": "your-deepseek-key",
     "lmstudio": "your-mock-lmstudio-key",
-    "wavespeed": "your-wavespeed-key"
+    "wavespeed": "your-wavespeed-key",
+    "nvidia": "your-nvidia-key"
 }
 ```
 
@@ -507,7 +509,7 @@ agent_name = manager.create_agent(
             {"provider": "groq", "model": "llama-3.1-8b-instant"}
         ]
     ```
-    Supported providers so far are: `"openai"`, `"openrouter"`, `"google"`, `"groq"`, `"anthropic"`, `"deepseek"`, `"wavespeed"`, and `"lmstudio"`. Ensure the corresponding `api_key` is available in your API key file. OpenRouter models should use OpenRouter slugs such as `"openai/gpt-5"` or `"anthropic/claude-sonnet-4"`. LM Studio models can optionally include a `base_url` in the model dictionary when connecting to a non-default server. Wavespeed models use vendor-prefixed slugs such as `"moonshotai/kimi-k2.5"` or `"anthropic/claude-sonnet-4.6"`; the provider calls the Wavespeed LLM gateway (`https://llm.wavespeed.ai/v1`) with an automatic 401-fallback to `https://tropical-llm.wavespeed.ai/v1`.
+    Supported providers so far are: `"openai"`, `"openrouter"`, `"google"`, `"groq"`, `"anthropic"`, `"deepseek"`, `"wavespeed"`, `"nvidia"`, and `"lmstudio"`. Ensure the corresponding `api_key` is available in your API key file. OpenRouter models should use OpenRouter slugs such as `"openai/gpt-5"` or `"anthropic/claude-sonnet-4"`. LM Studio models can optionally include a `base_url` in the model dictionary when connecting to a non-default server. Wavespeed models use vendor-prefixed slugs such as `"moonshotai/kimi-k2.5"` or `"anthropic/claude-sonnet-4.6"`; the provider calls the Wavespeed LLM gateway (`https://llm.wavespeed.ai/v1`) with an automatic 401-fallback to `https://tropical-llm.wavespeed.ai/v1`. NVIDIA models use NIM/API Catalog slugs such as `"nvidia/llama-3.1-nemotron-nano-8b-v1"` and call the OpenAI-compatible NVIDIA endpoint (`https://integrate.api.nvidia.com/v1`); a model dictionary can also include `base_url` for a self-hosted NIM endpoint.
 -   **`default_output`**: The output to use when all the models fail, should match the `required_outputs`.
 -   **`positive_filter`**: A list of `roles` to be included in the context of the agent (all other roles will be ignored if this is defined).
 -   **`negative_filter`**:  A list of `roles` to be excluded from the context.
@@ -2418,6 +2420,7 @@ GROQ_API_KEY=
 ANTHROPIC_API_KEY=
 DEEPSEEK_API_KEY=
 LMSTUDIO_API_KEY=
+NVIDIA_API_KEY=
 
 # Telegram (if using Telegram)
 TELEGRAM_TOKEN=

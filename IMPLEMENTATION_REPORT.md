@@ -83,3 +83,42 @@ This file tracks fixes completed during coding sessions. It is separate from `CO
 - `python setup.py bdist_wheel --dist-dir test_workdir\wheelhouse_split` -> passed
 - Split wheel content smoke check -> split MAS/MAWS modules and resources present
 - Split wheel import smoke check with a stubbed core `requests` dependency -> passed
+
+## 2026-05-01 Session
+
+### NVIDIA Provider Completed
+
+- Added `"nvidia"` as an agent model provider.
+- Implemented NVIDIA NIM/API Catalog chat completions through `https://integrate.api.nvidia.com/v1/chat/completions`.
+- Used bearer-token auth with `NVIDIA_API_KEY`/generic MAS key lookup and preserved per-model `base_url` overrides for self-hosted NIM endpoints.
+- Added NVIDIA request parameters for `temperature`, `max_tokens`, and `top_p`.
+- Used NVIDIA's supported `response_format: {"type": "json_object"}`; a live check confirmed the hosted endpoint rejects `json_schema`.
+- Formatted NVIDIA messages as text strings because the hosted LLM endpoint rejects OpenAI-style multipart text arrays for `messages[*].content`.
+- Added fallback parsing for NVIDIA responses where `message.content` is `null` and model reasoning content is returned in provider-specific fields.
+- Added NVIDIA to the plain-English bootstrap provider allowlist and recommended-model prompt.
+- Updated README provider/API-key documentation with `NVIDIA_API_KEY`, NVIDIA model slugs, and the NIM `base_url` override.
+
+### Additional Bug Fixed
+
+- Fixed JSON automation normalization for `while` steps that use `end_condition` without a separate `condition`. Runtime already allowed this shape, but config loading rejected it.
+
+### Live System Verification
+
+- Built an ignored live smoke system under `test_workdir\nvidia_live_system` with:
+  - one real NVIDIA-backed agent call,
+  - a tool call,
+  - process steps,
+  - branch control flow,
+  - switch control flow,
+  - for-loop iterator handling,
+  - a one-pass while loop,
+  - final validation over the MAS message history.
+- Live model used: `nvidia/llama-3.1-nemotron-nano-8b-v1`.
+- Live run completed with one NVIDIA agent message, 325 input tokens, 56 output tokens, and all validation checks passing.
+- The API key was supplied via environment variable for the live run and was not written into tracked files.
+
+### NVIDIA Session Verification
+
+- `python -m pytest -q --tb=short` -> `46 passed, 1 skipped`
+- `python -m py_compile mas/mas.py mas/_shared.py mas/components.py mas/manager.py mas/parser.py mas/bots.py maws/maws.py maws/runtime.py maws/operations.py tests/test_nvidia_provider.py tests/test_automation_control_flow.py` -> passed
+- `git diff --check` -> passed, with Windows LF/CRLF warnings only

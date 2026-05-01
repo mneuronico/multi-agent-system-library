@@ -179,6 +179,15 @@ class Agent(Component):
                         verbose=verbose,
                         return_token_count=return_token_count
                     )
+                elif provider == "nvidia":
+                    response = self._call_nvidia_api(
+                        model_name=model_name,
+                        conversation=formatted_conversation,
+                        api_key=api_key,
+                        verbose=verbose,
+                        return_token_count=return_token_count,
+                        base_url=model_info.get("base_url")
+                    )
                 else:
                     raise ValueError(f"[Agent:{self.name}] Unknown provider '{provider}'")
 
@@ -263,7 +272,15 @@ class Agent(Component):
             role   = msg["role"]
             blocks = self._as_blocks(msg["content"])
 
-            if provider in {"openai", "openrouter", "groq", "deepseek", "lmstudio", "wavespeed"}:
+            if provider == "nvidia":
+                text = "\n".join(
+                    _text_as_string(blk["content"]) if blk["type"] == "text"
+                    else "[image omitted]"
+                    for blk in blocks
+                )
+                out.append({"role": role, "content": text})
+
+            elif provider in {"openai", "openrouter", "groq", "deepseek", "lmstudio", "wavespeed"}:
                 if role == "user":
                     parts = []
                     for blk in blocks:
@@ -1389,6 +1406,67 @@ class Agent(Component):
             return (content, input_tokens, output_tokens)
         else:
             return content
+
+    def _call_nvidia_api(
+        self,
+        model_name: str,
+        conversation: List[Dict[str, Any]],
+        api_key: str,
+        verbose: bool,
+        return_token_count: bool = False,
+        base_url: Optional[str] = None
+    ) -> str:
+        params = {
+            "temperature": self.model_params.get("temperature"),
+            "max_tokens": self.model_params.get("max_tokens"),
+            "top_p": self.model_params.get("top_p")
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+
+        api_base = (base_url or self.model_params.get("base_url") or "https://integrate.api.nvidia.com/v1").rstrip("/")
+        url = f"{api_base}/chat/completions"
+
+        if verbose:
+            logger.debug(f"[Agent:{self.name}] _call_nvidia_api => model={model_name} (params = {params})")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        data = {
+            "model": model_name,
+            "messages": conversation,
+            "response_format": {"type": "json_object"},
+            **params
+        }
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=data,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            status = getattr(e.response, "status_code", None)
+            body = getattr(e.response, "text", None)
+            logger.error(f"[Agent:{self.name}] NVIDIA HTTP {status} ERROR:\n{body}")
+            raise
+
+        json_response = response.json()
+        message = json_response["choices"][0]["message"]
+        content = message.get("content")
+        if content is None:
+            content = message.get("reasoning_content") or message.get("reasoning") or ""
+
+        if return_token_count:
+            usage = json_response.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            return (content, input_tokens, output_tokens)
+        return content
 
 
 class Tool(Component):
