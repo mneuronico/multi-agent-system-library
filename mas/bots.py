@@ -67,6 +67,80 @@ class Bot(abc.ABC):
     async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
         raise NotImplementedError
 
+    def _normalize_metadata_value(self, value: Any) -> Any:
+        if isinstance(value, datetime):
+            return value.isoformat()
+
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+
+        if isinstance(value, dict):
+            return {
+                str(k): self._normalize_metadata_value(v)
+                for k, v in value.items()
+            }
+
+        if isinstance(value, (list, tuple)):
+            return [self._normalize_metadata_value(v) for v in value]
+
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            try:
+                return self._normalize_metadata_value(to_dict())
+            except Exception:
+                pass
+
+        useful_attrs = {}
+        for attr in (
+            "file_id",
+            "file_unique_id",
+            "mime_type",
+            "file_name",
+            "file_size",
+            "width",
+            "height",
+            "duration",
+        ):
+            if hasattr(value, attr):
+                useful_attrs[attr] = self._normalize_metadata_value(getattr(value, attr))
+
+        if useful_attrs:
+            return useful_attrs
+
+        return str(value)
+
+    def _build_user_message_metadata(self, parsed_message: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = {
+            "channel": self.__class__.__name__,
+            "user_id": str(parsed_message.get("user_id")),
+            "message_type": parsed_message.get("message_type"),
+            "timestamp": self._normalize_metadata_value(parsed_message.get("timestamp")),
+            "is_voice_note": bool(parsed_message.get("is_voice_note", False)),
+        }
+
+        if parsed_message.get("media_info") is not None:
+            metadata["media_info"] = self._normalize_metadata_value(parsed_message.get("media_info"))
+
+        if parsed_message.get("metadata") is not None:
+            metadata["metadata"] = self._normalize_metadata_value(parsed_message.get("metadata"))
+
+        if parsed_message.get("original_payload") is not None:
+            metadata["original_payload"] = self._normalize_metadata_value(parsed_message.get("original_payload"))
+
+        return metadata
+
+    def _attach_user_message_metadata(self, blocks: List[Dict], parsed_message: Dict[str, Any]) -> List[Dict]:
+        if not blocks:
+            return blocks
+
+        first = blocks[0]
+        if not isinstance(first, dict):
+            return blocks
+
+        first.setdefault("metadata", {})
+        first["metadata"]["user_message"] = self._build_user_message_metadata(parsed_message)
+        return blocks
+
 
     def _is_too_old(self, msg_dt, *, max_age=120) -> bool:
         if not isinstance(msg_dt, datetime):
@@ -369,7 +443,7 @@ class Bot(abc.ABC):
                 "content": {"kind": "file", "path": img_ref, "detail": "auto"}
             })
             
-        return blocks
+        return self._attach_user_message_metadata(blocks, parsed_message)
     
 
 

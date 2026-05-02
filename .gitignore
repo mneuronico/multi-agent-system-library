@@ -7,3 +7,4 @@ test_workdir/
 pytest-cache-files-*/
 IMPLEMENTATION_REPORT.md
 IMPLEMENTATION_REPORT.md
+MODEL_FAILURE_BACKOFF_PLAN.md
