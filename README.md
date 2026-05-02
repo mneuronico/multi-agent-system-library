@@ -381,7 +381,8 @@ manager = AgentSystemManager(
     timezone="UTC",
     log_level=logging.INFO,
     admin_user_id="your_telegram_or_whatsapp_id",
-    usage_logging=False
+    usage_logging=False,
+    model_failure_policy={"enabled": True}
 )
 ```
 
@@ -404,6 +405,7 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 -   **`log_level`**: Logging level for the library. Defaults to `logging.DEBUG`.
 -   **`admin_user_id`**: A specific user ID (e.g., your Telegram chat ID) granted access to administrative commands.
 -   **`usage_logging`**: If `True`, enables the persistent usage and cost logging system. Defaults to `False`.
+-   **`model_failure_policy`**: Optional manager-wide adaptive fallback policy for model failures. Enabled by default. When a model fails, MAS records that provider/model failure in memory and temporarily prefers the highest-priority model that has not failed recently. The original model order is restored after cooldown or after a later success. Set this to `False` to always probe models strictly in the configured order. Useful tuning fields are `base_cooldown_seconds`, `min_cooldown_seconds`, `max_cooldown_seconds`, `failure_half_life_seconds`, `history_retention_seconds`, and `failure_weights`.
 
 `on_update` and `on_complete` can be defined as callables directly, or they can be strings referring to the name of the function to use, located in one of the `functions` files. To accomplish this, _function syntax_ must be used.
 
@@ -437,7 +439,12 @@ You can accomplish the same thing when defining the system from a JSON file:
     "on_update": "fn:on_update_function", 
     "on_complete": "fn:on_complete_function",
     "include_timestamp": true,
-    "timezone": "America/Argentina/Buenos_Aires"
+    "timezone": "America/Argentina/Buenos_Aires",
+    "model_failure_policy": {
+        "enabled": true,
+        "base_cooldown_seconds": 60,
+        "max_cooldown_seconds": 1800
+    }
   },
   "components": []
 }
@@ -510,8 +517,9 @@ agent_name = manager.create_agent(
         ]
     ```
     Supported providers so far are: `"openai"`, `"openrouter"`, `"google"`, `"groq"`, `"anthropic"`, `"deepseek"`, `"wavespeed"`, `"nvidia"`, and `"lmstudio"`. Ensure the corresponding `api_key` is available in your API key file. OpenRouter models should use OpenRouter slugs such as `"openai/gpt-5"` or `"anthropic/claude-sonnet-4"`. LM Studio models can optionally include a `base_url` in the model dictionary when connecting to a non-default server. Wavespeed models use vendor-prefixed slugs such as `"moonshotai/kimi-k2.5"` or `"anthropic/claude-sonnet-4.6"`; the provider calls the Wavespeed LLM gateway (`https://llm.wavespeed.ai/v1`) with an automatic 401-fallback to `https://tropical-llm.wavespeed.ai/v1`. NVIDIA models use NIM/API Catalog slugs such as `"nvidia/llama-3.1-nemotron-nano-8b-v1"` and call the OpenAI-compatible NVIDIA endpoint (`https://integrate.api.nvidia.com/v1`); a model dictionary can also include `base_url` for a self-hosted NIM endpoint.
-    Agent responses also keep provider diagnostics in the first output block's `metadata`. Use `provider_response` for the successful raw provider response, `provider_attempts` for every attempted model/provider, and `provider_errors` for normalized errors. These fields are persisted in history and can be read with `manager.get_messages(user_id)` or `manager.read(get_full_dict=True)`.
+    Agent responses also keep provider diagnostics in the first output block's `metadata`. Use `provider_response` for the successful raw provider response, `provider_attempts` for every attempted model/provider, and `provider_errors` for normalized errors. If a model is temporarily suppressed after recent failures, `provider_attempts` includes a synthetic skipped attempt with `skipped=True`, `skip_reason`, and `model_health`. These fields are persisted in history and can be read with `manager.get_messages(user_id)` or `manager.read(get_full_dict=True)`.
     User messages produced by bot integrations keep incoming transport metadata in the first input block's `metadata.user_message`, including channel, user id, message type, timestamp, media info, and normalized original payload when available.
+    Model availability state is manager-wide and in memory. Use `manager.get_model_health()` to inspect recent failures, cooldowns, and the current status for registered models. Use `manager.clear_model_health()` to reset that operational state during tests or manual intervention.
 -   **`default_output`**: The output to use when all the models fail, should match the `required_outputs`.
 -   **`positive_filter`**: A list of `roles` to be included in the context of the agent (all other roles will be ignored if this is defined).
 -   **`negative_filter`**:  A list of `roles` to be excluded from the context.

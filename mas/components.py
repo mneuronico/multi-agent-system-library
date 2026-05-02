@@ -99,21 +99,51 @@ class Agent(Component):
             logger.debug(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2, ensure_ascii=False)}\n")
 
         provider_attempts = []
+        if hasattr(self.manager, "prepare_model_attempts"):
+            model_attempts = self.manager.prepare_model_attempts(self.models)
+        else:
+            model_attempts = [
+                {
+                    "model_info": model_info,
+                    "skip": False,
+                    "skip_reason": None,
+                    "status": {},
+                }
+                for model_info in self.models
+            ]
 
-        for model_info in self.models:
+        for model_attempt in model_attempts:
+            model_info = model_attempt["model_info"]
             provider = model_info["provider"].lower()
             model_name = model_info["model"]
+
+            if model_attempt.get("skip"):
+                provider_attempts.append(
+                    self._provider_skip_metadata(
+                        provider,
+                        model_name,
+                        model_attempt.get("skip_reason") or "recent_failure_cooldown",
+                        model_attempt.get("status") or {}
+                    )
+                )
+                if verbose:
+                    logger.warning(
+                        f"[Agent:{self.name}] Model {provider}/{model_name} is temporarily suppressed "
+                        "after recent failures. Trying the next available model."
+                    )
+                continue
+
             api_key = self.manager.get_key(provider)
 
             if not api_key:
-                provider_attempts.append(
-                    self._provider_error_metadata(
-                        provider,
-                        model_name,
-                        error_type="missing_api_key",
-                        message=f"No API key for provider '{provider}'."
-                    )
+                failure_metadata = self._provider_error_metadata(
+                    provider,
+                    model_name,
+                    error_type="missing_api_key",
+                    message=f"No API key for provider '{provider}'."
                 )
+                provider_attempts.append(failure_metadata)
+                self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
                 if verbose:
                     logger.warning(f"[Agent:{self.name}] No API key for '{provider}'. Skipping.")
                 continue
@@ -216,6 +246,7 @@ class Agent(Component):
                     )
                 provider_metadata["ok"] = True
                 provider_attempts.append(provider_metadata)
+                self._record_manager_model_success(provider, model_name, model_info, provider_metadata)
 
                 response_dict = self._extract_and_parse_json(response_str)
 
@@ -242,27 +273,27 @@ class Agent(Component):
                 return response_blocks
                 
             except requests.exceptions.RequestException as req_err:
-                provider_attempts.append(
-                    self._provider_exception_metadata(provider, model_name, req_err)
-                )
+                failure_metadata = self._provider_exception_metadata(provider, model_name, req_err)
+                provider_attempts.append(failure_metadata)
+                self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
                 if verbose:
                     logger.error(f"[Agent:{self.name}] HTTP error with provider={provider}, model={model_name}: {req_err}")
             except json.JSONDecodeError as json_err:
-                provider_attempts.append(
-                    self._provider_exception_metadata(provider, model_name, json_err)
-                )
+                failure_metadata = self._provider_exception_metadata(provider, model_name, json_err)
+                provider_attempts.append(failure_metadata)
+                self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
                 if verbose:
                     logger.error(f"[Agent:{self.name}] JSON decoding error with provider={provider}, model={model_name}: {json_err}")
             except ValueError as val_err:
-                provider_attempts.append(
-                    self._provider_exception_metadata(provider, model_name, val_err)
-                )
+                failure_metadata = self._provider_exception_metadata(provider, model_name, val_err)
+                provider_attempts.append(failure_metadata)
+                self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
                 if verbose:
                     logger.error(f"[Agent:{self.name}] Value error with provider={provider}, model={model_name}: {val_err}")
             except (KeyError, IndexError, TypeError) as parse_err:
-                provider_attempts.append(
-                    self._provider_exception_metadata(provider, model_name, parse_err)
-                )
+                failure_metadata = self._provider_exception_metadata(provider, model_name, parse_err)
+                provider_attempts.append(failure_metadata)
+                self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
                 if verbose:
                     logger.error(
                         f"[Agent:{self.name}] Invalid response shape with provider={provider}, "
@@ -391,6 +422,33 @@ class Agent(Component):
             "raw_response": raw_response,
         }
 
+    def _provider_skip_metadata(
+        self,
+        provider: str,
+        model_name: str,
+        reason: str,
+        health_status: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        remaining = health_status.get("cooldown_seconds_remaining")
+        if remaining is None:
+            message = f"Model {provider}/{model_name} is temporarily suppressed after recent failures."
+        else:
+            message = (
+                f"Model {provider}/{model_name} is temporarily suppressed after recent failures "
+                f"for another {round(float(remaining), 3)} seconds."
+            )
+        metadata = Agent._provider_error_metadata(
+            self,
+            provider,
+            model_name,
+            error_type="model_temporarily_suppressed",
+            message=message,
+        )
+        metadata["skipped"] = True
+        metadata["skip_reason"] = reason
+        metadata["model_health"] = copy.deepcopy(health_status)
+        return metadata
+
     def _provider_exception_metadata(
         self,
         provider: str,
@@ -425,6 +483,28 @@ class Agent(Component):
 
     def _remember_provider_response(self, metadata: Dict[str, Any]) -> None:
         self._last_provider_response_metadata = metadata
+
+    def _record_manager_model_failure(
+        self,
+        provider: str,
+        model_name: str,
+        model_info: Dict[str, Any],
+        metadata: Dict[str, Any]
+    ) -> None:
+        recorder = getattr(self.manager, "record_model_failure", None)
+        if callable(recorder):
+            recorder(provider, model_name, model_info, metadata)
+
+    def _record_manager_model_success(
+        self,
+        provider: str,
+        model_name: str,
+        model_info: Dict[str, Any],
+        metadata: Dict[str, Any]
+    ) -> None:
+        recorder = getattr(self.manager, "record_model_success", None)
+        if callable(recorder):
+            recorder(provider, model_name, model_info, metadata)
 
     def _attach_provider_metadata(
         self,

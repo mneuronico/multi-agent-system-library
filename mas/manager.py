@@ -4,6 +4,7 @@ from ._shared import *
 from .components import Agent, Automation, Component, Process, Tool
 from .parser import Parser
 from .bots import TelegramBot, WhatsappBot
+import math
 
 class AgentSystemManager:
 
@@ -28,13 +29,18 @@ class AgentSystemManager:
         log_level=None,
         admin_user_id: Optional[str] = None,
         usage_logging: bool = False,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        model_failure_policy: Optional[Union[bool, Dict[str, Any]]] = None
     ):
 
         self._tls = threading.local()
         self._db_pool = {}
         self._db_locks = {}
         self._db_write_lock = threading.RLock()
+        self._model_health_lock = threading.RLock()
+        self._model_health: Dict[str, Dict[str, Any]] = {}
+        self._model_failure_policy = self._default_model_failure_policy()
+        self._configure_model_failure_policy(model_failure_policy)
         self.base_directory = os.path.abspath(base_directory)
         self._usage_logging_enabled = bool(usage_logging)
         self.general_system_description = general_system_description
@@ -76,6 +82,7 @@ class AgentSystemManager:
         self.parser = Parser()
 
         self.default_models = default_models
+        self._register_model_infos(self.default_models)
 
         if not imports:
             self.imports = []
@@ -647,6 +654,506 @@ class AgentSystemManager:
 
     def cost_tool_call(self, tool_name):
         return self._price_for_tool(tool_name)
+
+    def _default_model_failure_policy(self) -> Dict[str, Any]:
+        return {
+            "enabled": True,
+            "base_cooldown_seconds": 60.0,
+            "min_cooldown_seconds": 30.0,
+            "max_cooldown_seconds": 1800.0,
+            "failure_half_life_seconds": 600.0,
+            "history_retention_seconds": 3600.0,
+            "failure_weights": {
+                "rate_limit": 1.5,
+                "auth": 3.0,
+                "server": 1.0,
+                "timeout": 1.0,
+                "network": 0.8,
+                "invalid_response": 0.7,
+                "missing_api_key": 3.0,
+                "unknown": 1.0,
+            },
+        }
+
+    def _configure_model_failure_policy(self, policy: Optional[Union[bool, Dict[str, Any]]]) -> None:
+        merged = copy.deepcopy(self._default_model_failure_policy())
+
+        if isinstance(policy, bool):
+            merged["enabled"] = policy
+        elif policy is not None:
+            if not isinstance(policy, dict):
+                raise ValueError("general_parameters.model_failure_policy must be a JSON object or boolean.")
+
+            scalar_keys = {
+                "enabled",
+                "base_cooldown_seconds",
+                "min_cooldown_seconds",
+                "max_cooldown_seconds",
+                "failure_half_life_seconds",
+                "history_retention_seconds",
+            }
+            for key in scalar_keys:
+                if key in policy:
+                    merged[key] = policy[key]
+
+            weights = policy.get("failure_weights")
+            if isinstance(weights, dict):
+                for name, weight in weights.items():
+                    merged["failure_weights"][str(name)] = float(weight)
+
+        merged["enabled"] = bool(merged.get("enabled", True))
+        for key in (
+            "base_cooldown_seconds",
+            "min_cooldown_seconds",
+            "max_cooldown_seconds",
+            "failure_half_life_seconds",
+            "history_retention_seconds",
+        ):
+            merged[key] = max(0.0, float(merged.get(key, 0.0)))
+
+        if merged["max_cooldown_seconds"] <= 0:
+            merged["max_cooldown_seconds"] = 1800.0
+        if merged["min_cooldown_seconds"] > merged["max_cooldown_seconds"]:
+            merged["min_cooldown_seconds"] = merged["max_cooldown_seconds"]
+        if merged["base_cooldown_seconds"] <= 0:
+            merged["base_cooldown_seconds"] = merged["min_cooldown_seconds"] or 1.0
+        if merged["failure_half_life_seconds"] <= 0:
+            merged["failure_half_life_seconds"] = 600.0
+        if merged["history_retention_seconds"] <= 0:
+            merged["history_retention_seconds"] = max(
+                merged["failure_half_life_seconds"] * 6,
+                merged["max_cooldown_seconds"],
+            )
+
+        with self._model_health_lock:
+            self._model_failure_policy = merged
+
+    def _model_health_now(self) -> float:
+        return datetime.now(timezone.utc).timestamp()
+
+    def _model_provider_and_name(
+        self,
+        model_info: Optional[Dict[str, Any]] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None
+    ):
+        info = model_info or {}
+        provider_name = provider or info.get("provider")
+        model_name = model or info.get("model")
+        provider_name = str(provider_name or "").lower()
+        model_name = str(model_name or "")
+        return provider_name, model_name
+
+    def _model_base_url(self, model_info: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(model_info, dict):
+            return None
+        for key in ("base_url", "api_base", "api_base_url"):
+            value = model_info.get(key)
+            if value:
+                return str(value).rstrip("/").lower()
+        return None
+
+    def _model_health_key(
+        self,
+        model_info: Optional[Dict[str, Any]] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None
+    ) -> str:
+        provider_name, model_name = self._model_provider_and_name(model_info, provider, model)
+        if not provider_name or not model_name:
+            raise ValueError("Model health entries require both provider and model.")
+        base_url = self._model_base_url(model_info)
+        parts = [provider_name, model_name]
+        if base_url:
+            parts.append(base_url)
+        return "::".join(parts)
+
+    def _empty_model_health_entry(
+        self,
+        key: str,
+        provider: str,
+        model: str,
+        base_url: Optional[str]
+    ) -> Dict[str, Any]:
+        return {
+            "key": key,
+            "provider": provider,
+            "model": model,
+            "base_url": base_url,
+            "registered": True,
+            "failure_events": [],
+            "success_events": [],
+            "consecutive_failures": 0,
+            "last_failure_at": None,
+            "last_success_at": None,
+            "cooldown_until": None,
+            "cooldown_seconds": 0.0,
+            "last_error": None,
+        }
+
+    def _ensure_model_health_entry_unlocked(
+        self,
+        model_info: Optional[Dict[str, Any]] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        provider_name, model_name = self._model_provider_and_name(model_info, provider, model)
+        key = self._model_health_key(model_info, provider_name, model_name)
+        base_url = self._model_base_url(model_info)
+        entry = self._model_health.get(key)
+        if entry is None:
+            entry = self._empty_model_health_entry(key, provider_name, model_name, base_url)
+            self._model_health[key] = entry
+        else:
+            entry["registered"] = True
+            entry["provider"] = provider_name
+            entry["model"] = model_name
+            entry["base_url"] = base_url
+        return entry
+
+    def _register_model_infos(self, models: Optional[List[Dict[str, Any]]]) -> None:
+        if not models:
+            return
+        with self._model_health_lock:
+            for model_info in models:
+                if not isinstance(model_info, dict):
+                    continue
+                try:
+                    self._ensure_model_health_entry_unlocked(model_info)
+                except ValueError:
+                    continue
+
+    def _prune_model_health_events_unlocked(self, entry: Dict[str, Any], now: float) -> None:
+        policy = self._model_failure_policy
+        retention = max(
+            float(policy.get("history_retention_seconds", 3600.0)),
+            float(policy.get("max_cooldown_seconds", 1800.0)),
+        )
+        for key in ("failure_events", "success_events"):
+            entry[key] = [
+                event
+                for event in entry.get(key, [])
+                if now - float(event.get("at", 0.0)) <= retention
+            ]
+
+    def _model_status_from_entry_unlocked(self, entry: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cooldown_until = entry.get("cooldown_until")
+        remaining = 0.0
+        if cooldown_until is not None:
+            remaining = max(0.0, float(cooldown_until) - now)
+        in_cooldown = bool(
+            self._model_failure_policy.get("enabled", True)
+            and cooldown_until is not None
+            and remaining > 0
+        )
+        return {
+            "key": entry["key"],
+            "provider": entry["provider"],
+            "model": entry["model"],
+            "base_url": entry.get("base_url"),
+            "in_cooldown": in_cooldown,
+            "cooldown_until": cooldown_until if in_cooldown else None,
+            "cooldown_seconds_remaining": remaining if in_cooldown else 0.0,
+            "consecutive_failures": entry.get("consecutive_failures", 0),
+            "last_failure_at": entry.get("last_failure_at"),
+            "last_success_at": entry.get("last_success_at"),
+            "last_error": copy.deepcopy(entry.get("last_error")),
+        }
+
+    def _model_availability_entries_unlocked(
+        self,
+        models: Optional[List[Dict[str, Any]]],
+        now: float
+    ) -> List[Dict[str, Any]]:
+        entries = []
+        for index, model_info in enumerate(models or []):
+            if not isinstance(model_info, dict):
+                continue
+            try:
+                entry = self._ensure_model_health_entry_unlocked(model_info)
+            except ValueError:
+                continue
+            self._prune_model_health_events_unlocked(entry, now)
+            entries.append({
+                "index": index,
+                "model_info": model_info,
+                "status": self._model_status_from_entry_unlocked(entry, now),
+            })
+        return entries
+
+    def order_models_for_availability(
+        self,
+        models: Optional[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        now = self._model_health_now()
+        with self._model_health_lock:
+            entries = self._model_availability_entries_unlocked(models, now)
+            if not self._model_failure_policy.get("enabled", True):
+                return [entry["model_info"] for entry in entries]
+
+            available = [entry for entry in entries if not entry["status"]["in_cooldown"]]
+            cooled = [entry for entry in entries if entry["status"]["in_cooldown"]]
+            if available:
+                ordered = available + sorted(
+                    cooled,
+                    key=lambda entry: (
+                        entry["status"].get("cooldown_until") or float("inf"),
+                        entry["index"],
+                    ),
+                )
+            else:
+                ordered = sorted(
+                    entries,
+                    key=lambda entry: (
+                        entry["status"].get("cooldown_until") or float("inf"),
+                        entry["index"],
+                    ),
+                )
+            return [entry["model_info"] for entry in ordered]
+
+    def prepare_model_attempts(
+        self,
+        models: Optional[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        now = self._model_health_now()
+        with self._model_health_lock:
+            entries = self._model_availability_entries_unlocked(models, now)
+            if not self._model_failure_policy.get("enabled", True):
+                return [
+                    {
+                        "model_info": entry["model_info"],
+                        "skip": False,
+                        "skip_reason": None,
+                        "status": copy.deepcopy(entry["status"]),
+                    }
+                    for entry in entries
+                ]
+
+            available = [entry for entry in entries if not entry["status"]["in_cooldown"]]
+            if available:
+                return [
+                    {
+                        "model_info": entry["model_info"],
+                        "skip": entry["status"]["in_cooldown"],
+                        "skip_reason": "recent_failure_cooldown" if entry["status"]["in_cooldown"] else None,
+                        "status": copy.deepcopy(entry["status"]),
+                    }
+                    for entry in entries
+                ]
+
+            if not entries:
+                return []
+
+            selected = min(
+                entries,
+                key=lambda entry: (
+                    entry["status"].get("cooldown_until") or float("inf"),
+                    entry["index"],
+                ),
+            )
+            prepared = [{
+                "model_info": selected["model_info"],
+                "skip": False,
+                "skip_reason": None,
+                "status": copy.deepcopy(selected["status"]),
+            }]
+            for entry in entries:
+                if entry is selected:
+                    continue
+                prepared.append({
+                    "model_info": entry["model_info"],
+                    "skip": True,
+                    "skip_reason": "recent_failure_cooldown",
+                    "status": copy.deepcopy(entry["status"]),
+                })
+            return prepared
+
+    def _first_provider_error(self, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(metadata, dict):
+            return {"type": "unknown", "message": ""}
+        errors = metadata.get("errors")
+        if isinstance(errors, list) and errors:
+            first = errors[0]
+            if isinstance(first, dict):
+                return first
+            return {"type": "unknown", "message": str(first)}
+        error = metadata.get("error")
+        if isinstance(error, dict):
+            return error
+        if error is not None:
+            return {"type": "unknown", "message": str(error)}
+        return {"type": "unknown", "message": ""}
+
+    def _classify_model_failure(self, metadata: Optional[Dict[str, Any]]) -> str:
+        status_code = None
+        if isinstance(metadata, dict) and metadata.get("status_code") is not None:
+            try:
+                status_code = int(metadata.get("status_code"))
+            except (TypeError, ValueError):
+                status_code = None
+
+        error = self._first_provider_error(metadata)
+        error_type = str(error.get("type") or "").lower()
+        message = str(error.get("message") or "").lower()
+        combined = f"{error_type} {message}"
+
+        if error_type == "missing_api_key":
+            return "missing_api_key"
+        if status_code == 429 or "rate limit" in combined or "quota" in combined:
+            return "rate_limit"
+        if status_code in (401, 403) or "unauthorized" in combined or "forbidden" in combined:
+            return "auth"
+        if status_code is not None and status_code >= 500:
+            return "server"
+        if "timeout" in combined or "timed out" in combined:
+            return "timeout"
+        if any(token in combined for token in ("connection", "network", "dns", "temporarily unavailable")):
+            return "network"
+        if any(token in error_type for token in ("jsondecode", "keyerror", "indexerror", "typeerror")):
+            return "invalid_response"
+        return "unknown"
+
+    def _compute_model_cooldown_unlocked(
+        self,
+        failure_events: List[Dict[str, Any]],
+        now: float
+    ) -> float:
+        policy = self._model_failure_policy
+        half_life = max(float(policy.get("failure_half_life_seconds", 600.0)), 1.0)
+        score = 0.0
+        for event in failure_events:
+            age = max(0.0, now - float(event.get("at", now)))
+            decay = math.exp(-math.log(2) * age / half_life)
+            score += float(event.get("weight", 1.0)) * decay
+
+        base = float(policy.get("base_cooldown_seconds", 60.0))
+        min_cooldown = float(policy.get("min_cooldown_seconds", 30.0))
+        max_cooldown = float(policy.get("max_cooldown_seconds", 1800.0))
+        cooldown = base * (2 ** max(0.0, score - 1.0))
+        if not math.isfinite(cooldown):
+            cooldown = max_cooldown
+        return max(min_cooldown, min(max_cooldown, cooldown))
+
+    def record_model_failure(
+        self,
+        provider: str,
+        model: str,
+        model_info: Optional[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]]
+    ) -> None:
+        if isinstance(metadata, dict) and metadata.get("skipped"):
+            return
+
+        now = self._model_health_now()
+        with self._model_health_lock:
+            entry = self._ensure_model_health_entry_unlocked(model_info, provider, model)
+            self._prune_model_health_events_unlocked(entry, now)
+
+            failure_type = self._classify_model_failure(metadata)
+            weights = self._model_failure_policy.get("failure_weights", {})
+            weight = float(weights.get(failure_type, weights.get("unknown", 1.0)))
+            provider_error = self._first_provider_error(metadata)
+            status_code = metadata.get("status_code") if isinstance(metadata, dict) else None
+            last_error = {
+                "type": failure_type,
+                "provider_error_type": provider_error.get("type"),
+                "message": provider_error.get("message"),
+                "status_code": status_code,
+            }
+            event = {
+                "at": now,
+                "type": failure_type,
+                "weight": weight,
+                "error": copy.deepcopy(last_error),
+            }
+
+            entry["failure_events"].append(event)
+            entry["consecutive_failures"] = int(entry.get("consecutive_failures") or 0) + 1
+            entry["last_failure_at"] = now
+            entry["last_error"] = last_error
+
+            if self._model_failure_policy.get("enabled", True):
+                cooldown = self._compute_model_cooldown_unlocked(entry["failure_events"], now)
+                entry["cooldown_seconds"] = cooldown
+                entry["cooldown_until"] = now + cooldown
+
+    def record_model_success(
+        self,
+        provider: str,
+        model: str,
+        model_info: Optional[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        now = self._model_health_now()
+        with self._model_health_lock:
+            entry = self._ensure_model_health_entry_unlocked(model_info, provider, model)
+            self._prune_model_health_events_unlocked(entry, now)
+            entry["success_events"].append({"at": now})
+            entry["consecutive_failures"] = 0
+            entry["last_success_at"] = now
+            entry["cooldown_until"] = None
+            entry["cooldown_seconds"] = 0.0
+            entry["last_error"] = None
+
+    def get_model_health(
+        self,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        model_info: Optional[Dict[str, Any]] = None
+    ) -> Optional[Union[Dict[str, Any], Dict[str, Dict[str, Any]]]]:
+        now = self._model_health_now()
+        provider_name = str(provider).lower() if provider is not None else None
+
+        with self._model_health_lock:
+            for entry in self._model_health.values():
+                self._prune_model_health_events_unlocked(entry, now)
+
+            if model_info is not None or (provider_name and model):
+                key = self._model_health_key(model_info, provider_name, model)
+                entry = self._model_health.get(key)
+                if entry is None:
+                    return None
+                return self._public_model_health_snapshot_unlocked(entry, now)
+
+            snapshots = {
+                key: self._public_model_health_snapshot_unlocked(entry, now)
+                for key, entry in self._model_health.items()
+                if provider_name is None or entry.get("provider") == provider_name
+            }
+            return snapshots
+
+    def _public_model_health_snapshot_unlocked(
+        self,
+        entry: Dict[str, Any],
+        now: float
+    ) -> Dict[str, Any]:
+        snapshot = copy.deepcopy(entry)
+        status = self._model_status_from_entry_unlocked(entry, now)
+        snapshot.update(status)
+        snapshot["failure_count"] = len(snapshot.get("failure_events", []))
+        snapshot["success_count"] = len(snapshot.get("success_events", []))
+        return snapshot
+
+    def clear_model_health(
+        self,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        model_info: Optional[Dict[str, Any]] = None
+    ) -> None:
+        provider_name = str(provider).lower() if provider is not None else None
+        with self._model_health_lock:
+            if model_info is None and provider_name is None and model is None:
+                self._model_health.clear()
+                return
+
+            if model_info is None and provider_name is not None and model is None:
+                for key in list(self._model_health.keys()):
+                    if self._model_health[key].get("provider") == provider_name:
+                        del self._model_health[key]
+                return
+
+            key = self._model_health_key(model_info, provider_name, model)
+            self._model_health.pop(key, None)
     
     def _now_iso(self):
         return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1356,6 +1863,7 @@ class AgentSystemManager:
 
         if models is None:
             models = self.default_models.copy()
+        self._register_model_infos(models)
     
         if isinstance(required_outputs, str):
             required_outputs = {"response": required_outputs}
@@ -1756,6 +2264,9 @@ class AgentSystemManager:
             self.functions = []
 
         self.default_models = general_params.get("default_models", self.default_models)
+        if "model_failure_policy" in general_params:
+            self._configure_model_failure_policy(general_params.get("model_failure_policy"))
+        self._register_model_infos(self.default_models)
         self.on_update = self._resolve_callable(general_params.get("on_update"))
         self.on_complete = self._resolve_callable(general_params.get("on_complete"))
         self.include_timestamp = general_params.get("include_timestamp", False)
