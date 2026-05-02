@@ -93,6 +93,11 @@ def _install_telegram_stub() -> None:
         PHOTO = _Filter()
         VOICE = _Filter()
         AUDIO = _Filter()
+        VIDEO = _Filter()
+        DOCUMENT = _Filter()
+        STICKER = _Filter()
+        Document = types.SimpleNamespace(ALL=_Filter())
+        Sticker = types.SimpleNamespace(ALL=_Filter())
 
     class _ApplicationBuilder:
         def token(self, token):

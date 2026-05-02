@@ -63,6 +63,10 @@ def main(argv=None):
     sp_pull.add_argument("--dir", dest="project_dir", default=None)
     sp_pull.add_argument("--force-copy-script", action="store_true")
     sp_pull.add_argument("--quiet", action="store_true")
+    sp_pull.add_argument("--user-id", dest="user_ids", action="append", default=None,
+                         help="Download only one user's history. Repeat for multiple users.")
+    sp_pull.add_argument("--user-ids", dest="user_ids_csv", default=None,
+                         help="Comma-separated list of user IDs to download.")
 
     sp_setup = sp.add_parser("setup", help="Interactive guide to complete params.json")
     sp_setup.add_argument("-c", "--config", dest="config_path", default=None)
@@ -110,8 +114,14 @@ def main(argv=None):
         return code
 
     if args.cmd == "pull-history":
+        user_ids = []
+        if args.user_ids:
+            user_ids.extend(args.user_ids)
+        if args.user_ids_csv:
+            user_ids.append(args.user_ids_csv)
         code = _pull(config_path=args.config_path, project_dir=args.project_dir,
-                     force_copy_script=args.force_copy_script, quiet=args.quiet)
+                     force_copy_script=args.force_copy_script, quiet=args.quiet,
+                     user_ids=user_ids or None)
         return code
     
     if args.cmd == "setup":

@@ -216,6 +216,7 @@ ANOTHER=VAL
 
 * User histories are stored as SQLite files in S3 under `history/<chat_id>.sqlite`.
 * maws automatically imports/exports around processing.
+* `maws pull-history` syncs all history files by default. Use `--user-id <id>` repeatedly or `--user-ids <id,id>` to download only selected user histories.
 * For **tokens** defined in `SPECIAL_TOKEN_FILES_JSON`, it syncs S3 to `/tmp` (or package to `/tmp` if missing in S3) and can optionally expose paths via `TOKEN_ENV_MAP_JSON`.
 
 ---

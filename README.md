@@ -47,7 +47,7 @@ Installing `mas` from GitHub is easy and straightforward.
 
 ### Prerequisites
 
--   Python 3.7+
+-   Python 3.9+
 -   [Git](https://git-scm.com/downloads)
 -   API keys for services you plan to use (OpenAI, Groq, etc)
 
@@ -164,9 +164,10 @@ If you just have an idea and don’t feel like writing JSON yet, pass the idea s
 The manager will:
 
 1.  Read this very README to learn about the MAS framework.  
-2.  Spin up an *internal* agent called **`system_writer`** (running on the best
-    available model chain – `o3`, `gemini-2.5-pro`, `deepseek-r1`, `claude-4`,
-    `llama-4@groq`).
+2.  Spin up an *internal* agent called **`system_writer`**. By default this
+    bootstrap agent tries OpenAI `gpt-5`, Google `gemini-2.5-pro`, and
+    Anthropic `claude-sonnet-4` in order; you can override that with the
+    `bootstrap_models` constructor argument.
 3.  Ask that agent to turn your description into:
     * `general_parameters`
     * a full **components** list
@@ -307,8 +308,8 @@ You don't need to worry about creating these structures yourself. When you call 
 3.  **A `str`**:
     - If the string is a path to a valid local image file, it's read, saved internally, and converted into an `image` block.
     - Otherwise, it's treated as plain text and becomes a `text` block.
-4.  **`bytes` or `bytearray`**: Assumed to be image or audio data. The bytes are saved to a file in the `files/` directory and wrapped in an `image` or `audio` block.
-5.  **A `dict`**: The object is serialized to a JSON string and placed inside a `text` block. If the object contains non-serializable data (like custom class instances), each such value is saved as a `.pkl` file and replaced with a `file:/...` reference.
+4.  **Image `bytes` or `bytearray`**: If the byte header is recognized as an image, the bytes are saved to a file in the `files/` directory and wrapped in an `image` block. Unknown byte payloads are not guessed as media; put them inside a dictionary or an explicit block if you want MAS to persist them as file references.
+5.  **A `dict`**: The dictionary is placed inside a `text` block as structured content. If it contains non-JSON values such as bytes or custom class instances, those values are saved under `files/` and replaced with `file:/...` references.
 
 #### Consuming Data from Blocks
 
@@ -398,8 +399,8 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 -   **`functions`**: The name of a Python file, or list of Python files, where function definitions must be located. Files must either exist in the base directory or be referenced as an absolute path. If not defined, this defaults to `fns.py` inside the `base_directory`.
 -   **`default_models`**: A list of models to use when executing agents, for agents that don't define specific models. Each element of the list should be a dictionary with two fields, `provider` (like 'groq' or 'openai') and `model` (the specific model name). These models will be tried in order, and failure of a model will trigger a call to the next one in the chain.
 -   **`imports`**: List of component import specifications. Each entry can be either `"<your_json>.json"` to import all components from that file, or `"<your_json>.json?[comp1, comp2]"` to import specific components from that file.
--   **`on_update`**: Function to be executed each time an individual component is finished running. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like updating an independent database or sending messages to user during an automation.
--   **`on_complete`**: Function to be executed when `manager.run`() reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both will be executed), but it's different for automations, since it will only be ran at the end of the automation. The function must receive a list of messages and the manager as the only two arguments. Useful for doing things like sending the last message to the user after a complex automation workflow.
+-   **`on_update`**: Function to be executed each time an individual component is finished running. It can accept `messages`, `manager`, and optionally a third `params` argument when the caller provides callback parameters. Useful for updating an external database or sending incremental bot messages during an automation.
+-   **`on_complete`**: Function to be executed when `manager.run()` reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both can run), but it is different for automations because it runs at the end of the automation. It follows the same callback signature flexibility as `on_update`.
 -   **`include_timestamp`**: Whether the agents receive the `timestamp` for each message in the conversation history. False by default. This is overriden by the `include_timestamp` parameter associated with each agent, if specified. 
 -   **`timezone`**: String defining what timezone should the `timestamp` information be saved in. Defaults to `UTC`.
 -   **`log_level`**: Logging level for the library. Defaults to `logging.DEBUG`.
@@ -520,6 +521,13 @@ agent_name = manager.create_agent(
     Agent responses also keep provider diagnostics in the first output block's `metadata`. Use `provider_response` for the successful raw provider response, `provider_attempts` for every attempted model/provider, and `provider_errors` for normalized errors. If a model is temporarily suppressed after recent failures, `provider_attempts` includes a synthetic skipped attempt with `skipped=True`, `skip_reason`, and `model_health`. These fields are persisted in history and can be read with `manager.get_messages(user_id)` or `manager.read(get_full_dict=True)`.
     User messages produced by bot integrations keep incoming transport metadata in the first input block's `metadata.user_message`, including channel, user id, message type, timestamp, media info, and normalized original payload when available.
     Model availability state is manager-wide and in memory. Use `manager.get_model_health()` to inspect recent failures, cooldowns, and the current status for registered models. Use `manager.clear_model_health()` to reset that operational state during tests or manual intervention.
+    ```python
+    last = manager.read(get_full_dict=True)
+    metadata = last["message"][0].get("metadata", {})
+    raw_response = metadata.get("provider_response", {}).get("raw_response")
+    attempts = metadata.get("provider_attempts", [])
+    errors = metadata.get("provider_errors", [])
+    ```
 -   **`default_output`**: The output to use when all the models fail, should match the `required_outputs`.
 -   **`positive_filter`**: A list of `roles` to be included in the context of the agent (all other roles will be ignored if this is defined).
 -   **`negative_filter`**:  A list of `roles` to be excluded from the context.
@@ -1134,10 +1142,10 @@ output = manager.run(
 )
 print(output)
 ```
--   **`input`**: Optional string or dict to store in the message history. If it's a string, it will be stored with the role `"user"`. If it's a dictionary, it will be stored with the role `"internal"`, assumed to be information added by the developer.
+-   **`input`**: Optional value to store before running the component. By default it is saved as a user message using MAS blocks. Strings are wrapped as `{"response": input}` so agents and bot replies can use the same shape; dictionaries are stored as structured text-block content. Pass `role="internal"` or another custom role if you want to save developer-provided context instead of user input.
 -   **`component_name`**: The name of the component to run. If not specified it uses the latest created automation, or creates a linear automation if one does not exist using all components available in their order of creation.
 -   **`user_id`**: The ID of the user whose database should be used. If not specified, the current user is used, or created if not set.
--   **`role`**: Role to use when saving the input, defaults to `"user"` if the input is a string, or `"internal"` if input is a dictionary, but can be overriden by developer.
+-   **`role`**: Role to use when saving the input. Defaults to `"user"` for all input types and can be overridden by the developer, for example with `"internal"` for developer-provided context.
 -   **`verbose`**: Boolean to enable verbose mode.
 -   **`target_input`**: The name of a component or user to use as input. This parameter can contain `mas input syntax` which will be parsed by the parser, equivalent to just calling `target_custom` (more details below).
 -   **`target_index`**: An integer or range to select a message by index in the selected `target_input`.  Negative indices count from the end (e.g., `-1` is the last message). If no index is passed, the component will use a default logic to select message(s). Ranges must be passed as tuples, and the string "~" stands for "all messages".
@@ -1214,7 +1222,7 @@ The `get_messages` method retrieves a structured history of all messages for a s
 #### Method Signature
 
 ```python
-manager.get_messages(user_id: Optional[str] = None) -> List[Dict[str, str]]
+manager.get_messages(user_id: Optional[str] = None) -> List[Dict[str, Any]]
 ```
 
 #### Parameters
@@ -1255,7 +1263,7 @@ manager.read(
 *   **`source`**: Filters messages by one or more `source` roles (e.g., `'user'`, `['agent1', 'tool2']`).
 *   **`index`**: Selects messages by index: `-1` for the last message (default), `None` for all messages, or a tuple `(start, end)` for a slice.
 *   **`get_full_dict`**: If `True`, returns the complete message dictionary (or list of dictionaries if the `index` returns a slice).
-*   **`block_type`**: Filters blocks within the selected messages by their type (`'text'`, `'image'`, `'audio'`).
+*   **`block_type`**: Filters blocks within the selected messages by their type (`'text'`, `'image'`, `'audio'`, `'video'`, `'document'`, or `'sticker'`).
 *   **`block_index`**: Selects a specific block by its index after filtering by `block_type`.
 
 #### Usage Examples
@@ -1318,9 +1326,7 @@ manager.add_blocks(
     *,
     role: str = "user",
     msg_type: str = "user",
-    user_id: Optional[str] = None,
-    detail: str = "auto",
-    verbose: bool = False
+    user_id: Optional[str] = None
 ) -> int:
 ```
 
@@ -1329,8 +1335,8 @@ This method intelligently processes the `content` parameter:
 -   **If `content` is a `str`**:
     -   If the string is a path to a valid image file (e.g., `"./images/photo.jpg"`), an `image` block is created.
     -   Otherwise, a `text` block is created.
--   **If `content` is `bytes`**: It is assumed to be image data, and an `image` block is created. The system will save the bytes to a file within the `files/` directory.
--   **If `content` is a `dict`**: The dictionary is serialized to a JSON string and stored as a `text` block. If the dictionary contains non-serializable values, they are persisted as `.pkl` files and referenced internally.
+-   **If `content` is image `bytes`**: An `image` block is created and the system saves the bytes to a file within the `files/` directory. Unknown byte payloads should be wrapped in a dictionary or explicit block if you want them saved as file references.
+-   **If `content` is a `dict`**: The dictionary is stored as structured `text` block content. Non-JSON values are persisted under `files/` and replaced with `file:/...` references.
 -   **If `content` is a `list`**: Each element in the list is processed using the same logic described above. This allows you to create multi-part messages (e.g., text followed by an image) in a single call.
 
 The method returns the `msg_number` of the newly created message in the database.
@@ -1377,7 +1383,7 @@ history file.
 `manager.has_new_updates()` can then be used as a boolean check to detect if new
 messages were added to the current user's history since the last check.
 
-### Retrieving API keys with `get_keys`
+### Retrieving API keys with `get_key`
 
 By default, the API keys file is used to store LLM provider keys, as well as the Bot Token for Telegram integration. However, you can also add any other key or sensitive string that you want to that file, and the manager will save it internally under the name you provide for it. Then, if you need to access it (for example, inside a `Tool` or `Process` function, to access an external API, database or anything else), you can use:
 
@@ -1710,7 +1716,7 @@ manager.start_whatsapp_bot(
 
 Both `TelegramBot` and `WhatsappBot` come with a powerful set of features out-of-the-box:
 
-*   **Multimodal Support**: Automatically process text messages, images with captions, and voice/audio notes.
+*   **Multimodal Support**: Automatically process text messages, images with captions, voice/audio notes, videos, documents, stickers, and WhatsApp reaction messages. Media messages are saved as MAS file blocks so they can be persisted in history and inspected by your system.
 *   **Automatic Speech-to-Text (STT)**: Voice notes and audio files are automatically transcribed to text using the manager's `stt()` method, allowing your agents to understand voice messages without any extra configuration.
 *   **Built-in Commands**:
     *   `/start`: Sends the welcome message (`on_start_msg`).
@@ -1743,10 +1749,27 @@ When using the bot integrations, the `on_complete` and `on_update` callbacks giv
 *   **Custom Behavior**: Your callback function (which can work as on_update, on_complete or both), defined as `def my_callback(messages, manager, params):`, determines what is sent based on its return value:
     *   **Return `None`**: Nothing is sent to the user.
     *   **Return a `str`**: The string is sent as a plain text message.
-    *   **Return a `list` of blocks**: The system iterates through the list and sends each block as a separate message. A `text` block becomes a text message, an `image` block a photo, and an `audio` block a voice message.
+    *   **Return a `list` of blocks**: The system iterates through the list and sends each block as a separate message. A `text` block becomes a text message, an `image` block a photo, an `audio` block an audio/voice message, and `video`, `document`, or `sticker` blocks are sent through the matching platform media API.
     *   **Return any other type**: The value is converted to a list of blocks using `manager._to_blocks()` and sent accordingly.
 
-This allows for anything from simple text replies to complex, multi-part responses with images and audio.
+This allows for anything from simple text replies to complex, multi-part responses with images, audio, video, documents, and stickers.
+
+#### Direct Bot Actions
+
+When you keep the returned bot instance (`start_polling=False` for Telegram or `run_server=False` for WhatsApp), both bot classes expose the same async action interface:
+
+```python
+await bot.send_text(user_id, "hello")
+await bot.send_image(user_id, "file:/path/to/photo.jpg", caption="Photo")
+await bot.send_audio(user_id, "file:/path/to/audio.ogg")
+await bot.send_video(user_id, "file:/path/to/video.mp4", caption="Video")
+await bot.send_document(user_id, "file:/path/to/report.pdf", filename="report.pdf")
+await bot.send_sticker(user_id, "file:/path/to/sticker.webp")
+await bot.react_to_message(user_id, message_id, "\U0001F44D")
+await bot.remove_reaction(user_id, message_id)
+```
+
+For media arguments, MAS accepts a local path, a `file:` path saved by the manager, a public URL, or a platform media/file id where the platform supports reusing one.
 
 
 ## Multimodal Message Support
@@ -1781,6 +1804,18 @@ The `mas` library normalizes all message content into a list of "blocks". Each b
     "content": {
       "kind": "file",
       "path": "file:/path/to/files/user_id/5678.ogg"
+    }
+  }
+  ```
+- **Video, document, and sticker blocks** use the same file/url/id shape:
+  ```json
+  {
+    "type": "document",
+    "content": {
+      "kind": "file",
+      "path": "file:/path/to/files/user_id/report.pdf",
+      "caption": "Quarterly report",
+      "filename": "report.pdf"
     }
   }
   ```
@@ -1954,15 +1989,15 @@ The library is designed for robust operation, handling various errors gracefully
 
 The `mas` library is designed to be flexible and versatile, and you can use it to fit your own specific needs and requirements. However, certain patterns are commonly repeated and are worth mentioning here for beginners who are learning to build multi agent systems effectively.
 
-### Model Recommendations
+### Model Selection Notes
 
--  **`groq: llama-3.1-8b-instant`**: Free to use and extremely fast when ran in groq's hardware. It works relatively well for very simple tasks, usually good for testing during development. Not good for production as it makes too many mistakes and rate limits are not permissive enough.
--  **`groq: llama-3.3-70b-versatile`**: Free to use and quite fast, as well as intelligent enough for relatively complex tasks. Good for testing complex workflows during development. Not good for production as rate limits are too low.
--  **`deepseek: deepseek-chat`**: Very cheap, fast and intelligent enough for most tasks. Good for production, especially for agents that don't require complex reasoning.
--  **`deepseek: deepseek-reasoner`**: State-of-the-art reasoning, cheaper than commonly used models, such as gpt-4o. Thinking time can take seconds or even minutes, but results are usually robust for high-complexity tasks.
--  **`google: gemini-2.0-flash-exp`**: Free to use as of January 2025, good for its 1M token context window and its speed, quite good at reasoning as well.
--  **`openai: gpt-4o`**: Usually taken as the default model for its reasonably good speed, intelligence and robustness. However, it's quite expensive compared to models such as deepseek's `deepseek-chat` or `deepseek-reasoner`.
--  **`openai: o3`**: State-of-the-art reasoning, but the most expensive model by far in this list, and not necessarily better than `deepseek-reasoner` in most cases.
+Model availability, pricing, and free tiers change frequently, so treat the examples below as starting points and verify current provider dashboards before production use.
+
+-  **Fast development/testing**: Small Groq, Google Gemini Flash, NVIDIA NIM, or OpenRouter free-tier models are useful for quick iteration when their rate limits fit your workflow.
+-  **Low-cost production**: DeepSeek, Gemini Flash, and low-cost OpenAI/OpenRouter models are often good candidates for routine structured-output agents.
+-  **Reasoning-heavy workflows**: Use stronger reasoning models only on the steps that need them. MAS makes this practical because each agent can define its own model list.
+-  **Local development**: LM Studio can be used through the `lmstudio` provider with a local OpenAI-compatible server and a mock key in your API key file.
+-  **Provider fallback**: Put your best-case model order first. MAS preserves that order when providers are healthy, and the manager-wide model failure policy temporarily avoids models with recent failures.
 
 ### Design Patterns
 
@@ -2292,10 +2327,10 @@ maws update \
 
 ### 3) `maws pull-history`
 
-Downloads your per-user SQLite histories from the **history bucket** into `./history`.
+Downloads your per-user SQLite histories from the **history bucket** into `./history`. Without filters it syncs every history file. Use `--user-id` repeatedly or `--user-ids` with a comma-separated list to download only specific users.
 
 ```bash
-maws pull-history [-c|--config params.json] [--dir <path>] [--force-copy-script] [--quiet]
+maws pull-history [-c|--config params.json] [--dir <path>] [--force-copy-script] [--quiet] [--user-id <id>] [--user-ids <id,id>]
 ```
 
 ---
@@ -2372,6 +2407,9 @@ update()
 
 # Pull conversation DBs from S3
 pull_history()
+
+# Pull only selected users
+pull_history(user_ids=["telegram-chat-id", "whatsapp-user-id"])
 
 # Interactive param refinement (or use programmatic edits to params.json yourself)
 setup()

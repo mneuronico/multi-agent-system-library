@@ -40,14 +40,14 @@ class Agent(Component):
         if isinstance(required_outputs, str):
             self.required_outputs = {"response": required_outputs}
         else:
-            self.required_outputs = required_outputs
+            self.required_outputs = copy.deepcopy(required_outputs)
 
-        self.models = models
-        self.default_output = default_output or {"response": "No valid response."}
-        self.positive_filter = positive_filter
-        self.negative_filter = negative_filter
+        self.models = copy.deepcopy(models)
+        self.default_output = copy.deepcopy(default_output) if default_output is not None else {"response": "No valid response."}
+        self.positive_filter = copy.deepcopy(positive_filter)
+        self.negative_filter = copy.deepcopy(negative_filter)
         self.general_system_description = general_system_description
-        self.model_params = model_params or {}
+        self.model_params = copy.deepcopy(model_params) if model_params is not None else {}
         self.include_timestamp = include_timestamp
         self.description = description if description else "Agent"
         self.timeout = timeout
@@ -2078,10 +2078,10 @@ class Tool(Component):
     ):
 
         super().__init__(name)
-        self.inputs = inputs
-        self.outputs = outputs
+        self.inputs = copy.deepcopy(inputs) if inputs is not None else {}
+        self.outputs = copy.deepcopy(outputs) if outputs is not None else {}
         self.function = function
-        self.default_output = default_output or {}
+        self.default_output = copy.deepcopy(default_output) if default_output is not None else {}
         self.description = description if description else "Tool"
 
         self.sig = inspect.signature(function)
@@ -3079,7 +3079,9 @@ class Automation(Component):
             return None
 
         index_to_use = index if index is not None else -1
-        if len(subset) < abs(index_to_use):
+        if not isinstance(index_to_use, int):
+            return None
+        if not (-len(subset) <= index_to_use < len(subset)):
             return None
 
         role, content, msg_number, msg_type, timestamp = subset[index_to_use]

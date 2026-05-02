@@ -67,6 +67,196 @@ class Bot(abc.ABC):
     async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
         raise NotImplementedError
 
+    async def send_text(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        return await self._send_text_message(
+            str(user_id),
+            text,
+            reply_to_message_id=reply_to_message_id,
+            **kwargs
+        )
+
+    async def send_image(
+        self,
+        user_id: str,
+        media: Any,
+        *,
+        caption: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        return await self._send_media(
+            str(user_id),
+            "image",
+            media,
+            caption=caption,
+            reply_to_message_id=reply_to_message_id,
+            **kwargs
+        )
+
+    async def send_audio(
+        self,
+        user_id: str,
+        media: Any,
+        *,
+        caption: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        return await self._send_media(
+            str(user_id),
+            "audio",
+            media,
+            caption=caption,
+            reply_to_message_id=reply_to_message_id,
+            **kwargs
+        )
+
+    async def send_video(
+        self,
+        user_id: str,
+        media: Any,
+        *,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        return await self._send_media(
+            str(user_id),
+            "video",
+            media,
+            caption=caption,
+            filename=filename,
+            reply_to_message_id=reply_to_message_id,
+            **kwargs
+        )
+
+    async def send_document(
+        self,
+        user_id: str,
+        media: Any,
+        *,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        return await self._send_media(
+            str(user_id),
+            "document",
+            media,
+            caption=caption,
+            filename=filename,
+            reply_to_message_id=reply_to_message_id,
+            **kwargs
+        )
+
+    async def send_sticker(
+        self,
+        user_id: str,
+        media: Any,
+        *,
+        emoji: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        return await self._send_media(
+            str(user_id),
+            "sticker",
+            media,
+            emoji=emoji,
+            reply_to_message_id=reply_to_message_id,
+            **kwargs
+        )
+
+    async def react_to_message(
+        self,
+        user_id: str,
+        message_id: str,
+        emoji: str,
+        **kwargs
+    ) -> Any:
+        return await self._send_reaction(str(user_id), str(message_id), emoji, **kwargs)
+
+    async def remove_reaction(self, user_id: str, message_id: str, **kwargs) -> Any:
+        return await self.react_to_message(user_id, message_id, "", **kwargs)
+
+    async def _send_text_message(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        raise NotImplementedError
+
+    async def _send_media(
+        self,
+        user_id: str,
+        media_type: str,
+        media: Any,
+        *,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        raise NotImplementedError
+
+    async def _send_reaction(
+        self,
+        user_id: str,
+        message_id: str,
+        emoji: str,
+        **kwargs
+    ) -> Any:
+        raise NotImplementedError
+
+    def _block_media_source(self, content: Any) -> Any:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, dict):
+            return content
+        for key in ("path", "url", "link", "media_id", "id", "file_id"):
+            value = content.get(key)
+            if value:
+                return value
+        return content
+
+    def _block_caption(self, block: Dict[str, Any]) -> Optional[str]:
+        content = block.get("content")
+        if isinstance(content, dict):
+            caption = content.get("caption")
+            if caption is not None:
+                return str(caption)
+        metadata = block.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("caption") is not None:
+            return str(metadata["caption"])
+        return None
+
+    def _block_filename(self, block: Dict[str, Any]) -> Optional[str]:
+        content = block.get("content")
+        if isinstance(content, dict):
+            filename = content.get("filename") or content.get("file_name")
+            if filename is not None:
+                return str(filename)
+        return None
+
+    def _local_path(self, media: Any) -> Optional[str]:
+        if isinstance(media, str) and media.startswith("file:"):
+            return media[5:]
+        if isinstance(media, str) and os.path.isfile(media):
+            return media
+        return None
+
     def _normalize_metadata_value(self, value: Any) -> Any:
         if isinstance(value, datetime):
             return value.isoformat()
@@ -433,14 +623,33 @@ class Bot(abc.ABC):
 
         elif msg_type == 'text' and text:
             blocks.extend(self.manager._to_blocks({"response": text}, user_id=user_id))
+
+        elif msg_type == 'reaction':
+            reaction_payload = {"response": text or ""}
+            normalized_media_info = self._normalize_metadata_value(media_info)
+            if isinstance(normalized_media_info, dict):
+                reaction_payload.update({
+                    k: v for k, v in normalized_media_info.items()
+                    if k in ("message_id", "emoji")
+                })
+            blocks.extend(self.manager._to_blocks(reaction_payload, user_id=user_id))
         
-        elif msg_type == 'image':
+        elif msg_type in ('image', 'video', 'document', 'sticker'):
             if text:
                  blocks.extend(self.manager._to_blocks({"response": text}, user_id=user_id))
-            img_ref = await self._download_media_and_save(user_id, media_info)
+            media_ref = await self._download_media_and_save(user_id, media_info)
+            content = {"kind": "file", "path": media_ref, "detail": "auto"}
+            normalized_media_info = self._normalize_metadata_value(media_info)
+            if isinstance(normalized_media_info, dict):
+                if normalized_media_info.get("filename"):
+                    content["filename"] = normalized_media_info["filename"]
+                if normalized_media_info.get("file_name"):
+                    content["filename"] = normalized_media_info["file_name"]
+                if normalized_media_info.get("mime_type"):
+                    content["mime_type"] = normalized_media_info["mime_type"]
             blocks.append({
-                "type": "image",
-                "content": {"kind": "file", "path": img_ref, "detail": "auto"}
+                "type": msg_type,
+                "content": content
             })
             
         return self._attach_user_message_metadata(blocks, parsed_message)
@@ -494,7 +703,28 @@ class TelegramBot(Bot):
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_payload_wrapper))
         self.application.add_handler(MessageHandler(filters.PHOTO, self.process_payload_wrapper))
         self.application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.process_payload_wrapper))
+        for media_filter in self._optional_media_filters():
+            self.application.add_handler(MessageHandler(media_filter, self.process_payload_wrapper))
         self.application.add_error_handler(self._on_error)
+
+    def _optional_media_filters(self) -> List[Any]:
+        filter_values = []
+        seen = set()
+
+        def add_filter(value):
+            if value is None or id(value) in seen:
+                return
+            seen.add(id(value))
+            filter_values.append(value)
+
+        for attr in ("VIDEO", "DOCUMENT", "STICKER"):
+            add_filter(getattr(filters, attr, None))
+
+        for attr in ("Document", "Sticker"):
+            namespace = getattr(filters, attr, None)
+            add_filter(getattr(namespace, "ALL", None))
+
+        return filter_values
 
     async def initialize(self):
         await self.application.initialize()
@@ -526,15 +756,33 @@ class TelegramBot(Bot):
             msg_type = 'image'
         elif is_voice or is_audio:
             msg_type = 'audio'
+        elif getattr(message, "video", None):
+            msg_type = 'video'
+        elif getattr(message, "document", None):
+            msg_type = 'document'
+        elif getattr(message, "sticker", None):
+            msg_type = 'sticker'
         
         if not msg_type:
             return None
+
+        media_info = None
+        if message.photo:
+            media_info = message.photo[-1]
+        elif is_voice or is_audio:
+            media_info = message.voice or message.audio
+        elif msg_type == "video":
+            media_info = message.video
+        elif msg_type == "document":
+            media_info = message.document
+        elif msg_type == "sticker":
+            media_info = message.sticker
 
         return {
             'user_id': str(message.chat.id),
             'message_type': msg_type,
             'text': message.text or message.caption,
-            'media_info': message.photo[-1] if message.photo else message.voice or message.audio,
+            'media_info': media_info,
             'is_voice_note': is_voice,
             'timestamp': message.date,
             'original_payload': payload 
@@ -544,6 +792,90 @@ class TelegramBot(Bot):
         file = await self.bot.get_file(media_info.file_id)
         media_bytes = await file.download_as_bytearray()
         return self.manager.save_file(bytes(media_bytes), user_id)
+
+    async def _send_text_message(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        payload = {"chat_id": user_id, "text": text, **kwargs}
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+        return await self.bot.send_message(**payload)
+
+    async def _send_media(
+        self,
+        user_id: str,
+        media_type: str,
+        media: Any,
+        *,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        method_by_type = {
+            "image": ("send_photo", "photo"),
+            "audio": ("send_audio", "audio"),
+            "video": ("send_video", "video"),
+            "document": ("send_document", "document"),
+            "sticker": ("send_sticker", "sticker"),
+        }
+        if media_type not in method_by_type:
+            raise ValueError(f"Unsupported Telegram media type: {media_type}")
+
+        method_name, field_name = method_by_type[media_type]
+        method = getattr(self.bot, method_name)
+        payload = {"chat_id": user_id, field_name: media, **kwargs}
+        if caption is not None and media_type != "sticker":
+            payload["caption"] = caption
+        if filename is not None and media_type == "document":
+            payload["filename"] = filename
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+
+        local_path = self._local_path(media)
+        if local_path:
+            with open(local_path, "rb") as f:
+                payload[field_name] = f
+                return await method(**payload)
+        return await method(**payload)
+
+    async def _send_reaction(
+        self,
+        user_id: str,
+        message_id: str,
+        emoji: str,
+        **kwargs
+    ) -> Any:
+        reaction = [] if emoji == "" else [{"type": "emoji", "emoji": emoji}]
+        if hasattr(self.bot, "set_message_reaction"):
+            return await self.bot.set_message_reaction(
+                chat_id=user_id,
+                message_id=int(message_id),
+                reaction=reaction,
+                **kwargs
+            )
+
+        def do_request():
+            payload = {
+                "chat_id": user_id,
+                "message_id": int(message_id),
+                "reaction": reaction,
+                **kwargs,
+            }
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.telegram_token}/setMessageReaction",
+                json=payload,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return await asyncio.to_thread(do_request)
 
     async def _send_blocks(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]):
         update = original_message['original_payload']
@@ -572,8 +904,51 @@ class TelegramBot(Bot):
                 elif block_type == "audio" and "path" in content and content["path"].startswith("file:"):
                     with open(content["path"][5:], "rb") as f:
                         await update.message.reply_voice(f)
+
+                elif block_type in ("video", "document", "sticker"):
+                    media = self._block_media_source(content)
+                    caption = self._block_caption(block)
+                    filename = self._block_filename(block)
+                    local_path = self._local_path(media)
+                    if local_path:
+                        with open(local_path, "rb") as f:
+                            await self._send_reply_media(
+                                update.message,
+                                block_type,
+                                f,
+                                caption=caption,
+                                filename=filename,
+                            )
+                    else:
+                        await self._send_reply_media(
+                            update.message,
+                            block_type,
+                            media,
+                            caption=caption,
+                            filename=filename,
+                        )
             except Exception as e:
                 self.logger.error(f"Error sending block to Telegram for {user_id}: {e}\nBlock: {block}")
+
+    async def _send_reply_media(
+        self,
+        message: Any,
+        media_type: str,
+        media: Any,
+        *,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None
+    ) -> Any:
+        if media_type == "video":
+            return await message.reply_video(media, caption=caption)
+        if media_type == "document":
+            kwargs = {"caption": caption}
+            if filename is not None:
+                kwargs["filename"] = filename
+            return await message.reply_document(media, **kwargs)
+        if media_type == "sticker":
+            return await message.reply_sticker(media)
+        raise ValueError(f"Unsupported Telegram reply media type: {media_type}")
 
     async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
         sent_count = 0
@@ -656,29 +1031,36 @@ class WhatsappBot(Bot):
         if msg_type == "text":
             text = (payload.get("text") or {}).get("body")
 
-        elif msg_type in ("audio", "voice", "image"):
-            if msg_type == "audio":
-                a = payload.get("audio") or {}
-                media_info = a.get("id")
-                is_voice = bool(a.get("voice", False))
-                text = a.get("caption")
-
-            elif msg_type == "voice":
-                v = payload.get("voice") or payload.get("audio") or {}
-                media_info = v.get("id")
-                text = v.get("caption")
+        elif msg_type in ("audio", "voice", "image", "video", "document", "sticker"):
+            if msg_type == "voice":
+                media_payload = payload.get("voice") or payload.get("audio") or {}
                 is_voice = True
+            else:
+                media_payload = payload.get(msg_type) or {}
+                if msg_type == "audio":
+                    is_voice = bool(media_payload.get("voice", False))
 
-            elif msg_type == "image":
-                img = payload.get("image") or {}
-                media_info = img.get("id")
-                text = img.get("caption")
-
-            if msg_type in ("audio", "voice", "image") and not media_info:
+            if not media_payload.get("id"):
                 return None
+            media_info = {
+                "id": media_payload.get("id"),
+                "mime_type": media_payload.get("mime_type"),
+                "sha256": media_payload.get("sha256"),
+                "filename": media_payload.get("filename"),
+            }
+            media_info = {k: v for k, v in media_info.items() if v is not None}
+            text = media_payload.get("caption")
+
+        elif msg_type == "reaction":
+            reaction = payload.get("reaction") or {}
+            text = reaction.get("emoji")
+            media_info = {
+                "message_id": reaction.get("message_id"),
+                "emoji": reaction.get("emoji"),
+            }
+            media_info = {k: v for k, v in media_info.items() if v is not None}
 
         else:
-            # Ignore other types for now: 'sticker', 'document', 'video', etc.
             return None
 
         normalized_type = "audio" if msg_type == "voice" else msg_type
@@ -694,8 +1076,10 @@ class WhatsappBot(Bot):
         }
 
 
-    async def _download_media_and_save(self, user_id: str, media_info: str) -> str:
-        media_id = media_info
+    async def _download_media_and_save(self, user_id: str, media_info: Any) -> str:
+        media_id = media_info.get("id") if isinstance(media_info, dict) else media_info
+        if not media_id:
+            raise ValueError("WhatsApp media id is required to download media.")
         
         def do_download():
             media_url_info = requests.get(
@@ -713,6 +1097,88 @@ class WhatsappBot(Bot):
         
         return await asyncio.to_thread(do_download)
 
+    async def _send_text_message(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        return await self._send_api_request(
+            "text",
+            to=user_id,
+            body=text,
+            reply_to_message_id=reply_to_message_id,
+            **kwargs
+        )
+
+    async def _send_media(
+        self,
+        user_id: str,
+        media_type: str,
+        media: Any,
+        *,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ) -> Any:
+        if media_type not in ("image", "audio", "video", "document", "sticker"):
+            raise ValueError(f"Unsupported WhatsApp media type: {media_type}")
+
+        media_payload: Dict[str, Any]
+        if isinstance(media, dict):
+            source = self._block_media_source(media)
+            if source is media:
+                media_payload = dict(media)
+            else:
+                media_payload = await self._whatsapp_media_payload_from_source(source)
+                for key in ("caption", "filename"):
+                    if media.get(key) is not None:
+                        media_payload[key] = media[key]
+        else:
+            media_payload = await self._whatsapp_media_payload_from_source(media)
+
+        if caption is not None and media_type not in ("audio", "sticker"):
+            media_payload["caption"] = caption
+        if filename is not None and media_type in ("document", "video"):
+            media_payload["filename"] = filename
+
+        return await self._send_api_request(
+            media_type,
+            to=user_id,
+            media_payload=media_payload,
+            reply_to_message_id=reply_to_message_id,
+            **kwargs
+        )
+
+    async def _whatsapp_media_payload_from_source(self, media: Any) -> Dict[str, Any]:
+        media_value = str(media)
+        local_path = self._local_path(media_value)
+        if local_path:
+            media_id = await self._upload_media(local_path)
+            if not media_id:
+                raise ValueError(f"Could not upload WhatsApp media: {media_value}")
+            return {"id": media_id}
+        if media_value.startswith("http://") or media_value.startswith("https://"):
+            return {"link": media_value}
+        return {"id": media_value}
+
+    async def _send_reaction(
+        self,
+        user_id: str,
+        message_id: str,
+        emoji: str,
+        **kwargs
+    ) -> Any:
+        return await self._send_api_request(
+            "reaction",
+            to=user_id,
+            reaction_payload={"message_id": message_id, "emoji": emoji},
+            **kwargs
+        )
+
     async def _send_blocks(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]):
 
         if not blocks:
@@ -726,17 +1192,16 @@ class WhatsappBot(Bot):
                 if block_type == "text":
                     text_content = self.manager._block_to_plain_text(block)
                     if text_content:
-                        await self._send_api_request("text", to=user_id, body=text_content)
+                        await self.send_text(user_id, text_content)
                 
-                elif block_type == "image" and content.get("path", "").startswith("file:"):
-                    media_id = await self._upload_media(content["path"][5:])
-                    if media_id:
-                        await self._send_api_request("image", to=user_id, media_id=media_id)
-
-                elif block_type == "audio" and content.get("path", "").startswith("file:"):
-                    media_id = await self._upload_media(content["path"][5:])
-                    if media_id:
-                        await self._send_api_request("audio", to=user_id, media_id=media_id)
+                elif block_type in ("image", "audio", "video", "document", "sticker"):
+                    await self._send_media(
+                        user_id,
+                        block_type,
+                        self._block_media_source(content),
+                        caption=self._block_caption(block),
+                        filename=self._block_filename(block),
+                    )
 
             except Exception as e:
                 self.logger.error(f"Error sending block to WhatsApp for {user_id}: {e}\nBlock: {block}")
@@ -750,19 +1215,39 @@ class WhatsappBot(Bot):
         if filename: doc_payload["filename"] = filename
         if caption: doc_payload["caption"] = caption
         
-        await self._send_api_request("document", to=to, document_payload=doc_payload)
+        await self._send_api_request("document", to=to, media_payload=doc_payload)
 
-    async def _send_api_request(self, msg_type: str, to: str, body: str = None, media_id: str = None, document_payload: dict = None):
+    async def _send_api_request(
+        self,
+        msg_type: str,
+        to: str,
+        body: str = None,
+        media_id: str = None,
+        media_payload: dict = None,
+        document_payload: dict = None,
+        reaction_payload: dict = None,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs
+    ):
         payload = {"messaging_product": "whatsapp", "to": to}
         if msg_type == "text":
             payload["type"] = "text"
             payload["text"] = {"body": body}
-        elif msg_type in ("image", "audio"):
+        elif msg_type in ("image", "audio", "video", "sticker"):
             payload["type"] = msg_type
-            payload[msg_type] = {"id": media_id}
+            payload[msg_type] = media_payload or {"id": media_id}
         elif msg_type == "document":
             payload["type"] = "document"
-            payload["document"] = document_payload
+            payload["document"] = media_payload or document_payload
+        elif msg_type == "reaction":
+            payload["type"] = "reaction"
+            payload["reaction"] = reaction_payload
+        else:
+            raise ValueError(f"Unsupported WhatsApp message type: {msg_type}")
+
+        if reply_to_message_id:
+            payload["context"] = {"message_id": reply_to_message_id}
+        payload.update(kwargs)
         
         resp = await asyncio.to_thread(
             requests.post, f"{self.graph_url}/messages", headers=self.headers_json, json=payload, timeout=60
@@ -779,6 +1264,7 @@ class WhatsappBot(Bot):
                 "[WA SEND] OK %s -> %s | status=%s",
                 msg_type, to, resp.status_code
             )
+        return resp
 
     async def _send_log_files(self, user_id: str, files_to_send: List[Dict[str, str]], original_message: Dict[str, Any]) -> int:
         sent_count = 0

@@ -206,12 +206,34 @@ def pull_history(
     project_dir: Optional[Union[str, Path]] = None,
     force_copy_script: bool = False,
     quiet: bool = False,
+    user_ids: Optional[Union[str, List[str]]] = None,
 ) -> int:
     workdir = Path(project_dir or Path.cwd())
     workdir.mkdir(parents=True, exist_ok=True)
     script = _ensure_script_in_cwd("pull_history.sh", workdir, force=force_copy_script)
     conf = config_path or "params.json"
-    return _run_bash(script, ["--config", conf], cwd=workdir, quiet=quiet)
+    args = ["--config", conf]
+    for user_id in _normalize_history_user_ids(user_ids):
+        args.extend(["--user-id", user_id])
+    return _run_bash(script, args, cwd=workdir, quiet=quiet)
+
+def _normalize_history_user_ids(user_ids: Optional[Union[str, List[str]]]) -> List[str]:
+    if user_ids is None:
+        return []
+
+    raw_items = user_ids if isinstance(user_ids, list) else [user_ids]
+    normalized = []
+    seen = set()
+    for item in raw_items:
+        if item is None:
+            continue
+        for part in str(item).split(","):
+            user_id = part.strip()
+            if not user_id or user_id in seen:
+                continue
+            normalized.append(user_id)
+            seen.add(user_id)
+    return normalized
 
 def _best_effort_install():
     """

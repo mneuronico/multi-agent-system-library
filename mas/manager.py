@@ -21,7 +21,7 @@ class AgentSystemManager:
         files_folder: Optional[str] = None,
         general_system_description: str = "This is a multi agent system.",
         functions: Union[str, List[str]] = "fns.py",
-        default_models: List[Dict[str, str]] = [{"provider": "groq", "model": "llama-3.1-8b-instant"}],
+        default_models: Optional[List[Dict[str, str]]] = None,
         on_update: Optional[Callable] = None,
         on_complete: Optional[Callable] = None,
         include_timestamp: bool = False,
@@ -80,6 +80,11 @@ class AgentSystemManager:
         self.automations: Dict[str, Automation] = {}
 
         self.parser = Parser()
+
+        if default_models is None:
+            default_models = [{"provider": "groq", "model": "llama-3.1-8b-instant"}]
+        else:
+            default_models = copy.deepcopy(default_models)
 
         self.default_models = default_models
         self._register_model_infos(self.default_models)
@@ -1845,9 +1850,9 @@ class AgentSystemManager:
         self,
         name: Optional[str] = None,
         system: str = "You are a helpful assistant",
-        required_outputs: Union[Dict[str, Any], str] = {"response": "Text to send to user."},
+        required_outputs: Optional[Union[Dict[str, Any], str]] = None,
         models: List[Dict[str, str]] = None,
-        default_output: Optional[Dict[str, Any]] = {"response": "No valid response."},
+        default_output: Optional[Dict[str, Any]] = None,
         positive_filter: Optional[List[str]] = None,
         negative_filter: Optional[List[str]] = None,
         model_params: Optional[Dict[str, Any]] = None,
@@ -1862,11 +1867,23 @@ class AgentSystemManager:
             raise ValueError(f"[Manager] Agent '{name}' already exists.")
 
         if models is None:
-            models = self.default_models.copy()
+            models = copy.deepcopy(self.default_models)
+        else:
+            models = copy.deepcopy(models)
         self._register_model_infos(models)
     
+        if required_outputs is None:
+            required_outputs = {"response": "Text to send to user."}
         if isinstance(required_outputs, str):
             required_outputs = {"response": required_outputs}
+        else:
+            required_outputs = copy.deepcopy(required_outputs)
+
+        final_default_output = (
+            copy.deepcopy(default_output)
+            if default_output is not None
+            else {"response": "No valid response."}
+        )
     
         final_prompt = self._build_agent_prompt(
             self.general_system_description,
@@ -1883,7 +1900,7 @@ class AgentSystemManager:
             system_prompt_original=system,
             required_outputs=required_outputs,
             models=models,
-            default_output=default_output or {"response": "No valid response."},
+            default_output=final_default_output,
             positive_filter=positive_filter,
             negative_filter=negative_filter,
             general_system_description=self.general_system_description,
@@ -1899,13 +1916,25 @@ class AgentSystemManager:
 
         return name
 
+    def _generate_numbered_name(self, prefix: str, existing_names) -> str:
+        numbers = []
+        for name in existing_names:
+            if not isinstance(name, str) or not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            if suffix.isdigit():
+                numbers.append(int(suffix))
+
+        next_number = max(numbers, default=0) + 1
+        candidate = f"{prefix}{next_number}"
+        existing = set(existing_names)
+        while candidate in existing:
+            next_number += 1
+            candidate = f"{prefix}{next_number}"
+        return candidate
+
     def _generate_agent_name(self) -> str:
-        existing_names = [name for name in self.agents.keys() if name.startswith("agent-")]
-        if not existing_names:
-            return "agent-1"
-    
-        max_number = max(int(name.split("-")[1]) for name in existing_names if name.split("-")[1].isdigit())
-        return f"agent-{max_number + 1}"
+        return self._generate_numbered_name("agent-", self.agents.keys())
 
     def create_tool(
         self,
@@ -1949,12 +1978,7 @@ class AgentSystemManager:
         return name
 
     def _generate_automation_name(self) -> str:
-        existing_names = [name for name in self.automations.keys() if name.startswith("automation-")]
-        if not existing_names:
-            return "automation-1"
-    
-        max_number = max(int(name.split("-")[1]) for name in existing_names if name.split("-")[1].isdigit())
-        return f"automation-{max_number + 1}"
+        return self._generate_numbered_name("automation-", self.automations.keys())
     
     def link_tool_to_agent_as_output(self, tool_name: str, agent_name: str):
         if tool_name not in self.tools:
@@ -2717,8 +2741,8 @@ class AgentSystemManager:
             raise ValueError("source must be None, str or list/tuple of str.")
         if isinstance(source, (list, tuple)) and not all(isinstance(s, str) for s in source):
             raise ValueError("All elements of source must be str.")
-        if block_type not in (None, "text", "image", "audio"):
-            raise ValueError("block_type must be None, 'text', 'image' or 'audio'.")
+        if block_type not in (None, "text", "image", "audio", "video", "document", "sticker"):
+            raise ValueError("block_type must be None, 'text', 'image', 'audio', 'video', 'document' or 'sticker'.")
         if block_index is not None and not isinstance(block_index, int):
             raise ValueError("block_index must be None or int.")
         if messages is not None and not isinstance(messages, (dict, list)):
