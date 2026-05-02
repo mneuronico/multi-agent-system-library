@@ -98,12 +98,22 @@ class Agent(Component):
         if verbose:
             logger.debug(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2, ensure_ascii=False)}\n")
 
+        provider_attempts = []
+
         for model_info in self.models:
             provider = model_info["provider"].lower()
             model_name = model_info["model"]
             api_key = self.manager.get_key(provider)
 
             if not api_key:
+                provider_attempts.append(
+                    self._provider_error_metadata(
+                        provider,
+                        model_name,
+                        error_type="missing_api_key",
+                        message=f"No API key for provider '{provider}'."
+                    )
+                )
                 if verbose:
                     logger.warning(f"[Agent:{self.name}] No API key for '{provider}'. Skipping.")
                 continue
@@ -112,6 +122,7 @@ class Agent(Component):
 
             try:
                 response = None
+                self._last_provider_response_metadata = None
                 
                 if provider == "openai":
                     response = self._call_openai_api(
@@ -196,6 +207,16 @@ class Agent(Component):
                 else:
                     response_str = response
 
+                provider_metadata = getattr(self, "_last_provider_response_metadata", None)
+                if provider_metadata is None:
+                    provider_metadata = self._provider_success_metadata(
+                        provider,
+                        model_name,
+                        content=response_str
+                    )
+                provider_metadata["ok"] = True
+                provider_attempts.append(provider_metadata)
+
                 response_dict = self._extract_and_parse_json(response_str)
 
                 if response_dict is None:
@@ -217,18 +238,31 @@ class Agent(Component):
                     md["usd_cost"]      = self.manager.cost_model_call(
                         provider, model_name, input_tokens, output_tokens
                     )
+                self._attach_provider_metadata(response_blocks, provider_metadata, provider_attempts)
                 return response_blocks
                 
             except requests.exceptions.RequestException as req_err:
+                provider_attempts.append(
+                    self._provider_exception_metadata(provider, model_name, req_err)
+                )
                 if verbose:
                     logger.error(f"[Agent:{self.name}] HTTP error with provider={provider}, model={model_name}: {req_err}")
             except json.JSONDecodeError as json_err:
+                provider_attempts.append(
+                    self._provider_exception_metadata(provider, model_name, json_err)
+                )
                 if verbose:
                     logger.error(f"[Agent:{self.name}] JSON decoding error with provider={provider}, model={model_name}: {json_err}")
             except ValueError as val_err:
+                provider_attempts.append(
+                    self._provider_exception_metadata(provider, model_name, val_err)
+                )
                 if verbose:
                     logger.error(f"[Agent:{self.name}] Value error with provider={provider}, model={model_name}: {val_err}")
             except (KeyError, IndexError, TypeError) as parse_err:
+                provider_attempts.append(
+                    self._provider_exception_metadata(provider, model_name, parse_err)
+                )
                 if verbose:
                     logger.error(
                         f"[Agent:{self.name}] Invalid response shape with provider={provider}, "
@@ -237,7 +271,12 @@ class Agent(Component):
 
         if verbose:
             logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self.default_output}")
-        return self.default_output
+        default_blocks = self.manager._to_blocks(
+            self.default_output,
+            self.manager._active_user_id()
+        )
+        self._attach_provider_metadata(default_blocks, None, provider_attempts)
+        return default_blocks
 
     def _as_blocks(self, value):
         if isinstance(value, list) and value and all(
@@ -246,6 +285,168 @@ class Agent(Component):
             return value
 
         return self.manager._to_blocks(value)
+
+    def _extract_request_id(self, response: Any) -> Optional[str]:
+        headers = getattr(response, "headers", None) or {}
+        for key in (
+            "x-request-id",
+            "x-request-id".title(),
+            "x-goog-request-id",
+            "request-id",
+            "cf-ray",
+        ):
+            try:
+                value = headers.get(key)
+            except AttributeError:
+                value = None
+            if value:
+                return value
+        return None
+
+    def _response_body_for_metadata(self, response: Any) -> Any:
+        if response is None:
+            return None
+        try:
+            return response.json()
+        except Exception:
+            return getattr(response, "text", None)
+
+    def _normalize_usage_metadata(self, usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        usage = usage or {}
+        input_tokens = (
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or usage.get("promptTokenCount")
+            or 0
+        )
+        output_tokens = (
+            usage.get("completion_tokens")
+            or usage.get("output_tokens")
+            or usage.get("candidatesTokenCount")
+            or 0
+        )
+        total_tokens = (
+            usage.get("total_tokens")
+            or usage.get("totalTokenCount")
+            or ((input_tokens or 0) + (output_tokens or 0))
+        )
+        return {
+            "input_tokens": input_tokens or 0,
+            "output_tokens": output_tokens or 0,
+            "total_tokens": total_tokens or 0,
+            "raw": usage,
+        }
+
+    def _provider_success_metadata(
+        self,
+        provider: str,
+        model_name: str,
+        *,
+        response: Any = None,
+        raw_response: Any = None,
+        content: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        if raw_response is None:
+            raw_response = Agent._response_body_for_metadata(self, response)
+        return {
+            "provider": provider,
+            "model": model_name,
+            "ok": True,
+            "status_code": getattr(response, "status_code", None),
+            "request_id": Agent._extract_request_id(self, response),
+            "content": content,
+            "usage": Agent._normalize_usage_metadata(self, usage),
+            "error": None,
+            "errors": [],
+            "raw_response": raw_response,
+        }
+
+    def _provider_error_metadata(
+        self,
+        provider: str,
+        model_name: str,
+        *,
+        error_type: str,
+        message: str,
+        response: Any = None,
+        raw_response: Any = None
+    ) -> Dict[str, Any]:
+        if raw_response is None:
+            raw_response = Agent._response_body_for_metadata(self, response)
+        error = {
+            "type": error_type,
+            "message": message,
+        }
+        return {
+            "provider": provider,
+            "model": model_name,
+            "ok": False,
+            "status_code": getattr(response, "status_code", None),
+            "request_id": Agent._extract_request_id(self, response),
+            "content": None,
+            "usage": Agent._normalize_usage_metadata(self, None),
+            "error": error,
+            "errors": [error],
+            "raw_response": raw_response,
+        }
+
+    def _provider_exception_metadata(
+        self,
+        provider: str,
+        model_name: str,
+        exc: Exception
+    ) -> Dict[str, Any]:
+        response = getattr(exc, "response", None)
+        base = getattr(self, "_last_provider_response_metadata", None)
+        if isinstance(base, dict) and base.get("provider") == provider and base.get("model") == model_name:
+            metadata = copy.deepcopy(base)
+            metadata["ok"] = False
+            metadata["status_code"] = metadata.get("status_code") or getattr(response, "status_code", None)
+            metadata["request_id"] = metadata.get("request_id") or Agent._extract_request_id(self, response)
+            if metadata.get("raw_response") is None:
+                metadata["raw_response"] = Agent._response_body_for_metadata(self, response)
+            error = {
+                "type": exc.__class__.__name__,
+                "message": str(exc),
+            }
+            metadata["error"] = error
+            metadata["errors"] = [error]
+            return metadata
+
+        return Agent._provider_error_metadata(
+            self,
+            provider,
+            model_name,
+            error_type=exc.__class__.__name__,
+            message=str(exc),
+            response=response,
+        )
+
+    def _remember_provider_response(self, metadata: Dict[str, Any]) -> None:
+        self._last_provider_response_metadata = metadata
+
+    def _attach_provider_metadata(
+        self,
+        response_blocks: Any,
+        provider_metadata: Optional[Dict[str, Any]],
+        provider_attempts: List[Dict[str, Any]]
+    ) -> None:
+        if not isinstance(response_blocks, list) or not response_blocks:
+            return
+        first = response_blocks[0]
+        if not isinstance(first, dict):
+            return
+        first.setdefault("metadata", {})
+        md = first["metadata"]
+        if provider_metadata is not None:
+            md["provider_response"] = copy.deepcopy(provider_metadata)
+        md["provider_attempts"] = copy.deepcopy(provider_attempts)
+        md["provider_errors"] = [
+            error
+            for attempt in provider_attempts
+            for error in attempt.get("errors", [])
+        ]
 
     def _provider_format_messages(self, provider: str, conversation: list) -> list:
         provider = provider.lower()
@@ -896,14 +1097,48 @@ class Agent(Component):
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
+            Agent._remember_provider_response(
+                self,
+                Agent._provider_error_metadata(
+                    self,
+                    "openai",
+                    model_name,
+                    error_type=e.__class__.__name__,
+                    message=str(e),
+                    response=getattr(e, "response", None)
+                )
+            )
             logger.error(f"[Agent:{self.name}] OPENAI HTTP {status} ERROR:\n{body}")
             raise
 
         json_response = response.json()
+        usage = json_response.get("usage", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "openai",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                usage=usage
+            )
+        )
         content = json_response["choices"][0]["message"]["content"]
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "openai",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = json_response.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
 
@@ -956,14 +1191,48 @@ class Agent(Component):
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None)
             body = getattr(e.response, "text", None)
+            Agent._remember_provider_response(
+                self,
+                Agent._provider_error_metadata(
+                    self,
+                    "openrouter",
+                    model_name,
+                    error_type=e.__class__.__name__,
+                    message=str(e),
+                    response=getattr(e, "response", None)
+                )
+            )
             logger.error(f"[Agent:{self.name}] OPENROUTER HTTP {status} ERROR:\n{body}")
             raise
 
         json_response = response.json()
+        usage = json_response.get("usage", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "openrouter",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                usage=usage
+            )
+        )
         content = json_response["choices"][0]["message"]["content"]
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "openrouter",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = json_response.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
             return (content, input_tokens, output_tokens)
@@ -1018,14 +1287,48 @@ class Agent(Component):
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
+            Agent._remember_provider_response(
+                self,
+                Agent._provider_error_metadata(
+                    self,
+                    "lmstudio",
+                    model_name,
+                    error_type=e.__class__.__name__,
+                    message=str(e),
+                    response=getattr(e, "response", None)
+                )
+            )
             logger.error(f"[Agent:{self.name}] LMSTUDIO HTTP {status} ERROR:\n{body}")
             raise
 
         json_response = response.json()
+        usage = json_response.get("usage", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "lmstudio",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                usage=usage
+            )
+        )
         content = json_response["choices"][0]["message"]["content"]
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "lmstudio",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = json_response.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
 
@@ -1078,14 +1381,48 @@ class Agent(Component):
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
+            Agent._remember_provider_response(
+                self,
+                Agent._provider_error_metadata(
+                    self,
+                    "deepseek",
+                    model_name,
+                    error_type=e.__class__.__name__,
+                    message=str(e),
+                    response=getattr(e, "response", None)
+                )
+            )
             logger.error(f"[Agent:{self.name}] DEEPSEEK HTTP {status} ERROR:\n{body}")
             raise
 
         json_response = response.json()
+        usage = json_response.get("usage", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "deepseek",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                usage=usage
+            )
+        )
         content = json_response["choices"][0]["message"]["content"]
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "deepseek",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = json_response.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
             return (content, input_tokens, output_tokens)
@@ -1183,6 +1520,17 @@ class Agent(Component):
             r.raise_for_status()
         except requests.exceptions.RequestException as e:
             resp = getattr(e, "response", None)
+            Agent._remember_provider_response(
+                self,
+                Agent._provider_error_metadata(
+                    self,
+                    "google",
+                    model_name,
+                    error_type=e.__class__.__name__,
+                    message=str(e),
+                    response=resp
+                )
+            )
             if not resp: raise
             try:
                 err = resp.json().get("error", {})
@@ -1200,10 +1548,33 @@ class Agent(Component):
                 raise ValueError(f"Google API {resp.status_code}: {resp.text}")
 
         data = r.json()
+        usage = data.get("usageMetadata", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "google",
+                model_name,
+                response=r,
+                raw_response=data,
+                usage=usage
+            )
+        )
         content = data["candidates"][0]["content"]["parts"][0]["text"]
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "google",
+                model_name,
+                response=r,
+                raw_response=data,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = data.get("usageMetadata", {})
             return (content, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0))
         return content
 
@@ -1253,17 +1624,50 @@ class Agent(Component):
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
+            Agent._remember_provider_response(
+                self,
+                Agent._provider_error_metadata(
+                    self,
+                    "anthropic",
+                    model_name,
+                    error_type=e.__class__.__name__,
+                    message=str(e),
+                    response=getattr(e, "response", None)
+                )
+            )
             logger.error(f"[Agent:{self.name}] ANTHROPIC HTTP {status} ERROR:\n{body}")
             raise
 
 
 
         json_response = response.json()
-    
+        usage = json_response.get("usage", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "anthropic",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                usage=usage
+            )
+        )
         content = json_response["content"][0]["text"]
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "anthropic",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = json_response.get("usage", {})
             input_tokens = usage.get("input_tokens", 0)
             output_tokens = usage.get("output_tokens", 0)
             return (content, input_tokens, output_tokens)
@@ -1321,14 +1725,48 @@ class Agent(Component):
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None)
             body   = getattr(e.response, "text", None)
+            Agent._remember_provider_response(
+                self,
+                Agent._provider_error_metadata(
+                    self,
+                    "groq",
+                    model_name,
+                    error_type=e.__class__.__name__,
+                    message=str(e),
+                    response=getattr(e, "response", None)
+                )
+            )
             logger.error(f"[Agent:{self.name}] GROQ HTTP {status} ERROR:\n{body}")
             raise
 
         json_response = response.json()
+        usage = json_response.get("usage", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "groq",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                usage=usage
+            )
+        )
         content = json_response["choices"][0]["message"]["content"]
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "groq",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = json_response.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
             return (content, input_tokens, output_tokens)
@@ -1390,17 +1828,62 @@ class Agent(Component):
                 except requests.exceptions.RequestException as e2:
                     status2 = getattr(e2.response, "status_code", None)
                     body2 = getattr(e2.response, "text", None)
+                    Agent._remember_provider_response(
+                        self,
+                        Agent._provider_error_metadata(
+                            self,
+                            "wavespeed",
+                            model_name,
+                            error_type=e2.__class__.__name__,
+                            message=str(e2),
+                            response=getattr(e2, "response", None)
+                        )
+                    )
                     logger.error(f"[Agent:{self.name}] WAVESPEED HTTP {status2} ERROR (fallback):\n{body2}")
                     raise
             else:
+                Agent._remember_provider_response(
+                    self,
+                    Agent._provider_error_metadata(
+                        self,
+                        "wavespeed",
+                        model_name,
+                        error_type=e.__class__.__name__,
+                        message=str(e),
+                        response=getattr(e, "response", None)
+                    )
+                )
                 logger.error(f"[Agent:{self.name}] WAVESPEED HTTP {status} ERROR:\n{body}")
                 raise
 
         json_response = response.json()
+        usage = json_response.get("usage", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "wavespeed",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                usage=usage
+            )
+        )
         content = json_response["choices"][0]["message"]["content"]
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "wavespeed",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = json_response.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
             return (content, input_tokens, output_tokens)
@@ -1452,17 +1935,51 @@ class Agent(Component):
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None)
             body = getattr(e.response, "text", None)
+            Agent._remember_provider_response(
+                self,
+                Agent._provider_error_metadata(
+                    self,
+                    "nvidia",
+                    model_name,
+                    error_type=e.__class__.__name__,
+                    message=str(e),
+                    response=getattr(e, "response", None)
+                )
+            )
             logger.error(f"[Agent:{self.name}] NVIDIA HTTP {status} ERROR:\n{body}")
             raise
 
         json_response = response.json()
+        usage = json_response.get("usage", {})
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "nvidia",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                usage=usage
+            )
+        )
         message = json_response["choices"][0]["message"]
         content = message.get("content")
         if content is None:
             content = message.get("reasoning_content") or message.get("reasoning") or ""
+        Agent._remember_provider_response(
+            self,
+            Agent._provider_success_metadata(
+                self,
+                "nvidia",
+                model_name,
+                response=response,
+                raw_response=json_response,
+                content=content,
+                usage=usage
+            )
+        )
 
         if return_token_count:
-            usage = json_response.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
             return (content, input_tokens, output_tokens)
