@@ -3,17 +3,20 @@ from __future__ import annotations
 from ._shared import *
 
 class Parser:
+    def _empty_parse_result(self) -> dict:
+        return {
+            "is_function": False,
+            "function_name": None,
+            "component_or_param": None,
+            "multiple_sources": None,
+            "single_source": None,
+            "selection": None,
+        }
 
     def parse_input_string(self, spec: str) -> dict:
         spec = spec.strip()
         if not spec:
-            return {
-                "is_function": False,
-                "function_name": None,
-                "component_or_param": None,
-                "multiple_sources": None,
-                "single_source": None,
-            }
+            return self._empty_parse_result()
 
         if ":" in spec and (spec.startswith("fn:") or ".py:" in spec):
             return self._parse_as_function_reference(spec)
@@ -28,6 +31,7 @@ class Parser:
             "component_or_param": None,
             "multiple_sources": None,
             "single_source": None,
+            "selection": None,
         }
 
 
@@ -41,24 +45,38 @@ class Parser:
             component_name = parts[0].strip()
             remainder = parts[1].strip()
 
-            if remainder.startswith("(") and remainder.endswith(")"):
-                multiple_sources = self._parse_multiple_sources(remainder[1:-1].strip())
+            selection = self._parse_selection_expression(remainder)
+
+            if selection is not None and selection["selector"]["type"] == "include":
+                multiple_sources = copy.deepcopy(selection["selector"]["sources"])
                 return {
                     "is_function": False,
                     "function_name": None,
                     "component_or_param": component_name,
                     "multiple_sources": multiple_sources,
                     "single_source": None,
+                    "selection": selection,
                 }
-            else:
-                single_source = self._parse_one_custom_item(remainder)
+
+            if selection is not None:
                 return {
                     "is_function": False,
                     "function_name": None,
                     "component_or_param": component_name,
                     "multiple_sources": None,
-                    "single_source": single_source,
+                    "single_source": None,
+                    "selection": selection,
                 }
+
+            single_source = self._parse_one_custom_item(remainder)
+            return {
+                "is_function": False,
+                "function_name": None,
+                "component_or_param": component_name,
+                "multiple_sources": None,
+                "single_source": single_source,
+                "selection": None,
+            }
 
         return {
             "is_function": False,
@@ -66,38 +84,170 @@ class Parser:
             "component_or_param": spec,
             "multiple_sources": None,
             "single_source": None,
+            "selection": None,
         }
 
 
     def _parse_input_sources(self, remainder: str) -> dict:
         remainder = remainder.strip()
         if not remainder:
-            return {
-                "is_function": False,
-                "function_name": None,
-                "component_or_param": None,
-                "multiple_sources": None,
-                "single_source": None,
-            }
+            return self._empty_parse_result()
 
-        if remainder.startswith("(") and remainder.endswith(")"):
-            multiple_sources = self._parse_multiple_sources(remainder[1:-1].strip())
+        selection = self._parse_selection_expression(remainder)
+
+        if selection is not None and selection["selector"]["type"] == "include":
+            multiple_sources = copy.deepcopy(selection["selector"]["sources"])
             return {
                 "is_function": False,
                 "function_name": None,
                 "component_or_param": None,
                 "multiple_sources": multiple_sources,
                 "single_source": None,
+                "selection": selection,
             }
-        else:
-            single_source = self._parse_one_custom_item(remainder)
+
+        if selection is not None:
             return {
                 "is_function": False,
                 "function_name": None,
                 "component_or_param": None,
                 "multiple_sources": None,
-                "single_source": single_source,
+                "single_source": None,
+                "selection": selection,
             }
+
+        single_source = self._parse_one_custom_item(remainder)
+        return {
+            "is_function": False,
+            "function_name": None,
+            "component_or_param": None,
+            "multiple_sources": None,
+            "single_source": single_source,
+            "selection": None,
+        }
+
+    def _parse_selection_expression(self, expr: str) -> Optional[dict]:
+        expr = expr.strip()
+        if not expr:
+            return None
+
+        if expr.startswith("*"):
+            selector, remainder = self._parse_star_selector(expr)
+            global_index = None
+            if remainder:
+                if not remainder.startswith("?"):
+                    raise ValueError(f"Unexpected input selector suffix: {remainder}")
+                global_index = self._parse_global_index(remainder[1:])
+            return {
+                "mode": "timeline",
+                "selector": selector,
+                "global_index": global_index,
+            }
+
+        if expr.startswith("("):
+            close_idx = self._find_matching(expr, 0, "(", ")")
+            if close_idx is None:
+                return None
+            inside = expr[1:close_idx].strip()
+            remainder = expr[close_idx + 1:].strip()
+            if remainder and not remainder.startswith("?"):
+                return None
+            sources = self._parse_multiple_sources(inside)
+            global_index = self._parse_global_index(remainder[1:]) if remainder else None
+            return {
+                "mode": "timeline",
+                "selector": {
+                    "type": "include",
+                    "sources": sources,
+                },
+                "global_index": global_index,
+            }
+
+        return None
+
+    def _parse_star_selector(self, expr: str) -> tuple:
+        remainder = expr[1:].strip()
+        if not remainder:
+            return {"type": "all"}, ""
+
+        if remainder.startswith("!"):
+            rest = remainder[1:].strip()
+            if rest.startswith("("):
+                close_idx = self._find_matching(rest, 0, "(", ")")
+                if close_idx is None:
+                    raise ValueError(f"Invalid negative selector: {expr}")
+                inside = rest[1:close_idx].strip()
+                excluded = [part.strip() for part in self._split_by_top_level_comma(inside) if part.strip()]
+                return {"type": "exclude", "components": excluded}, rest[close_idx + 1:].strip()
+
+            if not rest:
+                raise ValueError(f"Invalid negative selector: {expr}")
+            if "?" in rest:
+                name, suffix = rest.split("?", 1)
+                return {"type": "exclude", "components": [name.strip()]}, "?" + suffix
+            return {"type": "exclude", "components": [rest.strip()]}, ""
+
+        if remainder.startswith("?"):
+            return {"type": "all"}, remainder
+
+        raise ValueError(f"Invalid '*' selector syntax: {expr}")
+
+    def _find_matching(self, text: str, start_idx: int, opener: str, closer: str) -> Optional[int]:
+        depth = 0
+        bracket_depth = 0
+        for idx in range(start_idx, len(text)):
+            ch = text[idx]
+            if ch == "[":
+                bracket_depth += 1
+            elif ch == "]":
+                bracket_depth -= 1
+            elif bracket_depth == 0 and ch == opener:
+                depth += 1
+            elif bracket_depth == 0 and ch == closer:
+                depth -= 1
+                if depth == 0:
+                    return idx
+        return None
+
+    def _parse_global_index(self, spec: str):
+        spec = spec.strip()
+        if not spec or spec == "~":
+            return "~"
+
+        parts = spec.split("~")
+        if len(parts) == 1:
+            return self._parse_global_endpoint(parts[0])
+        if len(parts) == 2:
+            return (
+                self._parse_global_endpoint(parts[0]) if parts[0].strip() else None,
+                self._parse_global_endpoint(parts[1]) if parts[1].strip() else None,
+            )
+        raise ValueError(f"Invalid global range: {spec}")
+
+    def _parse_global_endpoint(self, token: str):
+        token = token.strip()
+        if not token:
+            return None
+        try:
+            return int(token)
+        except ValueError:
+            pass
+
+        item = self._parse_one_custom_item(token)
+        if not item.get("component"):
+            raise ValueError(f"Invalid global range endpoint: {token}")
+        if item.get("fields"):
+            raise ValueError(f"Global range endpoints cannot include fields: {token}")
+        idx = item.get("index")
+        if idx in (None, ""):
+            idx = -1
+        if not isinstance(idx, int):
+            raise ValueError(f"Global range endpoint must identify one message: {token}")
+        return {
+            "type": "anchor",
+            "component": item["component"],
+            "index": idx,
+        }
 
 
     def _parse_multiple_sources(self, content: str) -> list:

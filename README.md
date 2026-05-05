@@ -299,6 +299,29 @@ Here are the primary block types the system uses:
     }
     ```
 
+-   **Variable Block**: For changing runtime variables and component parameters from history.
+    ```json
+    {
+      "type": "variable",
+      "key": "tone",
+      "value": "casual"
+    }
+    ```
+    Variables are defined globally in `general_parameters.variables`:
+    ```json
+    {
+      "general_parameters": {
+        "variables": [
+          {"key": "tone", "type": ["formal", "casual"], "default": "formal"},
+          {"key": "temperature", "type": "number", "default": 0.2}
+        ]
+      }
+    }
+    ```
+    Any string in component config can reference a variable with `$key$`. A full-string placeholder keeps the original value type, so `"temperature": "$temperature$"` resolves to a number. The current value is per user: MAS uses the latest `variable` block for that `user_id`, or the configured default when no block exists.
+
+    Component parameters can be overridden with variable keys shaped like `component_name:parameter_name`. For example, `{"type":"variable","key":"assistant:temperature","value":0}` updates the agent's model params for subsequent runs, and `assistant:provider` / `assistant:model` can redirect the model used by that component. Python code can read or write these values with `manager.get_variable(key, user_id=None)` and `manager.set_variable(key, value, user_id=None)`.
+
 #### Automatic Conversion to Blocks (`_to_blocks`)
 
 You don't need to worry about creating these structures yourself. When you call `manager.run(input=...)` or `manager.add_blocks(content=...)`, the library automatically converts your data into the appropriate block format based on these rules:
@@ -1830,156 +1853,250 @@ It is the recommended way to programmatically insert content into the history.
 
 ## Input String Parsing
 
-The input string parser allows for advanced message selection and transformation based on specifications in a string format. This syntax is usually used when listing components in automations, and allows to specify which messages will each component receive from the history. The syntax can also be used when defining looping and branching conditions within automations.
+The input string parser controls which messages from the history are passed into a component. It is most often used in automation sequence steps, but the same input spec can also be used in `target_input`, branch conditions, loop conditions, switch values, and `for` loop item specs.
 
-#### Defining Inputs Using MAS Input Syntax
-
-In an automation, when defining a component to run in a step, you specify the component name in a string:
+An input string has one of these shapes:
 
 ```json
 "executed_component"
+"executed_component:input_spec"
+":input_spec"
 ```
 
-**Default Behavior**:
+Use `"executed_component:input_spec"` inside automation steps, because the string must name the component to run. Use `":input_spec"` when the component is already known, such as in `target_input` or in a condition dictionary.
 
-- For agents: The component receives the complete conversation (excluding messages labeled with the `"internal"` role, and respecting positive/negative filters defined during creation).
-- For tools: The component receives the latest message directly as a dictionary, because its values will be passed as arguments to the tool function, in order.
-- For processes: The component receives the latest message as a single-element list containing the content dictionary.
+### Defaults
 
-You can override these defaults with more complex input specifications. This is where input string syntax comes into play, starting with a colon which denotes the start of a string that will encode input information.
+If no input spec is provided:
 
-#### Specifying Input Component
+- Agents receive the full conversation, after excluding `"internal"` messages and after applying the agent's positive and negative filters.
+- Tools receive the latest message as a dictionary. That dictionary is unpacked into the tool function arguments.
+- Processes receive the latest message as a one-element message list.
+- Conditions like `"field_name"` read `field_name` from the latest message.
 
-- **Input Component:**
-  ```json
-  "executed_component:input_component"
-  ```
-  Specifies which input component’s messages are used as input by the executed component. For agents, this includes the full conversation history filtered to only messages from the specified `input_component` (as well as applying positive and negative filters defined for that agent). For tools and processes, this fetches the latest message from `input_component`.
+### Source Items
 
-#### Specifying Input Index
+A source item selects messages from one component's own message history:
 
-- **Indexing Messages:**
-  ```json
-  "executed_component:input_component?index"
-  ```
-  Specifies the index of `input_component`'s message history to fetch.
-  - Negative integers indicate positions from the end (e.g., `?-1` is the latest message, which is the default for tools and processes).
-  - A range can be specified (e.g., `?-5~-2` fetches all messages from the 5th-to-last to the 2nd-to-last from the specified `input_component`).
-  - Open intervals are allowed:
-    - `?-4` grabs all messages up to the 4th-to-last.
-    - `-4?` grabs the latest 4 messages.
-    - `?~` grabs all messages (this is the default for agents).
+```text
+component
+component?index
+component?start~end
+component?[field1, field2]
+component?index[field1, field2]
+component?start~end[field1, field2]
+```
 
-Ranges are well-defined for agents and processes, which receive lists of messages, but not for tools, as they work with single dictionaries. To retrieve fields from multiple messages for tools, specialized syntax is required (this will be covered below).
+Indexes are zero-based. Negative indexes count from the end. Ranges use Python-style slicing: the start is included and the end is excluded.
 
-#### Specifying Input Fields
+```json
+"agent:research?-1"
+"agent:research?-5~"
+"agent:research?~-1"
+"agent:research?~"
+"agent:research?-3~[answer, confidence]"
+```
 
-- **Selecting Fields:**
-  ```json
-  "executed_component:input_component?[field1, field2]"
-  ```
-  Filters the content dictionary of the messages to include only specified fields. For agents, this applies to all fetched messages. For processes, this applies to all fetched messages too, although by default it grabs only the latest message (like in this example, where no index is specified). For tools, it applies to the single fetched message.
+These mean:
 
-#### Combining Index and Field Specification
+- `research?-1`: the latest `research` message.
+- `research?-5~`: the last five `research` messages.
+- `research?~-1`: all `research` messages except the latest one.
+- `research?~`: all `research` messages.
+- `research?-3~[answer, confidence]`: the last three `research` messages, keeping only `answer` and `confidence`.
 
-- **Combining Index and Fields:**
-  ```json
-  "executed_component:input_component?-3~?[desired_field]"
-  ```
-  Executes the component with input as the last three messages from `input_component`, filtering each to only include `desired_field` and ignoring other fields that could be part of those messages. This would be valid for agents and processes, but not for tools, as the index specifies a range.
+When the input spec is a single bare source item, its range is local to that component. This is important:
 
-#### Concatenating Multiple Inputs
+```json
+"agent:research?-5~"
+```
 
-- **Concatenating Inputs:**
-  ```json
-  "executed_component:(input_comp_1, input_comp_2)"
-  ```
-  Specifies multiple input components.
-  - For agents: Receives message histories from both components, defaulting to full message histories from both in this case, combining all into one history which preserves conversation order.
-  - For processes: Builds a list of messages from each component just like agents, defaulting to full message histories, just like agents. Conversation history is preserved, and each message is wrapped into a dictionary which specifies "source" (the role) and "message" (the actual content) just like with agents.
-  - For tools: Merges fetched messages from all components into a single dictionary. Developers must be careful not to merge input messages with fields named the same way, as they can overwrite each other. This is solved by carefully naming fields that will be used by the same tool at the same time.
+This gives `agent` the last five messages produced by `research`, regardless of how many messages other components produced between them.
 
+### Multiple Positive Sources
 
-Input concatenation allows for all the usual input parameter specification for each particular input. For example:
-  ```json
-  "executed_component:(input_comp_1?-1, input_comp_2?[field1, field2])"
-  ```
-  - For agents: Combines the latest message from `input_comp_1` with all messages from `input_comp_2` (filtered to `field1` and `field2`), preserving conversation order.
-  - For processes: Grabs the latest message from both components, filtering the second component to keep only desired fields, and combines into a single list preserving conversation order.
-  - For tools: Combines all fields from the latest message from `input_comp_1` with the specified fields from the latest message of `input_comp_2` into a single dictionary.
+Wrap source items in parentheses to select several sources:
 
-#### Specifying Conditionals
+```json
+"agent:(research, critic)"
+"agent:(research?-1, critic?[summary])"
+"agent:(research?-3~[answer], critic?-1[verdict])"
+```
 
-**Conditionals in Automations**
-Conditionals are used for branching and loops in automations. By default, they evaluate a boolean field from the latest message:
+The result is merged back into chronological order.
 
-  ```json
-  "field1"
-  ```
+For agents and processes, a source item without an explicit index means all messages from that source. For tools and conditions, a source item without an explicit index means the latest message from that source, because their result is a single dictionary by default.
 
-  Fetches `field1` from the latest message, which must be a boolean, and evaluates it. If true, the conditional is true as well.
+Tools and conditions merge selected messages into one dictionary in chronological order. If two selected messages contain the same field, the later message overwrites the earlier one.
 
-**Complex Conditionals:**
+### Timeline Selectors
 
-If the conditional string starts with a colon, the input syntax can be used to specify conditional inputs in the same way as it is used for specifying inputs for components. Conditionals have defaults similar to tools, fetching the latest message by default and merging fields from different messages into a single dict for evaluation. For example:
+Sometimes you want to select by the whole conversation timeline first, instead of by each component separately. Timeline selectors do that:
 
-  ```json
-  ":input_comp?[field_1]"
-  ```
+```json
+"agent:*"
+"agent:*?-5~"
+"agent:*!(debug_logger, internal_tool)?-20~"
+"agent:(research, critic)?planner?-2~"
+"agent:(research?-1[answer], critic?[summary])?planner?-2~"
+```
 
-  Fetches the latest message from `input_comp`, retrieves `field_1`, and evaluates it as a boolean.
+The selector part can be:
 
-  ```json
-  ":input_comp?-3?[field1, field2]"
-  ```
+- `*`: all messages in the current timeline.
+- `*!(component_a, component_b)`: all messages except messages from those components.
+- `(source_item, source_item, ...)`: only the listed source items.
 
-  Fetches the -3rd message from `input_comp`, retrieves `field1` and `field2`, and evaluates both fields (AND logic is applied by default, both need to be true for the conditional to be true).
+The optional range after the selector is global. It is applied to the full chronological conversation before the selector's source-specific filters are applied.
 
-  ```json
-  ":(input_comp_1?[field1], input_comp_2?-4)"
-  ```
+This rule is the main distinction between bare and parenthesized single-component specs:
 
-  Combines the specified field from `input_comp_1`'s latest message and all fields from `input_comp_2`'s -4th message. All must evaluate to true for the conditional to be true. Just like with tools, the developer must be careful when naming output fields for components that will be evaluated inside the same conditional so as to not have overlap and overwriting.
+```json
+"agent:research?-5~"
+"agent:(research)?-5~"
+```
 
-Just like with tools, ranges are not allowed in conditionals, as they are ill-defined.
+The first line means: take the last five `research` messages.
 
-**Custom Functions:**
-  ```json
-  "fn:function_name"
-  ```
-  Evaluates a custom function, which must return a boolean value to be evaluated by the conditional. By default, this function takes as input a dictionary containing all fields from the latest message. This function must be present in the .py file associated with function calling.
-  ```json
-  "fn:function_name:input_comp"
-  ```
-  Takes all fields from the latest message of `input_comp` as input to the function.
+The second line means: take the last five messages in the whole conversation, then keep only the messages from `research` among those five.
 
-  ```json
-  "fn:function_name:input_comp?[field1, field2]"
-  ```
-  Fetches specified fields from the latest message of `input_comp` and passes them to the function.
+### Global Ranges
 
+A global range follows a timeline selector and starts with `?`:
 
-#### Advanced Conditional Evaluation
+```json
+"agent:*?-5~"
+"agent:*?~-1"
+"agent:*?-1"
+"agent:(research, critic)?planner?-2~"
+"agent:(research, critic)?planner~"
+```
 
-Conditionals can also be defined as dictionaries with `"input"` and `"value"` keys. This supports evaluating non-boolean values. The `"input"` field is a string which behaves in the exact same way as the conditional string described above.
+Global numeric endpoints use the whole conversation:
 
-- **Basic Equality Check:**
+- `*?-5~`: last five messages in the whole conversation.
+- `*?~-1`: all messages except the latest global message.
+- `*?-1`: only the latest global message.
 
-  ```json
-  {"input": "field1", "value": 5}
-  ```
+Global endpoints can also be anchors to a component message:
 
-  Tests if `field1` from the latest message equals `5`.
+- `planner?-2~`: start at the penultimate `planner` message and continue to the end.
+- `planner~`: start at the latest `planner` message and continue to the end.
+- `planner?-3~planner?-1`: start at the third-to-last `planner` message and stop before the latest `planner` message.
 
-- **Multiple Values:**
+Anchor endpoints identify one message in the global timeline. They can use a component name plus a single integer index. They cannot include fields or ranges. If an anchor does not match any message, the selected global window is empty.
 
-  ```json
-  {"input": ":(input_comp_1?-2?[field1], input_comp_2?[field1, field2])", "value": [false, "yes", 0]}
-  ```
+### Evaluation Order
 
-  Evaluates fields in order of reference inside the input string: `field1` from `input_comp_1`'s second to last message must be `false`, `field1` from `input_comp_2`'s latest message must be the string `"yes"`, and `field2` from that same message must be `0` for the condition to be true.
+MAS evaluates an input spec in this order:
 
-The input syntax allows the developer to have a remarkable amount of control and flexibility over what is received as input by each component or conditional inside an automation, while keeping the JSON notation concise when working with simple workflows that can rely on reasonable default behaviors.
+1. Start from chronological history. For agents, apply the agent's positive and negative filters first.
+2. If the input spec has a global range, cut the global timeline to that window.
+3. Apply the selector: all messages with `*`, all except named components with `*!(...)`, or only the parenthesized source items with `(...)`.
+4. For parenthesized source items, apply each source item's local index, local range, and field filter inside the already-cut global window.
+5. Return the selected messages in chronological order. Tools and conditions merge selected dictionaries chronologically, so later fields win on key conflicts.
+
+For example:
+
+```json
+"agent:(research?-1[answer], critic?[summary])?planner?-2~"
+```
+
+This means:
+
+1. Find the penultimate `planner` message in the whole conversation.
+2. Keep only the conversation from that message onward.
+3. Inside that window, select the latest `research` message and keep only `answer`.
+4. Inside that same window, select `critic` messages and keep only `summary`.
+5. Pass the surviving messages to `agent` in chronological order.
+
+### Component Behavior
+
+Agents receive a conversation. Selected messages keep their chronological order, and messages from other components are represented as user-side messages with a source block so the agent can tell where each message came from.
+
+Processes receive a list of dictionaries:
+
+```json
+[
+  {
+    "source": "research",
+    "message": [{"type": "text", "content": {"answer": "..."}}],
+    "type": "component",
+    "timestamp": "..."
+  }
+]
+```
+
+Tools receive one dictionary. The selected messages are converted to dictionaries and merged in chronological order:
+
+```json
+"tool:(retriever?[items], ranker?[ranking])"
+```
+
+This passes a single dictionary containing fields from the latest `retriever` message and the latest `ranker` message, filtered to `items` and `ranking`.
+
+Conditions use the same input syntax when the condition string starts with `:`:
+
+```json
+":state?[ok]"
+":*!(debug_logger)?-3~"
+":(planner?[should_continue], validator?[is_valid])?planner?-2~"
+```
+
+A string condition evaluates the truthiness of the selected value or values. A dictionary condition compares the selected value with `"value"`:
+
+```json
+{
+  "input": ":*!(debug_logger)?-2~",
+  "value": {"ok": true}
+}
+```
+
+### Examples
+
+```json
+"summarizer:*?-5~"
+```
+
+Run `summarizer` with the last five messages in the whole conversation.
+
+```json
+"writer:(research, critic)?planner?-2~"
+```
+
+Run `writer` with `research` and `critic` messages from the penultimate `planner` message onward.
+
+```json
+"writer:(research?-1[answer], critic?-1[verdict])?planner?-2~"
+```
+
+Run `writer` with the latest `research.answer` and latest `critic.verdict` inside the global window that starts at the penultimate `planner` message.
+
+```json
+"cleanup_tool:*!(debug_logger, trace_collector)?-20~"
+```
+
+Run `cleanup_tool` with a dictionary merged from the last twenty global messages, excluding messages produced by `debug_logger` and `trace_collector`.
+
+```json
+"audit_process:(retriever?~[items], ranker?-1[ranking])?planner~"
+```
+
+Run `audit_process` with all `retriever.items` and the latest `ranker.ranking` from the latest `planner` message onward.
+
+```json
+"agent:research?-5~"
+```
+
+Run `agent` with the last five `research` messages.
+
+```json
+"agent:(research)?-5~"
+```
+
+Run `agent` with `research` messages that appear inside the last five messages of the whole conversation.
+
+The compact forms keep their usual meaning, and timeline selectors let you express conversation-wide windows, component anchors, and negative component filters without changing the rest of the automation format.
 
 ## Error Handling
 

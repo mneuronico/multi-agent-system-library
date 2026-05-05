@@ -15,6 +15,154 @@ class Component:
         verbose: bool = False) -> Dict:
         raise NotImplementedError("Subclass must implement .run().")
 
+    def _has_timeline_selection(self, parsed: dict) -> bool:
+        selection = parsed.get("selection") if isinstance(parsed, dict) else None
+        return isinstance(selection, dict) and selection.get("mode") == "timeline"
+
+    def _message_sort_key(self, row: tuple) -> Any:
+        return row[2]
+
+    def _select_by_index(self, index, subset: List[tuple], default: str = "all") -> List[tuple]:
+        if not subset:
+            return []
+
+        if index is None:
+            return subset[-1:] if default == "latest" else subset[:]
+
+        if index == "~":
+            return subset[:]
+
+        if isinstance(index, int):
+            if -len(subset) <= index < len(subset):
+                return [subset[index]]
+            return []
+
+        if isinstance(index, tuple):
+            start, end = index
+            start = 0 if start is None else int(start)
+            end = len(subset) if end is None else int(end)
+            return subset[start:end]
+
+        return subset[-1:] if default == "latest" else subset[:]
+
+    def _normalize_global_position(self, pos: int, length: int) -> int:
+        return length + pos if pos < 0 else pos
+
+    def _resolve_global_endpoint(self, endpoint, messages: List[tuple]) -> Optional[int]:
+        if endpoint is None:
+            return None
+
+        if isinstance(endpoint, int):
+            return self._normalize_global_position(endpoint, len(messages))
+
+        if isinstance(endpoint, dict) and endpoint.get("type") == "anchor":
+            component = endpoint.get("component")
+            index = endpoint.get("index", -1)
+            subset = [row for row in messages if row[0] == component]
+            chosen = self._select_by_index(index, subset, default="latest")
+            if len(chosen) != 1:
+                return None
+            target_msg_number = chosen[0][2]
+            for pos, row in enumerate(messages):
+                if row[2] == target_msg_number:
+                    return pos
+            return None
+
+        return None
+
+    def _apply_global_index(self, messages: List[tuple], global_index) -> List[tuple]:
+        if global_index is None or global_index == "~":
+            return messages[:]
+
+        if isinstance(global_index, int):
+            if -len(messages) <= global_index < len(messages):
+                return [messages[global_index]]
+            return []
+
+        if isinstance(global_index, dict):
+            pos = self._resolve_global_endpoint(global_index, messages)
+            if pos is None or not (0 <= pos < len(messages)):
+                return []
+            return [messages[pos]]
+
+        if isinstance(global_index, tuple):
+            start_endpoint, end_endpoint = global_index
+            start = self._resolve_global_endpoint(start_endpoint, messages) if start_endpoint is not None else 0
+            end = self._resolve_global_endpoint(end_endpoint, messages) if end_endpoint is not None else len(messages)
+            if start is None or end is None:
+                return []
+            start = max(0, min(start, len(messages)))
+            end = max(0, min(end, len(messages)))
+            if end < start:
+                return []
+            return messages[start:end]
+
+        return messages[:]
+
+    def _content_as_blocks_for_fields(self, content: Any) -> List[dict]:
+        data = content
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if isinstance(data, list) and all(isinstance(b, dict) and "type" in b for b in data):
+            return data
+        return self.manager._to_blocks(data)
+
+    def _with_filtered_fields(self, msg_tuples: List[tuple], fields: Optional[list]) -> List[tuple]:
+        if not fields:
+            return msg_tuples
+        out = []
+        for role, content, msg_number, msg_type, timestamp in msg_tuples:
+            blocks = self._content_as_blocks_for_fields(content)
+            filtered = self.manager._filter_blocks_by_fields(blocks, fields)
+            out.append((role, filtered, msg_number, msg_type, timestamp))
+        return out
+
+    def _apply_timeline_selection(
+        self,
+        selection: dict,
+        messages: List[tuple],
+        *,
+        per_source_default: str = "all"
+    ) -> List[tuple]:
+        window = self._apply_global_index(messages, selection.get("global_index"))
+        selector = selection.get("selector", {}) or {}
+        selector_type = selector.get("type")
+
+        if selector_type == "all":
+            return window[:]
+
+        if selector_type == "exclude":
+            excluded = set(selector.get("components", []) or [])
+            return [row for row in window if row[0] not in excluded]
+
+        if selector_type == "include":
+            selected = []
+            for source_item in selector.get("sources", []) or []:
+                comp_name = source_item.get("component")
+                fields = source_item.get("fields")
+                subset = [row for row in window if row[0] == comp_name] if comp_name else window[:]
+                chosen = self._select_by_index(
+                    source_item.get("index"),
+                    subset,
+                    default=per_source_default
+                )
+                selected.extend(self._with_filtered_fields(chosen, fields))
+            return sorted(selected, key=self._message_sort_key)
+
+        return []
+
+    def _messages_to_input_dict(self, msg_tuples: List[tuple]) -> dict:
+        final_input = {}
+        for role, content, msg_number, msg_type, timestamp in sorted(msg_tuples, key=self._message_sort_key):
+            data = self.manager._blocks_as_tool_input(content)
+            data = self.manager._load_files_in_dict(data)
+            if isinstance(data, dict):
+                final_input.update(data)
+        return final_input
+
 
 class Agent(Component):
 
@@ -63,6 +211,95 @@ class Agent(Component):
             f"Description: {self.description}"
         )
 
+    def _runtime_config(self) -> Dict[str, Any]:
+        getter = getattr(self.manager, "_get_runtime_component_config", None)
+        if callable(getter):
+            cfg = getter(self.name)
+            if isinstance(cfg, dict):
+                return cfg
+        return {}
+
+    def _runtime_attr(self, name: str, default: Any) -> Any:
+        cfg = self._runtime_config()
+        if name in cfg:
+            return cfg[name]
+        resolver = getattr(self.manager, "resolve_runtime_value", None)
+        if callable(resolver):
+            return resolver(default, component_name=self.name)
+        return default
+
+    def _runtime_system_prompt(self) -> str:
+        return self._runtime_attr("system_prompt", self.system_prompt)
+
+    def _runtime_models(self) -> List[Dict[str, Any]]:
+        models = self._runtime_attr("models", self.models)
+        if isinstance(models, dict):
+            models = [models]
+        return copy.deepcopy(models or [])
+
+    def _runtime_model_params(self) -> Dict[str, Any]:
+        params = self._runtime_attr("model_params", self.model_params)
+        return copy.deepcopy(params) if isinstance(params, dict) else {}
+
+    def _runtime_required_outputs(self) -> Dict[str, Any]:
+        outputs = self._runtime_attr("required_outputs", self.required_outputs)
+        if isinstance(outputs, str):
+            return {"response": outputs}
+        return copy.deepcopy(outputs) if isinstance(outputs, dict) else {}
+
+    def _runtime_default_output(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._runtime_attr("default_output", self.default_output))
+
+    def _runtime_timeout(self) -> int:
+        return self._runtime_attr("timeout", self.timeout)
+
+    def _runtime_positive_filter(self):
+        return self._runtime_attr("positive_filter", self.positive_filter)
+
+    def _runtime_negative_filter(self):
+        return self._runtime_attr("negative_filter", self.negative_filter)
+
+    def _runtime_include_timestamp(self) -> bool:
+        return bool(self._runtime_attr("include_timestamp", self.include_timestamp))
+
+    @staticmethod
+    def _runtime_model_params_for_call(instance) -> Dict[str, Any]:
+        getter = getattr(instance, "_runtime_model_params", None)
+        if callable(getter):
+            return getter()
+        params = getattr(instance, "model_params", {}) or {}
+        return copy.deepcopy(params) if isinstance(params, dict) else {}
+
+    @staticmethod
+    def _runtime_required_outputs_for_call(instance) -> Dict[str, Any]:
+        getter = getattr(instance, "_runtime_required_outputs", None)
+        if callable(getter):
+            return getter()
+        outputs = getattr(instance, "required_outputs", {}) or {}
+        if isinstance(outputs, str):
+            return {"response": outputs}
+        return copy.deepcopy(outputs) if isinstance(outputs, dict) else {}
+
+    @staticmethod
+    def _runtime_timeout_for_call(instance) -> int:
+        getter = getattr(instance, "_runtime_timeout", None)
+        if callable(getter):
+            return getter()
+        return getattr(instance, "timeout", 120)
+
+    def _push_runtime_config(self) -> bool:
+        resolver = getattr(self.manager, "resolve_component_runtime_config", None)
+        pusher = getattr(self.manager, "_push_runtime_component_config", None)
+        if not callable(resolver) or not callable(pusher):
+            return False
+        pusher(self.name, resolver(self))
+        return True
+
+    def _pop_runtime_config(self) -> None:
+        popper = getattr(self.manager, "_pop_runtime_component_config", None)
+        if callable(popper):
+            popper(self.name)
+
     def run(
         self,
         input_data: Any = None,
@@ -73,7 +310,31 @@ class Agent(Component):
         verbose: bool = False,
         return_token_count: bool = False
     ) -> dict:
-        
+        runtime_pushed = self._push_runtime_config()
+        try:
+            return self._run_with_runtime_config(
+                input_data=input_data,
+                target_input=target_input,
+                target_index=target_index,
+                target_fields=target_fields,
+                target_custom=target_custom,
+                verbose=verbose,
+                return_token_count=return_token_count
+            )
+        finally:
+            if runtime_pushed:
+                self._pop_runtime_config()
+
+    def _run_with_runtime_config(
+        self,
+        input_data: Any = None,
+        target_input: Optional[str] = None,
+        target_index: Optional[int] = None,
+        target_fields: Optional[list] = None,
+        target_custom: Optional[list] = None,
+        verbose: bool = False,
+        return_token_count: bool = False
+    ) -> dict:
         db_conn = self.manager._get_user_db()
 
         conversation = None
@@ -99,8 +360,9 @@ class Agent(Component):
             logger.debug(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2, ensure_ascii=False)}\n")
 
         provider_attempts = []
+        runtime_models = self._runtime_models()
         if hasattr(self.manager, "prepare_model_attempts"):
-            model_attempts = self.manager.prepare_model_attempts(self.models)
+            model_attempts = self.manager.prepare_model_attempts(runtime_models)
         else:
             model_attempts = [
                 {
@@ -109,7 +371,7 @@ class Agent(Component):
                     "skip_reason": None,
                     "status": {},
                 }
-                for model_info in self.models
+                for model_info in runtime_models
             ]
 
         for model_attempt in model_attempts:
@@ -301,17 +563,19 @@ class Agent(Component):
                     )
 
         if verbose:
-            logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self.default_output}")
+            logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self._runtime_default_output()}")
         default_blocks = self.manager._to_blocks(
-            self.default_output,
+            self._runtime_default_output(),
             self.manager._active_user_id()
         )
         self._attach_provider_metadata(default_blocks, None, provider_attempts)
         return default_blocks
 
     def _as_blocks(self, value):
+        is_block = getattr(self.manager, "_is_block", None)
         if isinstance(value, list) and value and all(
-            isinstance(b, dict) and "type" in b and "content" in b for b in value
+            is_block(b) if callable(is_block) else isinstance(b, dict) and "type" in b and "content" in b
+            for b in value
         ):
             return value
 
@@ -603,7 +867,7 @@ class Agent(Component):
                             if src["kind"] == "file":
                                 data = open(_clean_path(src["path"]),"rb").read()
                             elif src["kind"] == "url":
-                                data = requests.get(src["url"], timeout=self.timeout).content
+                                data = requests.get(src["url"], timeout=Agent._runtime_timeout_for_call(self)).content
                             else:
                                 data = base64.b64decode(src["b64"])
                             gem_parts.append({
@@ -662,7 +926,14 @@ class Agent(Component):
         all_msgs = self.manager._get_all_messages(db_conn)
         filtered_msgs = self._apply_filters(all_msgs)
 
-        if parsed["multiple_sources"] is None and parsed["single_source"] is None:
+        if self._has_timeline_selection(parsed):
+            selected = self._apply_timeline_selection(
+                parsed["selection"],
+                filtered_msgs,
+                per_source_default="all"
+            )
+            conversation = self._transform_to_conversation(selected)
+        elif parsed["multiple_sources"] is None and parsed["single_source"] is None:
             if parsed["component_or_param"]:
                 comp_name = parsed["component_or_param"]
                 chosen = [
@@ -684,7 +955,7 @@ class Agent(Component):
             partial = self._collect_msg_snippets_for_agent(parsed["single_source"], filtered_msgs)
             conversation = self._transform_to_conversation(partial)
 
-        conversation = [{"role": "system", "content": self.system_prompt}] + conversation
+        conversation = [{"role": "system", "content": self._runtime_system_prompt()}] + conversation
         return conversation
 
 
@@ -741,6 +1012,8 @@ class Agent(Component):
         cleaned = []
         for blk in blocks:
             if isinstance(blk, dict):
+                if blk.get("type") == "variable":
+                    continue
                 blk = blk.copy()
                 blk.pop("metadata", None)
             cleaned.append(blk)
@@ -769,7 +1042,7 @@ class Agent(Component):
                 source_id = f"{role}"
                 source_obj = {"source": source_id}
 
-                if self.include_timestamp:
+                if self._runtime_include_timestamp():
                     try:
                         dt = datetime.fromisoformat(timestamp)
                         formatted_ts = dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -837,7 +1110,7 @@ class Agent(Component):
 
             conversation = self._transform_to_conversation(conversation)
             
-            conversation = [{"role": "system", "content": self.system_prompt}] + conversation
+            conversation = [{"role": "system", "content": self._runtime_system_prompt()}] + conversation
             return conversation
     
     def _handle_fields(self, msg_tuples, fields):
@@ -879,7 +1152,7 @@ class Agent(Component):
             subset = filtered_msgs[:]
 
         if not subset:
-            return [{"role": "system", "content": self.system_prompt}]
+            return [{"role": "system", "content": self._runtime_system_prompt()}]
 
         if target_index is not None:
             subset = self._handle_index(target_index, subset)
@@ -887,7 +1160,7 @@ class Agent(Component):
                  raise IndexError(f"Requested index/range={target_index} resulted in zero messages from a subset of size {len(filtered_msgs)}.")
 
         conversation = self._transform_to_conversation(subset, target_fields)
-        conversation = [{"role": "system", "content": self.system_prompt}] + conversation
+        conversation = [{"role": "system", "content": self._runtime_system_prompt()}] + conversation
         return conversation
 
     def _build_default_conversation(
@@ -896,11 +1169,13 @@ class Agent(Component):
         verbose: bool
     ) -> List[Dict[str, Any]]:
         conversation = self._transform_to_conversation(filtered_msgs)
-        conversation = [{"role": "system", "content": self.system_prompt}] + conversation
+        conversation = [{"role": "system", "content": self._runtime_system_prompt()}] + conversation
         return conversation
 
     def _apply_filters(self, messages: List[tuple]) -> List[tuple]:
-        if not self.positive_filter and not self.negative_filter:
+        positive_filter = self._runtime_positive_filter()
+        negative_filter = self._runtime_negative_filter()
+        if not positive_filter and not negative_filter:
             return messages
 
         def matches_filter(r: str, fltr: str, msg_type) -> bool:
@@ -914,11 +1189,11 @@ class Agent(Component):
 
         filtered = []
         for (role, content, msg_number, msg_type, timestamp) in messages:
-            if self.positive_filter:
-                if not any(matches_filter(role, pf, msg_type) for pf in self.positive_filter):
+            if positive_filter:
+                if not any(matches_filter(role, pf, msg_type) for pf in positive_filter):
                     continue
-            if self.negative_filter:
-                if any(matches_filter(role, nf, msg_type) for nf in self.negative_filter):
+            if negative_filter:
+                if any(matches_filter(role, nf, msg_type) for nf in negative_filter):
                     continue
             filtered.append((role, content, msg_number, msg_type, timestamp))
 
@@ -944,7 +1219,7 @@ class Agent(Component):
             return out
 
         props = {}
-        for field_name, desc in self.required_outputs.items():
+        for field_name, desc in Agent._runtime_required_outputs_for_call(self).items():
             props[field_name] = normalize_prop(desc)
 
         return {
@@ -1132,10 +1407,11 @@ class Agent(Component):
     ) -> str:
         schema_for_response = self._build_json_schema()
         
+        mp = Agent._runtime_model_params_for_call(self)
         params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_tokens": self.model_params.get("max_tokens"),
-            "top_p": self.model_params.get("top_p")
+            "temperature": mp.get("temperature"),
+            "max_tokens": mp.get("max_tokens"),
+            "top_p": mp.get("top_p")
         }
         
         params = {k: v for k, v in params.items() if v is not None}
@@ -1171,7 +1447,7 @@ class Agent(Component):
             response = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
-                json=data, timeout=self.timeout
+                json=data, timeout=Agent._runtime_timeout_for_call(self)
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1234,10 +1510,11 @@ class Agent(Component):
         verbose: bool,
         return_token_count: bool = False
     ) -> str:
+        mp = Agent._runtime_model_params_for_call(self)
         params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_tokens": self.model_params.get("max_tokens"),
-            "top_p": self.model_params.get("top_p")
+            "temperature": mp.get("temperature"),
+            "max_tokens": mp.get("max_tokens"),
+            "top_p": mp.get("top_p")
         }
         params = {k: v for k, v in params.items() if v is not None}
 
@@ -1265,7 +1542,7 @@ class Agent(Component):
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json=data,
-                timeout=self.timeout
+                timeout=Agent._runtime_timeout_for_call(self)
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1333,10 +1610,11 @@ class Agent(Component):
         url = f"{api_base}/chat/completions"
         schema_for_response = self._build_json_schema()
         
+        mp = Agent._runtime_model_params_for_call(self)
         params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_tokens": self.model_params.get("max_tokens"),
-            "top_p": self.model_params.get("top_p")
+            "temperature": mp.get("temperature"),
+            "max_tokens": mp.get("max_tokens"),
+            "top_p": mp.get("top_p")
         }
         params = {k: v for k, v in params.items() if v is not None}
 
@@ -1361,7 +1639,7 @@ class Agent(Component):
             response = requests.post(
                 url,
                 headers=headers,
-                json=data, timeout=self.timeout
+                json=data, timeout=Agent._runtime_timeout_for_call(self)
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1425,10 +1703,11 @@ class Agent(Component):
         return_token_count: bool = False
     ) -> str:
 
+        mp = Agent._runtime_model_params_for_call(self)
         params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_tokens": self.model_params.get("max_tokens"),
-            "top_p": self.model_params.get("top_p")
+            "temperature": mp.get("temperature"),
+            "max_tokens": mp.get("max_tokens"),
+            "top_p": mp.get("top_p")
         }
         params = {k: v for k, v in params.items() if v is not None}
 
@@ -1455,7 +1734,7 @@ class Agent(Component):
             response = requests.post(
                 "https://api.deepseek.com/chat/completions",
                 headers=headers,
-                json=data, timeout=self.timeout
+                json=data, timeout=Agent._runtime_timeout_for_call(self)
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1562,14 +1841,15 @@ class Agent(Component):
 
             return node
 
-        prop_names = list(self.required_outputs.keys())
+        required_outputs = Agent._runtime_required_outputs_for_call(self)
+        prop_names = list(required_outputs.keys())
         json_schema = {
             "type": "object",
-            "properties": {k: to_json_schema(self.required_outputs[k]) for k in prop_names},
+            "properties": {k: to_json_schema(required_outputs[k]) for k in prop_names},
             "required": prop_names
         }
 
-        mp = self.model_params or {}
+        mp = Agent._runtime_model_params_for_call(self)
         gc = {
             "response_mime_type": "application/json",
             "response_json_schema": json_schema,
@@ -1595,7 +1875,7 @@ class Agent(Component):
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1alpha/models/{model_name}:generateContent",
                 headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-                json=payload, timeout=self.timeout
+                json=payload, timeout=Agent._runtime_timeout_for_call(self)
             )
             r.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1668,10 +1948,11 @@ class Agent(Component):
         return_token_count: bool = False
     ) -> str:
         
+        mp = Agent._runtime_model_params_for_call(self)
         params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_tokens": self.model_params.get("max_tokens", 4096),
-            "top_p": self.model_params.get("top_p")
+            "temperature": mp.get("temperature"),
+            "max_tokens": mp.get("max_tokens", 4096),
+            "top_p": mp.get("top_p")
         }
         params = {k: v for k, v in params.items() if v is not None}
 
@@ -1698,7 +1979,7 @@ class Agent(Component):
             response = requests.post(
                 "https://api.anthropic.com/v1/messages",
                 headers=headers,
-                json=data, timeout=self.timeout
+                json=data, timeout=Agent._runtime_timeout_for_call(self)
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1763,10 +2044,11 @@ class Agent(Component):
         return_token_count: bool = False
     ) -> str:
         
+        mp = Agent._runtime_model_params_for_call(self)
         params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_completion_tokens": self.model_params.get("max_tokens"),
-            "top_p": self.model_params.get("top_p")
+            "temperature": mp.get("temperature"),
+            "max_completion_tokens": mp.get("max_tokens"),
+            "top_p": mp.get("top_p")
         }
         params = {k: v for k, v in params.items() if v is not None}
 
@@ -1799,7 +2081,7 @@ class Agent(Component):
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
-                json=data, timeout=self.timeout
+                json=data, timeout=Agent._runtime_timeout_for_call(self)
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -1863,10 +2145,11 @@ class Agent(Component):
     ) -> str:
         schema_for_response = self._build_json_schema()
 
+        mp = Agent._runtime_model_params_for_call(self)
         params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_tokens": self.model_params.get("max_tokens"),
-            "top_p": self.model_params.get("top_p")
+            "temperature": mp.get("temperature"),
+            "max_tokens": mp.get("max_tokens"),
+            "top_p": mp.get("top_p")
         }
         params = {k: v for k, v in params.items() if v is not None}
 
@@ -1891,7 +2174,7 @@ class Agent(Component):
         fallback_url = "https://tropical-llm.wavespeed.ai/v1/chat/completions"
 
         def _post(url):
-            resp = requests.post(url, headers=headers, json=data, timeout=self.timeout)
+            resp = requests.post(url, headers=headers, json=data, timeout=Agent._runtime_timeout_for_call(self))
             resp.raise_for_status()
             return resp
 
@@ -1979,14 +2262,15 @@ class Agent(Component):
         return_token_count: bool = False,
         base_url: Optional[str] = None
     ) -> str:
+        mp = Agent._runtime_model_params_for_call(self)
         params = {
-            "temperature": self.model_params.get("temperature"),
-            "max_tokens": self.model_params.get("max_tokens"),
-            "top_p": self.model_params.get("top_p")
+            "temperature": mp.get("temperature"),
+            "max_tokens": mp.get("max_tokens"),
+            "top_p": mp.get("top_p")
         }
         params = {k: v for k, v in params.items() if v is not None}
 
-        api_base = (base_url or self.model_params.get("base_url") or "https://integrate.api.nvidia.com/v1").rstrip("/")
+        api_base = (base_url or mp.get("base_url") or "https://integrate.api.nvidia.com/v1").rstrip("/")
         url = f"{api_base}/chat/completions"
 
         if verbose:
@@ -2009,7 +2293,7 @@ class Agent(Component):
                 url,
                 headers=headers,
                 json=data,
-                timeout=self.timeout
+                timeout=Agent._runtime_timeout_for_call(self)
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -2107,6 +2391,30 @@ class Tool(Component):
             f"Description: {self.description}"
         )
 
+    def _runtime_default_output(self) -> Dict[str, Any]:
+        resolver = getattr(self.manager, "resolve_component_runtime_config", None)
+        if callable(resolver):
+            cfg = resolver(self)
+            if isinstance(cfg, dict) and "default_output" in cfg:
+                return copy.deepcopy(cfg["default_output"])
+        value_resolver = getattr(self.manager, "resolve_runtime_value", None)
+        if callable(value_resolver):
+            return copy.deepcopy(value_resolver(self.default_output, component_name=self.name))
+        return copy.deepcopy(self.default_output)
+
+    def _runtime_outputs(self) -> Dict[str, Any]:
+        resolver = getattr(self.manager, "resolve_component_runtime_config", None)
+        if callable(resolver):
+            cfg = resolver(self)
+            if isinstance(cfg, dict) and "outputs" in cfg:
+                outputs = cfg["outputs"]
+                return copy.deepcopy(outputs) if isinstance(outputs, dict) else {}
+        value_resolver = getattr(self.manager, "resolve_runtime_value", None)
+        if callable(value_resolver):
+            outputs = value_resolver(self.outputs, component_name=self.name)
+            return copy.deepcopy(outputs) if isinstance(outputs, dict) else {}
+        return copy.deepcopy(self.outputs)
+
     def run(
             self,
             input_data: Any = None,
@@ -2167,7 +2475,7 @@ class Tool(Component):
             if missing:
                 if verbose:
                     logger.error(f"[Tool:{self.name}] Required arguments are missing: {missing}")
-                return self.default_output
+                return self._runtime_default_output()
 
             pos_args = []
             for p in pos_only:
@@ -2191,7 +2499,7 @@ class Tool(Component):
                         f"got {type(result).__name__}."
                     )
 
-                missing_outputs = [key for key in self.outputs if key not in result]
+                missing_outputs = [key for key in self._runtime_outputs() if key not in result]
                 if missing_outputs:
                     raise ValueError(
                         f"[Tool:{self.name}] function result is missing required "
@@ -2209,7 +2517,7 @@ class Tool(Component):
                 logger.error(f"[Tool:{self.name}] => error: {e}")
                 if verbose:
                     traceback.print_exc()
-                return self.default_output
+                return self._runtime_default_output()
 
 
     def _resolve_tool_or_process_input(
@@ -2290,6 +2598,15 @@ class Tool(Component):
 
         if verbose:
             logger.debug(f"[Tool:{self.name}] _gather_data_for_tool_process => parsed={parsed}")
+
+        if self._has_timeline_selection(parsed):
+            messages = self.manager._get_all_messages(db_conn)
+            selected = self._apply_timeline_selection(
+                parsed["selection"],
+                messages,
+                per_source_default="latest"
+            )
+            return self._messages_to_input_dict(selected)
 
         if parsed["multiple_sources"] is None and parsed["single_source"] is None:
             if parsed["component_or_param"]:
@@ -2518,6 +2835,14 @@ class Process(Component):
 
         all_msgs = self.manager._get_all_messages(db_conn)
 
+        if self._has_timeline_selection(parsed):
+            selected = self._apply_timeline_selection(
+                parsed["selection"],
+                all_msgs,
+                per_source_default="all"
+            )
+            return self._transform_to_message_list(selected)
+
         if not parsed["multiple_sources"] and not parsed["single_source"]:
             if parsed["component_or_param"]:
                 comp_name = parsed["component_or_param"]
@@ -2734,6 +3059,9 @@ class Automation(Component):
     def _execute_step(self, step, current_output, db_conn, verbose,
                       on_update = None, on_update_params = None,
                       return_token_count = False):
+        resolver = getattr(self.manager, "resolve_runtime_value", None)
+        if callable(resolver):
+            step = resolver(step, component_name=self.name)
 
         if isinstance(step, str):
             (
@@ -3012,6 +3340,15 @@ class Automation(Component):
     
     def _gather_data_for_parser_result(self, parsed: dict, db_conn: sqlite3.Connection) -> Any:
 
+        if self._has_timeline_selection(parsed):
+            messages = self.manager._get_all_messages(db_conn)
+            selected = self._apply_timeline_selection(
+                parsed["selection"],
+                messages,
+                per_source_default="latest"
+            )
+            return self._messages_to_input_dict(selected)
+
         if parsed["multiple_sources"] is None and parsed["single_source"] is None:
             if parsed["component_or_param"]:
                 comp = self.manager._get_component(parsed["component_or_param"])
@@ -3105,7 +3442,13 @@ class Automation(Component):
 
         parsed = self.manager.parser.parse_input_string(step_str)
 
-        if parsed["multiple_sources"]:
+        if self._has_timeline_selection(parsed):
+            component_name = parsed["component_or_param"] if parsed["component_or_param"] else step_str
+            if ":" in step_str:
+                target_input = ":" + step_str.split(":", 1)[1].strip()
+            else:
+                target_input = step_str
+        elif parsed["multiple_sources"]:
             component_name = parsed["component_or_param"]
             target_custom = parsed["multiple_sources"]
         elif parsed["single_source"]:

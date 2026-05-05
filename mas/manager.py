@@ -37,8 +37,10 @@ class AgentSystemManager:
         self._db_pool = {}
         self._db_locks = {}
         self._db_write_lock = threading.RLock()
+        self._variable_lock = threading.RLock()
         self._model_health_lock = threading.RLock()
         self._model_health: Dict[str, Dict[str, Any]] = {}
+        self.variable_definitions: Dict[str, Dict[str, Any]] = {}
         self._model_failure_policy = self._default_model_failure_policy()
         self._configure_model_failure_policy(model_failure_policy)
         self.base_directory = os.path.abspath(base_directory)
@@ -463,6 +465,9 @@ class AgentSystemManager:
         return tmp_file.name
     
     def _merge_imported_components(self, other_mgr, only_names):
+        for key, definition in getattr(other_mgr, "variable_definitions", {}).items():
+            if key not in self.variable_definitions:
+                self.variable_definitions[key] = copy.deepcopy(definition)
 
         for name, agent_obj in other_mgr.agents.items():
             if only_names and name not in only_names:
@@ -2279,6 +2284,7 @@ class AgentSystemManager:
         self.base_directory = general_params.get("base_directory", self.base_directory)
         self.general_system_description = general_params.get("general_system_description", "This is a multi-agent system.")
         self.functions = general_params.get("functions", "fns.py")
+        self._configure_variables(general_params.get("variables", []))
 
         if isinstance(self.functions, str):
             self.functions = [self.functions]
@@ -2348,6 +2354,373 @@ class AgentSystemManager:
                 self.link(input_component, output_component)
             except ValueError as e:
                 logger.error(f"Warning: Could not create link from '{input_component}' to '{output_component}'. Error: {e}")
+
+    def _configure_variables(self, variables: Any) -> None:
+        if variables in (None, ""):
+            variables = []
+        if isinstance(variables, dict):
+            variables = [
+                {"key": key, **(spec if isinstance(spec, dict) else {"default": spec})}
+                for key, spec in variables.items()
+            ]
+        if not isinstance(variables, list):
+            raise ValueError("general_parameters.variables must be a list of objects.")
+
+        definitions: Dict[str, Dict[str, Any]] = {}
+        for item in variables:
+            if not isinstance(item, dict):
+                raise ValueError("Each variable definition must be an object.")
+            key = item.get("key")
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("Each variable definition must include a non-empty string 'key'.")
+            if "default" not in item:
+                raise ValueError(f"Variable definition for '{key}' must include a 'default'.")
+            key = key.strip()
+            if key in definitions:
+                raise ValueError(f"Duplicate variable definition for '{key}'.")
+
+            definition = {
+                "key": key,
+                "type": copy.deepcopy(item.get("type")),
+                "default": copy.deepcopy(item.get("default")),
+                "has_default": True,
+            }
+            self._validate_variable_value(key, definition["default"], definition=definition)
+            definitions[key] = definition
+
+        with self._variable_lock:
+            self.variable_definitions = definitions
+
+    def define_variable(self, key: str, type: Any = None, default: Any = None) -> None:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("Variable key must be a non-empty string.")
+        key = key.strip()
+        definition = {"key": key, "type": copy.deepcopy(type), "default": copy.deepcopy(default), "has_default": True}
+        self._validate_variable_value(key, definition["default"], definition=definition)
+        with self._variable_lock:
+            self.variable_definitions[key] = definition
+
+    def _is_component_parameter_key(self, key: str) -> bool:
+        if not isinstance(key, str) or ":" not in key:
+            return False
+        component_name, parameter_name = key.split(":", 1)
+        return bool(component_name.strip() and parameter_name.strip())
+
+    def _is_known_variable_key(self, key: str) -> bool:
+        return key in self.variable_definitions or self._is_component_parameter_key(key)
+
+    def _validate_variable_key(self, key: Any) -> str:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("Variable block key must be a non-empty string.")
+        key = key.strip()
+        if not self._is_known_variable_key(key):
+            raise ValueError(
+                f"Unknown variable '{key}'. Define it in general_parameters.variables "
+                "or use a component parameter key like 'component:param'."
+            )
+        return key
+
+    def _validate_variable_value(
+        self,
+        key: str,
+        value: Any,
+        *,
+        definition: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        definition = definition if definition is not None else self.variable_definitions.get(key)
+        if not definition:
+            return value
+
+        expected = definition.get("type")
+        if expected is None:
+            return value
+
+        if isinstance(expected, list):
+            if value not in expected:
+                raise ValueError(
+                    f"Variable '{key}' must be one of {expected!r}; got {value!r}."
+                )
+            return value
+
+        if isinstance(expected, str):
+            type_name = expected.strip().lower()
+            if type_name in ("any", "*"):
+                return value
+            checks = {
+                "str": lambda v: isinstance(v, str),
+                "string": lambda v: isinstance(v, str),
+                "int": lambda v: isinstance(v, int) and not isinstance(v, bool),
+                "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+                "float": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+                "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+                "bool": lambda v: isinstance(v, bool),
+                "boolean": lambda v: isinstance(v, bool),
+                "dict": lambda v: isinstance(v, dict),
+                "object": lambda v: isinstance(v, dict),
+                "list": lambda v: isinstance(v, list),
+                "array": lambda v: isinstance(v, list),
+                "none": lambda v: v is None,
+                "null": lambda v: v is None,
+            }
+            checker = checks.get(type_name)
+            if checker is None:
+                raise ValueError(f"Unsupported type for variable '{key}': {expected!r}.")
+            if not checker(value):
+                raise ValueError(
+                    f"Variable '{key}' must be of type '{expected}'; got {type(value).__name__}."
+                )
+            return value
+
+        raise ValueError(f"Unsupported type declaration for variable '{key}': {expected!r}.")
+
+    def _normalize_variable_block(self, block: Dict[str, Any], user_id: Optional[str] = None) -> Dict[str, Any]:
+        normalized = copy.deepcopy(block)
+        key = self._validate_variable_key(normalized.get("key"))
+        value = normalized.get("value")
+        value = self._persist_non_json_values(value, user_id)
+        normalized["key"] = key
+        normalized["value"] = self._validate_variable_value(key, value)
+        return normalized
+
+    def _iter_variable_blocks_from_rows(self, rows: List[tuple]):
+        for row in rows:
+            content = row[1]
+            try:
+                blocks = json.loads(content) if isinstance(content, str) else content
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            if isinstance(blocks, dict):
+                blocks = [blocks]
+            if not isinstance(blocks, list):
+                continue
+
+            for block in blocks:
+                if isinstance(block, dict) and block.get("type") == "variable":
+                    yield block
+
+    def get_variables(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+        with self._variable_lock:
+            values = {
+                key: copy.deepcopy(definition.get("default"))
+                for key, definition in self.variable_definitions.items()
+            }
+
+        uid = str(user_id) if user_id is not None else self._active_user_id()
+        if not uid:
+            return values
+
+        conn = self._ensure_user_db(uid)
+        rows = self._get_all_messages(conn)
+        for block in self._iter_variable_blocks_from_rows(rows):
+            key = self._validate_variable_key(block.get("key"))
+            values[key] = self._validate_variable_value(key, block.get("value"))
+
+        return values
+
+    def get_variable(self, key: str, user_id: Optional[str] = None) -> Any:
+        key = self._validate_variable_key(key)
+        return copy.deepcopy(self.get_variables(user_id).get(key))
+
+    def get_component_parameter_overrides(
+        self,
+        component_name: str,
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        prefix = f"{component_name}:"
+        return {
+            key[len(prefix):]: value
+            for key, value in self.get_variables(user_id).items()
+            if isinstance(key, str) and key.startswith(prefix)
+        }
+
+    def set_variable(self, key: str, value: Any, user_id: Optional[str] = None) -> int:
+        key = self._validate_variable_key(key)
+        value = self._validate_variable_value(key, value)
+        self.ensure_user(user_id)
+        conn = self._get_user_db()
+        return self._save_message(
+            conn,
+            "variable",
+            {"type": "variable", "key": key, "value": value},
+            "variable"
+        )
+
+    def _lookup_variable_for_template(self, key: str, user_id: Optional[str] = None) -> Any:
+        if not self._is_known_variable_key(key):
+            raise ValueError(f"Unknown variable placeholder '${key}$'.")
+        return self.get_variables(user_id).get(key)
+
+    def resolve_runtime_value(
+        self,
+        value: Any,
+        user_id: Optional[str] = None,
+        component_name: Optional[str] = None
+    ) -> Any:
+        placeholder_re = re.compile(r"\$([A-Za-z0-9_.:-]+)\$")
+        uid = str(user_id) if user_id is not None else self._active_user_id()
+
+        def resolve_string(text: str) -> Any:
+            full = re.fullmatch(r"\$([A-Za-z0-9_.:-]+)\$", text.strip())
+            if full:
+                return copy.deepcopy(self._lookup_variable_for_template(full.group(1), uid))
+
+            def replace(match):
+                raw = self._lookup_variable_for_template(match.group(1), uid)
+                if raw is None:
+                    return ""
+                if isinstance(raw, (dict, list)):
+                    return json.dumps(raw, ensure_ascii=False)
+                return str(raw)
+
+            return placeholder_re.sub(replace, text)
+
+        if isinstance(value, str):
+            return resolve_string(value)
+        if isinstance(value, list):
+            return [self.resolve_runtime_value(item, uid, component_name) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: self.resolve_runtime_value(item, uid, component_name)
+                for key, item in value.items()
+            }
+        return copy.deepcopy(value)
+
+    def _agent_prompt_suffix(self, agent: Agent) -> str:
+        try:
+            base_prompt = self._build_agent_prompt(
+                agent.general_system_description,
+                agent.name,
+                agent.system_prompt_original,
+                agent.required_outputs
+            )
+            if isinstance(agent.system_prompt, str) and agent.system_prompt.startswith(base_prompt):
+                return agent.system_prompt[len(base_prompt):]
+        except Exception:
+            pass
+        return ""
+
+    def resolve_component_runtime_config(
+        self,
+        component: Component,
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        uid = str(user_id) if user_id is not None else self._active_user_id()
+        name = component.name
+        overrides = self.get_component_parameter_overrides(name, uid)
+        config: Dict[str, Any] = {}
+
+        if isinstance(component, Agent):
+            required_outputs = self.resolve_runtime_value(component.required_outputs, uid, name)
+            specific_system = self.resolve_runtime_value(component.system_prompt_original, uid, name)
+            general_desc = self.resolve_runtime_value(component.general_system_description, uid, name)
+
+            if "required_outputs" in overrides:
+                required_outputs = copy.deepcopy(overrides["required_outputs"])
+            if "system" in overrides:
+                specific_system = str(overrides["system"])
+
+            if self._agent_prompt_suffix(component):
+                prompt = self._build_agent_prompt(general_desc, name, specific_system, required_outputs)
+                prompt += self.resolve_runtime_value(self._agent_prompt_suffix(component), uid, name)
+            else:
+                prompt = self.resolve_runtime_value(component.system_prompt, uid, name)
+            if "system_prompt" in overrides:
+                prompt = str(overrides["system_prompt"])
+
+            models = self.resolve_runtime_value(component.models, uid, name)
+            if "models" in overrides:
+                models = copy.deepcopy(overrides["models"])
+            if isinstance(models, dict):
+                models = [models]
+            if models is None:
+                models = []
+            models = copy.deepcopy(models)
+            if ("provider" in overrides or "model" in overrides or "base_url" in overrides) and not models:
+                models = [{}]
+            if models:
+                if "provider" in overrides:
+                    models[0]["provider"] = overrides["provider"]
+                if "model" in overrides:
+                    models[0]["model"] = overrides["model"]
+                if "base_url" in overrides:
+                    models[0]["base_url"] = overrides["base_url"]
+
+            model_params = self.resolve_runtime_value(component.model_params or {}, uid, name)
+            if not isinstance(model_params, dict):
+                model_params = {}
+            if "model_params" in overrides and isinstance(overrides["model_params"], dict):
+                model_params.update(copy.deepcopy(overrides["model_params"]))
+            reserved = {
+                "system", "system_prompt", "required_outputs", "models",
+                "provider", "model", "default_output", "timeout",
+                "positive_filter", "negative_filter", "include_timestamp"
+            }
+            for param_name, param_value in overrides.items():
+                if param_name in reserved:
+                    continue
+                model_params[param_name] = copy.deepcopy(param_value)
+
+            config.update({
+                "system_prompt": prompt,
+                "required_outputs": required_outputs,
+                "models": models,
+                "model_params": model_params,
+                "default_output": copy.deepcopy(overrides.get(
+                    "default_output",
+                    self.resolve_runtime_value(component.default_output, uid, name)
+                )),
+                "timeout": copy.deepcopy(overrides.get(
+                    "timeout",
+                    self.resolve_runtime_value(component.timeout, uid, name)
+                )),
+                "positive_filter": copy.deepcopy(overrides.get(
+                    "positive_filter",
+                    self.resolve_runtime_value(component.positive_filter, uid, name)
+                )),
+                "negative_filter": copy.deepcopy(overrides.get(
+                    "negative_filter",
+                    self.resolve_runtime_value(component.negative_filter, uid, name)
+                )),
+                "include_timestamp": copy.deepcopy(overrides.get(
+                    "include_timestamp",
+                    self.resolve_runtime_value(component.include_timestamp, uid, name)
+                )),
+            })
+        else:
+            for attr in ("default_output", "inputs", "outputs", "sequence", "description"):
+                if hasattr(component, attr):
+                    config[attr] = self.resolve_runtime_value(getattr(component, attr), uid, name)
+            for param_name, param_value in overrides.items():
+                config[param_name] = copy.deepcopy(param_value)
+
+        return config
+
+    def _push_runtime_component_config(self, component_name: str, config: Dict[str, Any]) -> None:
+        if not hasattr(self, "_tls"):
+            self._tls = threading.local()
+        stack = getattr(self._tls, "runtime_component_configs", None)
+        if stack is None:
+            stack = {}
+            self._tls.runtime_component_configs = stack
+        stack.setdefault(component_name, []).append(config)
+
+    def _pop_runtime_component_config(self, component_name: str) -> None:
+        stack = getattr(self._tls, "runtime_component_configs", None)
+        if not stack or component_name not in stack:
+            return
+        stack[component_name].pop()
+        if not stack[component_name]:
+            del stack[component_name]
+
+    def _get_runtime_component_config(self, component_name: str) -> Optional[Dict[str, Any]]:
+        stack = getattr(self._tls, "runtime_component_configs", None)
+        if not stack:
+            return None
+        component_stack = stack.get(component_name)
+        if not component_stack:
+            return None
+        return component_stack[-1]
 
     def _create_component_from_json(self, component: dict):
         component_type = component.get("type")
@@ -2670,7 +3043,11 @@ class AgentSystemManager:
         return re.sub(pattern, r'\\\1', text)
     
     def _is_block(self, obj):
-        return isinstance(obj, dict) and "type" in obj and "content" in obj
+        if not isinstance(obj, dict) or "type" not in obj:
+            return False
+        if obj.get("type") == "variable":
+            return "key" in obj and "value" in obj
+        return "content" in obj
     
     def _is_image_bytes(self, val):
         return isinstance(val, (bytes, bytearray)) and what(None, h=bytes(val)) in {
@@ -2741,8 +3118,8 @@ class AgentSystemManager:
             raise ValueError("source must be None, str or list/tuple of str.")
         if isinstance(source, (list, tuple)) and not all(isinstance(s, str) for s in source):
             raise ValueError("All elements of source must be str.")
-        if block_type not in (None, "text", "image", "audio", "video", "document", "sticker"):
-            raise ValueError("block_type must be None, 'text', 'image', 'audio', 'video', 'document' or 'sticker'.")
+        if block_type not in (None, "text", "image", "audio", "video", "document", "sticker", "variable"):
+            raise ValueError("block_type must be None, 'text', 'image', 'audio', 'video', 'document', 'sticker' or 'variable'.")
         if block_index is not None and not isinstance(block_index, int):
             raise ValueError("block_index must be None or int.")
         if messages is not None and not isinstance(messages, (dict, list)):
@@ -2824,6 +3201,11 @@ class AgentSystemManager:
         if block_index is not None and isinstance(block_index, int):
             target_block = blocks[0]
             block_content = target_block.get("content")
+            if target_block.get("type") == "variable":
+                block_content = {
+                    "key": target_block.get("key"),
+                    "value": target_block.get("value"),
+                }
             
             if target_block.get("type") == "text" and isinstance(block_content, str):
                 try:
@@ -2840,7 +3222,10 @@ class AgentSystemManager:
         user_id = user_id or self._uid()
 
         if isinstance(value, list) and value and all(self._is_block(b) for b in value):
-            return value
+            return [
+                self._normalize_variable_block(b, user_id) if b.get("type") == "variable" else b
+                for b in value
+            ]
         
         if isinstance(value, list):
             merged = []
@@ -2849,6 +3234,8 @@ class AgentSystemManager:
             return merged
 
         if self._is_block(value):
+            if value.get("type") == "variable":
+                return [self._normalize_variable_block(value, user_id)]
             return [value]
 
         if self._is_image_bytes(value):
