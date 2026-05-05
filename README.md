@@ -1663,123 +1663,243 @@ A dictionary containing a detailed breakdown of costs and token counts, structur
 
 ### Bot Integrations (Telegram & WhatsApp)
 
-The `mas` library abstracts the complexity of building messaging bots through a modular architecture. Instead of managing asynchronous logic and event loops yourself, you can instantiate and run a fully-featured bot with a single method call, connecting it directly to your agent system.
+MAS includes bot adapters for Telegram and WhatsApp Cloud API. Both adapters share the same processing pipeline:
 
-The framework is built upon an abstract `Bot` class that handles all common logic for message processing, commands, and callbacks. The `TelegramBot` and `WhatsappBot` classes inherit from this base class to manage platform-specific communication.
+1. A platform update arrives.
+2. MAS parses it into normalized message blocks.
+3. The blocks are saved as the current user's input message.
+4. `manager.run(...)` executes the configured component or automation.
+5. The last result, or your callback result, is converted back into platform messages.
 
-#### `manager.start_telegram_bot()`
+Install the optional dependencies for the channel you use:
 
-This method creates and launches a Telegram bot instance.
-
-```python
-manager.start_telegram_bot(
-  telegram_token: str = None,
-  component_name: str = None,
-  verbose: bool = False,
-  on_update: Callable = None,
-  on_complete: Callable = None,
-  speech_to_text: Callable = None,
-  whisper_provider: str = None,
-  whisper_model: str = None,
-  on_start_msg: str = "Hey! Talk to me or type '/clear' to erase your message history.",
-  on_clear_msg: str = "Message history deleted.",
-  on_help_msg: str = "Here are the available commands:",
-  unknown_command_msg: str = "I don't recognize that command. Type /help to see what I can do.",
-  custom_commands: List[Dict] = None,
-  return_token_count: bool = False,
-  ensure_delivery: bool = False, 
-  delivery_timeout: float = 5.0,
-  start_polling: bool = True
-)
+```bash
+pip install "mas[telegram]"
+pip install "mas[whatsapp]"
 ```
 
-**Key Parameters:**
-
-*   **`telegram_token`**: Your bot token from Telegram's BotFather. If `None`, it will be retrieved from the manager's API keys file.
-*   **`component_name`**: The component (typically an automation) to execute when a message is received. Defaults to the standard `manager.run()` logic.
-*   **`on_update` / `on_complete`**: Callbacks to handle responses. If `on_complete` is not defined, the bot will automatically send the content of the last generated message to the user.
-*   **`whisper_provider` / `whisper_model`**: Configures the speech-to-text (STT) provider. It automatically detects and uses `groq` or `openai` if their API keys are available.
-*   **`custom_commands`**: A list of dictionaries to define your own custom bot commands (see details below).
-*   **`start_polling`**: If `True` (default), the bot starts polling and blocks the main thread. If `False`, the method returns the `TelegramBot` object instance for advanced handling (e.g., integrating with a web server for webhooks).
-
-This integration allows you to launch a fully functional Telegram bot with a single line of code:
+#### Telegram Startup
 
 ```python
-# main.py
 from mas import AgentSystemManager
 
-# Load the configuration and start the bot
-AgentSystemManager(config="config.json").start_telegram_bot()
-```
-
-#### `manager.start_whatsapp_bot()`
-
-This method creates and launches a WhatsApp bot using the Meta Cloud API. It starts a Flask web server to handle incoming webhooks.
-
-```python
-manager.start_whatsapp_bot(
-  whatsapp_token: str = None,
-  phone_number_id: str = None,
-  webhook_verify_token: str = None,
-  # ... (all other parameters are the same as TelegramBot)
-  host: str = "0.0.0.0",
-  port: int = 5000,
-  base_path: str = "/webhook",
-  run_server: bool = True
+manager = AgentSystemManager(config="config.json")
+manager.start_telegram_bot(
+    telegram_token=None,
+    component_name=None,
+    verbose=False,
+    on_update=None,
+    on_complete=None,
+    speech_to_text=None,
+    whisper_provider=None,
+    whisper_model=None,
+    on_start_msg="Hey! Talk to me or type '/clear' to erase your message history.",
+    on_clear_msg="Message history deleted.",
+    on_help_msg="Here are the available commands:",
+    unknown_command_msg="I don't recognize that command. Type /help to see what I can do.",
+    custom_commands=None,
+    return_token_count=False,
+    ensure_delivery=False,
+    delivery_timeout=5.0,
+    max_allowed_message_delay=120.0,
+    start_polling=True,
 )
 ```
 
-**WhatsApp-Specific Parameters:**
+`telegram_token` can be passed directly or stored in the manager API keys as `telegram_token`. If `start_polling=True`, polling starts immediately and blocks the current thread. If `start_polling=False`, the method returns a `TelegramBot` object so you can call direct actions or wire your own webhook server.
 
-*   **`whatsapp_token`, `phone_number_id`, `webhook_verify_token`**: Your credentials from the WhatsApp Cloud API platform. These can be provided directly or loaded from the manager's API keys file.
-*   **`host`, `port`, `base_path`**: Configuration for the built-in Flask server that listens for webhook events.
-*   **`run_server`**: If `True` (default), the Flask server is started. If `False`, the method returns the `WhatsappBot` instance, allowing you to integrate it into your own web server (e.g., Gunicorn, uWSGI).
+```python
+manager = AgentSystemManager(config="config.json")
+bot = manager.start_telegram_bot(start_polling=False)
+bot.start_polling()
+```
 
-#### Common Bot Features
+For Telegram webhooks, keep the bot object and feed raw Telegram update dictionaries into `process_webhook_update`:
 
-Both `TelegramBot` and `WhatsappBot` come with a powerful set of features out-of-the-box:
+```python
+bot = manager.start_telegram_bot(start_polling=False)
+await bot.initialize()
+await bot.process_webhook_update(update_json)
+```
 
-*   **Multimodal Support**: Automatically process text messages, images with captions, voice/audio notes, videos, documents, stickers, and WhatsApp reaction messages. Media messages are saved as MAS file blocks so they can be persisted in history and inspected by your system.
-*   **Automatic Speech-to-Text (STT)**: Voice notes and audio files are automatically transcribed to text using the manager's `stt()` method, allowing your agents to understand voice messages without any extra configuration.
-*   **Built-in Commands**:
-    *   `/start`: Sends the welcome message (`on_start_msg`).
-    *   `/clear`: Clears the message history for the user running the command.
-    *   `/help`: Displays a list of all available commands and their descriptions.
-*   **Administrative Commands**: If you set an `admin_user_id` in the manager, that user gains access to privileged commands:
-    *   **/clear\_all\_users**: Clears the message history for **every** user of the bot.
-    *   **/reset\_system**: **WARNING:** This is a destructive command that permanently deletes all histories (`history/`), saved files (`files/`), and usage logs (`logs/`).
-    *   **/logs**: Sends the `usage.log` and `summary.log` files directly to the admin's chat for inspection.
-*   **Custom Commands**: You can define your own commands using the `custom_commands` parameter. Each command is a dictionary:
-    ```python
-    custom_commands = [
-        {
-            "command": "/status",
-            "description": "Checks the system's operational status.",
-            "function": "fn:check_system_status", # Can be a callable or a function string
-            "message": "System is operational.", # Fallback message if function returns None
-            "admin_only": True # Optional: restrict command to the admin user
-        }
-    ]
-    ```
+#### WhatsApp Startup
 
-#### Advanced Response Handling in Bots
+```python
+from mas import AgentSystemManager
 
-When using the bot integrations, the `on_complete` and `on_update` callbacks give you full control over how your system replies to users.
+manager = AgentSystemManager(config="config.json")
+manager.start_whatsapp_bot(
+    whatsapp_token=None,
+    phone_number_id=None,
+    webhook_verify_token=None,
+    component_name=None,
+    verbose=False,
+    on_update=None,
+    on_complete=None,
+    speech_to_text=None,
+    whisper_provider=None,
+    whisper_model=None,
+    custom_commands=None,
+    return_token_count=False,
+    ensure_delivery=False,
+    delivery_timeout=5.0,
+    max_allowed_message_delay=120.0,
+    host="0.0.0.0",
+    port=5000,
+    base_path="/webhook",
+    run_server=True,
+)
+```
 
-*   **Default Behavior**: If you do not provide an `on_complete` function, the system intelligently processes the last generated message to create a reply. It inspects the `text` blocks of that message and follows this logic:
-    1.  **It first looks for a `"response"` field.** The primary behavior is to find a `text` block whose content is a dictionary containing a key named `"response"`. If found, **only the value of that key** is sent to the user as a plain text message. This is the standard and recommended way to handle simple conversational replies.
-    2.  **If no `"response"` field is found**, the system falls back to sending the entire content of the first available `text` block. If that content is a dictionary or list, it will be sent as a formatted JSON string. This ensures that the user always receives a reply, even if the component's output is structured data not intended for direct conversation.
-*   **Custom Behavior**: Your callback function (which can work as on_update, on_complete or both), defined as `def my_callback(messages, manager, params):`, determines what is sent based on its return value:
-    *   **Return `None`**: Nothing is sent to the user.
-    *   **Return a `str`**: The string is sent as a plain text message.
-    *   **Return a `list` of blocks**: The system iterates through the list and sends each block as a separate message. A `text` block becomes a text message, an `image` block a photo, an `audio` block an audio/voice message, and `video`, `document`, or `sticker` blocks are sent through the matching platform media API.
-    *   **Return any other type**: The value is converted to a list of blocks using `manager._to_blocks()` and sent accordingly.
+WhatsApp credentials can be passed directly or stored in the manager API keys as `whatsapp_token`, `whatsapp_phone_number_id`, and either `webhook_verify_token` or `whatsapp_verify_token`.
 
-This allows for anything from simple text replies to complex, multi-part responses with images, audio, video, documents, and stickers.
+If `run_server=True`, MAS starts a Flask server. Meta webhook verification is handled on `GET base_path`, and message webhooks are handled on `POST base_path`.
+
+If `run_server=False`, the method returns a `WhatsappBot` object:
+
+```python
+bot = manager.start_whatsapp_bot(run_server=False)
+
+challenge, status = bot.handle_webhook_verification(request.args)
+await bot.process_webhook_update(request_json)
+```
+
+`process_webhook_update` expects the normal WhatsApp webhook body containing `entry -> changes -> value -> messages`.
+
+#### Shared Bot Parameters
+
+- `component_name`: component or automation to run for each incoming message. If omitted, MAS uses the default `manager.run()` component resolution.
+- `on_update`: optional callback called when the run emits an update.
+- `on_complete`: optional callback called when the run finishes. If omitted, MAS sends the last generated message to the user.
+- `speech_to_text`: optional callable used for audio transcription. If omitted, MAS calls `manager.stt(...)`.
+- `whisper_provider` and `whisper_model`: provider/model used by automatic STT. If no provider is set, `manager.stt()` chooses `groq` when available, otherwise `openai`.
+- `custom_commands`: a command definition or list of definitions.
+- `return_token_count`: passes `return_token_count=True` into the run.
+- `ensure_delivery`: when a callback returns a response, wait for the async send operation to finish before continuing.
+- `delivery_timeout`: max seconds to wait when `ensure_delivery=True`.
+- `max_allowed_message_delay`: incoming messages older than this many seconds are ignored. Set a larger value if your deployment queues webhooks.
+- `verbose`: enables bot logging.
+
+#### Incoming Message Conversion
+
+Text messages become one text block:
+
+```json
+[
+  {"type": "text", "content": {"response": "hello"}}
+]
+```
+
+Images, videos, documents, and stickers are downloaded and saved through `manager.save_file(...)`. Captions become a preceding text block.
+
+```json
+[
+  {"type": "text", "content": {"response": "caption text"}},
+  {
+    "type": "document",
+    "content": {
+      "kind": "file",
+      "path": "file:/path/to/saved/file.pdf",
+      "filename": "file.pdf",
+      "mime_type": "application/pdf",
+      "detail": "auto"
+    }
+  }
+]
+```
+
+Audio and voice messages are saved as `audio` blocks. MAS also tries to add a transcription text block first:
+
+```json
+[
+  {"type": "text", "content": {"response": "transcribed text"}},
+  {
+    "type": "audio",
+    "content": {
+      "kind": "file",
+      "path": "file:/path/to/saved/audio.ogg",
+      "detail": "auto",
+      "is_voice_note": true
+    }
+  }
+]
+```
+
+WhatsApp reaction messages are parsed as a text block with the reaction metadata:
+
+```json
+[
+  {
+    "type": "text",
+    "content": {
+      "response": "\uD83D\uDC4D",
+      "message_id": "wamid...",
+      "emoji": "\uD83D\uDC4D"
+    }
+  }
+]
+```
+
+Telegram reaction updates are not parsed as incoming user messages by the current Telegram adapter. Telegram reactions are supported as outgoing bot actions.
+
+#### User Message Metadata
+
+MAS attaches transport metadata to the first generated block for every incoming user message:
+
+```json
+{
+  "type": "text",
+  "content": {"response": "hello"},
+  "metadata": {
+    "user_message": {
+      "channel": "TelegramBot",
+      "user_id": "123456",
+      "message_type": "text",
+      "timestamp": "2026-05-05T12:00:00+00:00",
+      "is_voice_note": false,
+      "media_info": {},
+      "original_payload": {}
+    }
+  }
+}
+```
+
+This metadata is persisted in message history. Use it when later components need to inspect where the message came from. In callbacks, MAS also passes the raw platform payload separately in `params["original_payload"]`.
+
+#### Bot Callbacks
+
+Bot callbacks use the same callback mechanism as `manager.run`, with extra bot parameters:
+
+```python
+def on_complete(messages, manager, params):
+    user_id = params["user_id"]
+    original_payload = params["original_payload"]
+    event_loop = params["event_loop"]
+    return "Done"
+```
+
+`params` contains:
+
+- `user_id`: Telegram chat id or WhatsApp sender id as a string.
+- `original_payload`: raw Telegram `Update` object for Telegram, or the raw WhatsApp message dictionary for WhatsApp.
+- `event_loop`: the bot event loop. Use it to schedule async direct bot actions from a normal synchronous callback.
+
+Callback return values control what is sent:
+
+- `None`: send nothing.
+- `str`: send that text.
+- `list` of blocks: send each block as a platform message.
+- any other value: convert it with `manager._to_blocks(...)` and send it.
+
+If no `on_complete` callback is provided, MAS sends the latest generated message. It prefers a text block with a `"response"` field. If no `"response"` field exists, it sends the first text block converted to plain text or JSON.
+
+For Telegram, callback output is sent as a reply to the incoming message when using the built-in `_send_blocks` path. For WhatsApp, callback output is sent as a normal outbound message unless you use direct actions with `reply_to_message_id`.
+
+For callback-returned media blocks, `video`, `document`, and `sticker` blocks may use `path`, `url`, `link`, `media_id`, `id`, or `file_id`. Telegram `image` and `audio` blocks are sent from saved `file:`/local paths in the built-in block sender; use direct `send_image(...)` or `send_audio(...)` if you need to send a URL or platform id for those media types.
 
 #### Direct Bot Actions
 
-When you keep the returned bot instance (`start_polling=False` for Telegram or `run_server=False` for WhatsApp), both bot classes expose the same async action interface:
+If you keep the returned bot instance, both bot classes expose the same async direct action interface:
 
 ```python
 await bot.send_text(user_id, "hello")
@@ -1792,7 +1912,161 @@ await bot.react_to_message(user_id, message_id, "\U0001F44D")
 await bot.remove_reaction(user_id, message_id)
 ```
 
-For media arguments, MAS accepts a local path, a `file:` path saved by the manager, a public URL, or a platform media/file id where the platform supports reusing one.
+All direct send methods accept `reply_to_message_id=None` and arbitrary `**kwargs`. For Telegram, extra kwargs are forwarded to the underlying Telegram bot method. For WhatsApp, extra kwargs are merged into the Cloud API JSON payload.
+
+Media arguments can be:
+
+- a local filesystem path such as `"/tmp/photo.jpg"`;
+- a MAS file reference such as `"file:/tmp/photo.jpg"`;
+- a public `http://` or `https://` URL;
+- a platform media/file id;
+- a dictionary containing one of `path`, `url`, `link`, `media_id`, `id`, or `file_id`.
+
+Local WhatsApp media is uploaded first, then sent by uploaded media id. WhatsApp URLs are sent as `link`. Any other non-path value is treated as a WhatsApp media `id`.
+
+#### Sending Stickers
+
+Direct sticker send:
+
+```python
+await bot.send_sticker(user_id, "file:/path/to/sticker.webp")
+await bot.send_sticker(user_id, "https://example.com/sticker.webp")
+await bot.send_sticker(user_id, "platform-media-or-file-id")
+```
+
+Sticker block response:
+
+```python
+def on_complete(messages, manager, params):
+    return [
+        {
+            "type": "sticker",
+            "content": {
+                "kind": "file",
+                "path": "file:/path/to/sticker.webp"
+            }
+        }
+    ]
+```
+
+You can also use `url`, `link`, `id`, `media_id`, or `file_id` in `content`. Stickers do not use captions. MAS forwards the media to the platform, but the platform still decides whether the sticker format is valid.
+
+#### Reacting To Messages
+
+Telegram outgoing reaction:
+
+```python
+import asyncio
+
+bot_holder = {}
+
+def on_complete(messages, manager, params):
+    bot = bot_holder["bot"]
+    update = params["original_payload"]
+    chat_id = params["user_id"]
+    message_id = update.message.message_id
+    loop = params["event_loop"]
+
+    asyncio.run_coroutine_threadsafe(
+        bot.react_to_message(chat_id, message_id, "\U0001F44D"),
+        loop,
+    )
+    return "Reacted"
+
+manager = AgentSystemManager(config="config.json")
+bot = manager.start_telegram_bot(start_polling=False, on_complete=on_complete)
+bot_holder["bot"] = bot
+bot.start_polling()
+```
+
+WhatsApp outgoing reaction:
+
+```python
+import asyncio
+
+bot_holder = {}
+
+def on_complete(messages, manager, params):
+    bot = bot_holder["bot"]
+    inbound = params["original_payload"]
+    user_id = params["user_id"]
+    message_id = inbound["id"]
+    loop = params["event_loop"]
+
+    asyncio.run_coroutine_threadsafe(
+        bot.react_to_message(user_id, message_id, "\U0001F44D"),
+        loop,
+    )
+    return None
+
+manager = AgentSystemManager(config="config.json")
+bot = manager.start_whatsapp_bot(run_server=False, on_complete=on_complete)
+bot_holder["bot"] = bot
+bot.run_server()
+```
+
+Remove a reaction by sending an empty reaction:
+
+```python
+await bot.remove_reaction(user_id, message_id)
+```
+
+For WhatsApp incoming reaction messages, the message being reacted to is available in the user's message content as `message_id`, and the emoji is available as `emoji`.
+
+#### Replying To A Specific Message
+
+Direct actions support replies:
+
+```python
+await bot.send_text(user_id, "reply text", reply_to_message_id=message_id)
+await bot.send_document(user_id, "file:/tmp/report.pdf", reply_to_message_id=message_id)
+await bot.send_sticker(user_id, "file:/tmp/sticker.webp", reply_to_message_id=message_id)
+```
+
+For Telegram, this sends `reply_to_message_id` to the Telegram API. For WhatsApp, this adds a Cloud API `context` object with that `message_id`.
+
+#### Commands
+
+Built-in commands:
+
+- `/start`: sends `on_start_msg`.
+- `/clear`: clears the current user's message history.
+- `/help`: lists commands.
+
+Admin-only commands are registered when `manager.admin_user_id` is set:
+
+- `/clear_all_users`: clears every user's history.
+- `/reset_system`: deletes histories, saved files, and logs.
+- `/logs`: sends `usage.log` and `summary.log` when usage logging is enabled.
+
+Custom commands:
+
+```python
+def check_status(user_id, original_message, manager=None):
+    return "System is operational."
+
+custom_commands = [
+    {
+        "command": "/status",
+        "description": "Checks the system status.",
+        "function": check_status,
+        "message": "System is operational.",
+        "admin_only": False,
+    }
+]
+
+manager.start_telegram_bot(custom_commands=custom_commands)
+```
+
+`function` can be a callable or a function reference string such as `"fn:check_status"`. Command functions are called with `user_id` and `original_message`; if the function signature includes `manager`, MAS also passes the manager. If the function returns a string, MAS sends it. If it returns `None`, MAS sends the command's `"message"` fallback if one is defined.
+
+#### Operational Behavior
+
+MAS processes one message per user at a time. If another message from the same user arrives while a run is still active, the new message is ignored. This avoids overlapping writes and mixed histories.
+
+Messages older than `max_allowed_message_delay` seconds are ignored. This protects polling and webhook deployments from replaying old updates.
+
+The bot classes are async internally. Direct actions such as `send_sticker` and `react_to_message` must be awaited from async code, or scheduled with `asyncio.run_coroutine_threadsafe(..., params["event_loop"])` inside synchronous callbacks.
 
 
 ## Multimodal Message Support

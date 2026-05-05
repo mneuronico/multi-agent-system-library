@@ -48,7 +48,7 @@ class Bot(abc.ABC):
         self.logger = logging.getLogger(__name__)
 
         self._processing_users = set()
-        self._user_lock = asyncio.Lock()
+        self._user_lock = threading.Lock()
 
 
     @abc.abstractmethod
@@ -348,7 +348,7 @@ class Bot(abc.ABC):
 
         user_id = parsed_message['user_id']
 
-        async with self._user_lock:
+        with self._user_lock:
             if user_id in self._processing_users:
                 self.logger.debug(f"[Bot] User {user_id} is already being processed. Ignoring new message.")
                 return
@@ -425,7 +425,7 @@ class Bot(abc.ABC):
                 return_token_count=self.return_token_count
             )
         finally:
-            async with self._user_lock:
+            with self._user_lock:
                 if user_id in self._processing_users:
                     self._processing_users.remove(user_id)
 

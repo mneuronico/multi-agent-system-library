@@ -38,6 +38,17 @@ class _Bot(Bot):
         return 0
 
 
+def test_bot_constructor_does_not_require_an_asyncio_event_loop(monkeypatch, workspace_tmp_path):
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
+
+    def fail_lock_creation(*args, **kwargs):
+        raise AssertionError("Bot construction should not create an asyncio.Lock")
+
+    monkeypatch.setattr(asyncio, "Lock", fail_lock_creation)
+
+    _Bot(manager=manager)
+
+
 def test_bot_user_message_metadata_is_attached_and_persisted(workspace_tmp_path):
     manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
     bot = _Bot(manager=manager)
