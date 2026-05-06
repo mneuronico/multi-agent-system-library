@@ -268,6 +268,15 @@ def main(argv=None):
     run_parser.add_argument("--component", "-c", help="Name of the specific component to execute.")
     run_parser.add_argument("--verbose", "-v", action="store_true", help="Enable detailed logging.")
 
+    # --- 'dashboard' command ---
+    dashboard_parser = subparsers.add_parser("dashboard", help="Open a visual dashboard for a MAS project.")
+    dashboard_parser.add_argument("--directory", "-d", default=".", help="MAS project directory (default: current).")
+    dashboard_parser.add_argument("--host", default="127.0.0.1", help="Host for the local dashboard server.")
+    dashboard_parser.add_argument("--port", type=int, default=8765, help="Port for the local dashboard server.")
+    dashboard_parser.add_argument("--auto-port", action="store_true", help="Use the requested port if free, otherwise choose a free port.")
+    dashboard_parser.add_argument("--no-browser", action="store_true", help="Start the server without opening a browser.")
+    dashboard_parser.add_argument("--history-limit", type=int, default=200, help="Maximum messages to load per user history.")
+
     args = parser.parse_args(argv)
 
     if args.command == "start":
@@ -279,6 +288,9 @@ def main(argv=None):
             component_name=args.component,
             verbose=args.verbose
         )
+    elif args.command == "dashboard":
+        from mas.dashboard import dashboard_main
+        return dashboard_main(args)
 
     return 1
 

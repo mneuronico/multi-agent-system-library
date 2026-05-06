@@ -78,6 +78,230 @@ Let’s create a minimal configuration to get started with a single agent.
 }
 ```
 
+### Reference `config.json` Pattern
+
+For most production-shaped MAS projects, a good starting structure is:
+
+1. Put the full system capability map in `general_system_description`, so every agent knows what the system can do.
+2. Define narrow components: processes for deterministic preprocessing, agents for judgment or language/vision tasks, tools for validated function calls, and one automation that orchestrates the flow.
+3. Preprocess the latest user message first, route into a list of action strings, run one action path at a time with a `for` + `switch`, and finish with one responder that sees what happened.
+4. Use MAS input syntax to keep every component's context explicit.
+
+The following example is intentionally complete enough to copy as a reference. It uses one process to add today's weather context, one agent to turn possible images into text, a router agent that emits a list of actions, a `for` loop over those actions, a `switch` for the action-specific paths, and a final responder.
+
+```json
+{
+  "general_parameters": {
+    "api_keys_path": ".env",
+    "functions": "fns.py",
+    "history_folder": "history",
+    "general_system_description": "This MAS can answer normal user questions, inspect user-provided images, fetch deterministic weather context through local functions, save notes through local functions, and combine all intermediate results into one final user-facing response. Components should rely on previous component outputs instead of redoing work.",
+    "default_models": [
+      {
+        "provider": "google",
+        "model": "gemini-2.5-flash"
+      }
+    ],
+    "variables": [
+      {
+        "key": "tone",
+        "type": ["concise", "friendly", "technical"],
+        "default": "friendly"
+      },
+      {
+        "key": "final_responder:temperature",
+        "type": "number",
+        "default": 0.4
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "process",
+      "name": "weather_context",
+      "description": "Adds deterministic weather context for the latest user request.",
+      "function": "fn:get_today_weather_context"
+    },
+    {
+      "type": "agent",
+      "name": "image_describer",
+      "description": "Describes any image in the latest user message.",
+      "system": "If the latest user message contains images, describe them with useful visual details. If there is no image, return image_description as an empty string.",
+      "required_outputs": {
+        "image_description": "Detailed image description, or an empty string when no image is present."
+      },
+      "default_output": {
+        "image_description": ""
+      }
+    },
+    {
+      "type": "agent",
+      "name": "router",
+      "description": "Chooses one or more action paths.",
+      "system": "Read the latest user request and preprocessing outputs. Return every useful action as a list of strings. Allowed actions: answer_weather, describe_image, save_note, small_talk. Use small_talk when no specialized action is needed.",
+      "required_outputs": {
+        "actions": "List of strings. Each item must be one of: answer_weather, describe_image, save_note, small_talk."
+      },
+      "default_output": {
+        "actions": ["small_talk"]
+      }
+    },
+    {
+      "type": "tool",
+      "name": "weather_answer",
+      "description": "Turns weather context into a user-facing weather result.",
+      "function": "fn:format_weather_answer",
+      "inputs": {
+        "weather_summary": "Weather summary produced by weather_context.",
+        "response": "Latest user text."
+      },
+      "outputs": {
+        "weather_answer": "Prepared weather answer."
+      },
+      "default_output": {
+        "weather_answer": ""
+      }
+    },
+    {
+      "type": "agent",
+      "name": "visual_answer",
+      "description": "Uses the image description to answer visual questions.",
+      "system": "Use the image_description and the user request to produce a useful visual answer.",
+      "required_outputs": {
+        "visual_answer": "Answer based on image_description."
+      },
+      "default_output": {
+        "visual_answer": ""
+      }
+    },
+    {
+      "type": "process",
+      "name": "note_saver",
+      "description": "Saves note-like user requests.",
+      "function": "fn:save_note"
+    },
+    {
+      "type": "agent",
+      "name": "small_talk_answer",
+      "description": "Handles general conversation and unknown actions.",
+      "system": "Answer conversationally using the available context. Do not claim that tools were used if no tool output exists.",
+      "required_outputs": {
+        "small_talk_answer": "General conversational answer."
+      },
+      "default_output": {
+        "small_talk_answer": ""
+      }
+    },
+    {
+      "type": "agent",
+      "name": "final_responder",
+      "description": "Combines all action results into one final reply.",
+      "system": "Write one coherent final response in a $tone$ tone. Use outputs from the router and action components. Avoid exposing implementation details unless the user asks.",
+      "required_outputs": {
+        "response": "Final response to send to the user."
+      },
+      "model_params": {
+        "temperature": "$final_responder:temperature$"
+      },
+      "default_output": {
+        "response": "I could not prepare a reliable response."
+      }
+    },
+    {
+      "type": "automation",
+      "name": "main_flow",
+      "description": "Preprocesses the user message, routes actions, runs action paths, and responds.",
+      "sequence": [
+        "weather_context:user?-1",
+        "image_describer:user?-1",
+        "router:*?-8~",
+        {
+          "control_flow_type": "for",
+          "items": ":router?-1[actions]",
+          "body": [
+            {
+              "control_flow_type": "switch",
+              "value": ":iterator?-1[item]",
+              "cases": [
+                {
+                  "case": "answer_weather",
+                  "body": [
+                    "weather_answer:(weather_context?-1[weather_summary], user?-1[response])"
+                  ]
+                },
+                {
+                  "case": "describe_image",
+                  "body": [
+                    "visual_answer:(image_describer?-1[image_description], user?-1[response])"
+                  ]
+                },
+                {
+                  "case": "save_note",
+                  "body": [
+                    "note_saver:(user?-1[response], image_describer?-1[image_description])"
+                  ]
+                },
+                {
+                  "case": "default",
+                  "body": [
+                    "small_talk_answer:*?router?-1~"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "final_responder:*?router?-1~"
+      ]
+    }
+  ]
+}
+```
+
+The companion `fns.py` might look like this:
+
+```python
+def _latest_user_text(messages):
+    for message in reversed(messages or []):
+        if message.get("source") == "user":
+            for block in message.get("message", []):
+                content = block.get("content") if isinstance(block, dict) else block
+                if isinstance(content, dict) and "response" in content:
+                    return content["response"]
+                if isinstance(content, str):
+                    return content
+    return ""
+
+
+def get_today_weather_context(messages=None, manager=None):
+    text = _latest_user_text(messages)
+    return {
+        "weather_summary": "Today is mild and partly cloudy. Replace this with a real weather API call.",
+        "weather_query": text
+    }
+
+
+def format_weather_answer(manager, weather_summary, response=None):
+    target = response or "your request"
+    return {"weather_answer": f"For {target}: {weather_summary}"}
+
+
+def save_note(messages=None, manager=None):
+    note_text = _latest_user_text(messages)
+    return {
+        "note_saved": bool(note_text),
+        "note_text": note_text
+    }
+```
+
+The automation uses several input syntax patterns:
+
+- `weather_context:user?-1` gives the process only the latest user message.
+- `router:*?-8~` gives the router the last eight global messages, regardless of source.
+- `weather_answer:(weather_context?-1[weather_summary], user?-1[response])` gives the tool only the latest weather summary and latest user text.
+- `small_talk_answer:*?router?-1~` gives the agent all messages from the latest router output onward.
+- `final_responder:*?router?-1~` gives the final responder the router decision plus everything produced inside the action loop.
+
 ### Preparing API Keys
 
 The `mas` library supports a flexible, three-tiered approach to managing API keys, allowing you to use the best method for your environment (e.g., local development vs. production). When you request a key, the manager searches for it in the following order:
@@ -155,6 +379,44 @@ You can check the interaction history for the current user:
 ```python
 manager.show_history()
 ```
+---
+
+## Step 4: Open the Visual Dashboard
+
+From any MAS project directory, you can open a local dashboard:
+
+```bash
+mas dashboard
+```
+
+You can also point it at a project explicitly:
+
+```bash
+mas dashboard --directory ./my_mas_project
+mas dashboard -d ./my_mas_project --port 8777 --auto-port
+mas dashboard -d ./my_mas_project --no-browser
+```
+
+The dashboard looks for `config.json` in the selected directory. If it finds a MAS project, it loads the configuration through `AgentSystemManager`, reads the configured history folder, and serves a local browser UI. It does not call any model provider or run your automation.
+
+Available options:
+
+- `--directory`, `-d`: Project directory. Defaults to the current directory.
+- `--host`: Local server host. Defaults to `127.0.0.1`.
+- `--port`: Local server port. Defaults to `8765`.
+- `--auto-port`: Use the requested port if it is free, otherwise choose a free port.
+- `--no-browser`: Start the server without opening a browser automatically.
+- `--history-limit`: Maximum number of messages to load per user history. Defaults to `200`.
+
+The dashboard has four views:
+
+- **Config**: Shows global parameters and each component as an interpreted component card, including component type, description, models, inputs, outputs, and automation step counts.
+- **Automation**: Shows each automation as a visual flow. Component calls, `for` loops, `switch` blocks, `while` loops, and branches are represented as separate flow nodes. MAS input syntax is parsed into readable chips so selectors such as `*?-5~`, `*!(debug)`, and `(research?-1[answer], critic?-1[verdict])?planner?-2~` can be inspected without reading raw JSON.
+- **History**: Shows one user history at a time. Messages are grouped by user id, then rendered as message cards with role, type, timestamp, model metadata when present, block types, block content, variable blocks, and block metadata.
+- **Raw**: Provides the full dashboard state for debugging. This is a fallback view; the main views are intended to be read as MAS objects rather than JSON.
+
+If no `config.json` is found, the dashboard still opens and reports that the selected directory is not a MAS project. This makes it safe to run `mas dashboard` while moving around directories.
+
 ---
 
 ## Fast Track: Build a System from Plain Text
