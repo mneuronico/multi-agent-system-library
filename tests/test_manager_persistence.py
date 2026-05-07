@@ -75,6 +75,127 @@ def test_existing_history_database_is_migrated(workspace_tmp_path):
     assert rows == [(1, None), (2, None)]
 
 
+def test_default_history_mode_keeps_one_database_per_user(workspace_tmp_path):
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
+
+    manager.add_blocks({"response": "hello alice"}, user_id="alice")
+    manager.add_blocks({"response": "hello bob"}, user_id="bob")
+
+    assert manager.history_mode == "per_user"
+    assert sorted(path.name for path in Path(manager.history_folder).glob("*.sqlite")) == [
+        "alice.sqlite",
+        "bob.sqlite",
+    ]
+
+
+def test_shared_history_stores_user_id_and_rotates_by_message_count(workspace_tmp_path):
+    manager = AgentSystemManager(
+        base_directory=str(workspace_tmp_path),
+        history_mode="shared",
+        history_max_messages=3,
+    )
+
+    manager.add_blocks({"response": "a1"}, user_id="alice")
+    manager.add_blocks({"response": "b1"}, user_id="bob")
+    manager.add_blocks({"response": "a2"}, user_id="alice")
+    manager.add_blocks({"response": "b2"}, user_id="bob")
+
+    paths = sorted(Path(manager.history_folder).glob("*.sqlite"))
+    assert [path.name for path in paths] == [
+        "shared_history_000001.sqlite",
+        "shared_history_000002.sqlite",
+    ]
+
+    conn = sqlite3.connect(paths[0])
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(message_history)")}
+    rows = conn.execute(
+        "SELECT user_id, msg_number, role, type FROM message_history ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    assert "user_id" in columns
+    assert rows == [
+        ("alice", 1, "user", "user"),
+        ("bob", 1, "user", "user"),
+        ("alice", 2, "user", "user"),
+    ]
+
+    alice = manager.get_messages("alice")
+    bob = manager.get_messages("bob")
+    assert [msg["message"][0]["content"]["response"] for msg in alice] == ["a1", "a2"]
+    assert [msg["msg_number"] for msg in alice] == [1, 2]
+    assert [msg["user_id"] for msg in alice] == ["alice", "alice"]
+    assert [msg["message"][0]["content"]["response"] for msg in bob] == ["b1", "b2"]
+    assert [msg["msg_number"] for msg in bob] == [1, 2]
+
+
+def test_shared_history_can_rotate_by_time_period(workspace_tmp_path):
+    manager = AgentSystemManager(
+        base_directory=str(workspace_tmp_path),
+        history_mode="shared",
+        history_rotation="time_period",
+        history_period="1 day",
+    )
+
+    manager.add_blocks({"response": "first"}, user_id="alice")
+    first_path = Path(manager.history_folder) / "shared_history_000001.sqlite"
+    conn = sqlite3.connect(first_path)
+    conn.execute(
+        """
+        INSERT INTO history_metadata (key, value)
+        VALUES ('created_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        ("2000-01-01T00:00:00+00:00",),
+    )
+    conn.commit()
+    conn.close()
+
+    manager.add_blocks({"response": "second"}, user_id="alice")
+
+    assert [path.name for path in sorted(Path(manager.history_folder).glob("*.sqlite"))] == [
+        "shared_history_000001.sqlite",
+        "shared_history_000002.sqlite",
+    ]
+    assert [msg["message"][0]["content"]["response"] for msg in manager.get_messages("alice")] == [
+        "first",
+        "second",
+    ]
+
+
+def test_shared_history_clear_is_isolated_by_user(workspace_tmp_path):
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path), history_mode="shared")
+    manager.define_variable("mood", type="string", default="neutral")
+
+    manager.set_variable("mood", "happy", user_id="alice")
+    manager.set_variable("mood", "focused", user_id="bob")
+    manager.clear_message_history("alice")
+
+    assert manager.get_variable("mood", user_id="alice") == "neutral"
+    assert manager.get_variable("mood", user_id="bob") == "focused"
+
+
+def test_shared_history_export_import_round_trip_filters_to_user(workspace_tmp_path):
+    first = AgentSystemManager(
+        base_directory=str(workspace_tmp_path / "first"),
+        history_mode="shared",
+    )
+    first.add_blocks({"response": "alice-only"}, user_id="alice")
+    first.add_blocks({"response": "bob-only"}, user_id="bob")
+
+    exported = first.export_history("alice")
+    second = AgentSystemManager(
+        base_directory=str(workspace_tmp_path / "second"),
+        history_mode="shared",
+    )
+    second.import_history("alice", exported)
+
+    assert [msg["message"][0]["content"]["response"] for msg in second.get_messages("alice")] == [
+        "alice-only"
+    ]
+    assert second.get_messages("bob") == []
+
+
 def test_config_file_errors_fail_fast(workspace_tmp_path):
     missing = workspace_tmp_path / "missing.json"
     with pytest.raises(FileNotFoundError):

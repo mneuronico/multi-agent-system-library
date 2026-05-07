@@ -30,13 +30,18 @@ class AgentSystemManager:
         admin_user_id: Optional[str] = None,
         usage_logging: bool = False,
         timeout: Optional[int] = None,
-        model_failure_policy: Optional[Union[bool, Dict[str, Any]]] = None
+        model_failure_policy: Optional[Union[bool, Dict[str, Any]]] = None,
+        history_mode: str = "per_user",
+        history_rotation: str = "message_count",
+        history_max_messages: int = 1000,
+        history_period: Union[str, int, float, timedelta] = "1w"
     ):
 
         self._tls = threading.local()
         self._db_pool = {}
         self._db_locks = {}
         self._db_write_lock = threading.RLock()
+        self._shared_history_lock = threading.RLock()
         self._variable_lock = threading.RLock()
         self._model_health_lock = threading.RLock()
         self._model_health: Dict[str, Dict[str, Any]] = {}
@@ -44,6 +49,13 @@ class AgentSystemManager:
         self._model_failure_policy = self._default_model_failure_policy()
         self._configure_model_failure_policy(model_failure_policy)
         self.base_directory = os.path.abspath(base_directory)
+        self._shared_history_prefix = "shared_history"
+        self._configure_history_storage(
+            mode=history_mode,
+            rotation=history_rotation,
+            max_messages=history_max_messages,
+            period=history_period,
+        )
         self._usage_logging_enabled = bool(usage_logging)
         self.general_system_description = general_system_description
         self.on_update = self._resolve_callable(on_update)
@@ -1274,6 +1286,348 @@ class AgentSystemManager:
             return result
         return span_data
 
+    def _normalize_history_mode(self, mode: Optional[str]) -> str:
+        raw = "per_user" if mode is None else str(mode).strip().lower().replace("-", "_")
+        aliases = {
+            "per_user": "per_user",
+            "peruser": "per_user",
+            "user": "per_user",
+            "user_id": "per_user",
+            "by_user": "per_user",
+            "shared": "shared",
+            "global": "shared",
+            "all_users": "shared",
+            "allusers": "shared",
+            "aggregate": "shared",
+            "aggregated": "shared",
+        }
+        if raw not in aliases:
+            raise ValueError(
+                "history_mode must be 'per_user' or 'shared' "
+                "(aliases: global, all_users)."
+            )
+        return aliases[raw]
+
+    def _normalize_history_rotation(self, rotation: Optional[str]) -> str:
+        raw = "message_count" if rotation is None else str(rotation).strip().lower().replace("-", "_")
+        aliases = {
+            "message_count": "message_count",
+            "messages": "message_count",
+            "count": "message_count",
+            "max_messages": "message_count",
+            "time_period": "time_period",
+            "period": "time_period",
+            "time": "time_period",
+            "age": "time_period",
+            "both": "both",
+            "either": "both",
+        }
+        if raw not in aliases:
+            raise ValueError(
+                "history_rotation must be 'message_count', 'time_period', or 'both'."
+            )
+        return aliases[raw]
+
+    def _parse_history_period_seconds(
+        self,
+        period: Optional[Union[str, int, float, timedelta]]
+    ) -> float:
+        if period is None:
+            return 7 * 24 * 60 * 60
+        if isinstance(period, timedelta):
+            seconds = period.total_seconds()
+        elif isinstance(period, (int, float)):
+            seconds = float(period)
+        elif isinstance(period, str):
+            text = period.strip().lower()
+            unit_aliases = {
+                "s": 1,
+                "sec": 1,
+                "secs": 1,
+                "second": 1,
+                "seconds": 1,
+                "m": 60,
+                "min": 60,
+                "mins": 60,
+                "minute": 60,
+                "minutes": 60,
+                "h": 60 * 60,
+                "hr": 60 * 60,
+                "hrs": 60 * 60,
+                "hour": 60 * 60,
+                "hours": 60 * 60,
+                "d": 24 * 60 * 60,
+                "day": 24 * 60 * 60,
+                "days": 24 * 60 * 60,
+                "w": 7 * 24 * 60 * 60,
+                "week": 7 * 24 * 60 * 60,
+                "weeks": 7 * 24 * 60 * 60,
+            }
+            if text in unit_aliases:
+                seconds = unit_aliases[text]
+            else:
+                match = re.fullmatch(
+                    r"([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)",
+                    text,
+                )
+                if not match or match.group(2) not in unit_aliases:
+                    raise ValueError(
+                        "history_period must be seconds or a value like '1w', "
+                        "'7 days', or '12 hours'."
+                    )
+                seconds = float(match.group(1)) * unit_aliases[match.group(2)]
+        else:
+            raise ValueError("history_period must be a string, number, or timedelta.")
+
+        if seconds <= 0:
+            raise ValueError("history_period must be greater than zero.")
+        return float(seconds)
+
+    def _configure_history_storage(
+        self,
+        *,
+        mode: Optional[str] = None,
+        rotation: Optional[str] = None,
+        max_messages: Optional[int] = None,
+        period: Optional[Union[str, int, float, timedelta]] = None
+    ) -> None:
+        self.history_mode = self._normalize_history_mode(mode)
+        self.history_rotation = self._normalize_history_rotation(rotation)
+
+        try:
+            parsed_max = int(max_messages if max_messages is not None else 1000)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("history_max_messages must be an integer.") from exc
+        if parsed_max <= 0:
+            raise ValueError("history_max_messages must be greater than zero.")
+        self.history_max_messages = parsed_max
+
+        self.history_period_seconds = self._parse_history_period_seconds(
+            period if period is not None else "1w"
+        )
+        self.history_period = period if period is not None else "1w"
+
+    def _history_mode_is_shared(self) -> bool:
+        return getattr(self, "history_mode", "per_user") == "shared"
+
+    def _history_now_iso(self) -> str:
+        tz = getattr(self, "timezone", timezone.utc)
+        if isinstance(tz, str):
+            try:
+                tz = ZoneInfo(tz)
+            except Exception:
+                tz = timezone.utc
+        return datetime.now(tz).isoformat()
+
+    def _parse_history_datetime(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            tz = getattr(self, "timezone", timezone.utc)
+            if isinstance(tz, str):
+                try:
+                    tz = ZoneInfo(tz)
+                except Exception:
+                    tz = timezone.utc
+            parsed = parsed.replace(tzinfo=tz)
+        return parsed
+
+    def _shared_history_db_name(self, sequence: int) -> str:
+        return f"{self._shared_history_prefix}_{sequence:06d}.sqlite"
+
+    def _shared_history_db_path(self, sequence: int) -> str:
+        return os.path.join(self.history_folder, self._shared_history_db_name(sequence))
+
+    def _shared_history_db_key(self, db_path: str) -> str:
+        return f"shared:{os.path.abspath(db_path)}"
+
+    def _shared_history_sequence(self, db_path: str) -> Optional[int]:
+        match = re.fullmatch(
+            rf"{re.escape(self._shared_history_prefix)}_(\d+)\.sqlite",
+            os.path.basename(db_path),
+        )
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _list_shared_history_db_paths(self) -> List[str]:
+        if not os.path.isdir(self.history_folder):
+            return []
+        paths = []
+        for fname in os.listdir(self.history_folder):
+            db_path = os.path.join(self.history_folder, fname)
+            sequence = self._shared_history_sequence(db_path)
+            if sequence is not None:
+                paths.append((sequence, db_path))
+        return [db_path for _, db_path in sorted(paths)]
+
+    def _connect_history_db(self, db_path: str, pool_key: str) -> sqlite3.Connection:
+        if not hasattr(self, "_db_pool"):
+            self._db_pool = {}
+        if not hasattr(self, "_db_locks"):
+            self._db_locks = {}
+        if pool_key in self._db_pool:
+            return self._db_pool[pool_key]
+
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._migrate_history_schema(conn)
+
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
+        self._db_pool[pool_key] = conn
+        self._db_locks.setdefault(pool_key, threading.RLock())
+        return conn
+
+    def _get_latest_shared_history_db_path(self) -> str:
+        paths = self._list_shared_history_db_paths()
+        if paths:
+            return paths[-1]
+        return self._shared_history_db_path(1)
+
+    def _history_metadata_value(self, conn: sqlite3.Connection, key: str) -> Optional[str]:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM history_metadata WHERE key = ?", (key,))
+            row = cur.fetchone()
+            return row[0] if row else None
+        except sqlite3.OperationalError:
+            return None
+
+    def _set_history_metadata(self, conn: sqlite3.Connection, key: str, value: str) -> None:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO history_metadata (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+    def _open_history_db_for_read(self, db_path: str):
+        if self._history_mode_is_shared():
+            key = self._shared_history_db_key(db_path)
+        else:
+            key = os.path.splitext(os.path.basename(db_path))[0]
+
+        conn = self._db_pool.get(key) if hasattr(self, "_db_pool") else None
+        if conn is not None:
+            return conn, False
+
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._migrate_history_schema(conn)
+        return conn, True
+
+    def _shared_history_db_should_rotate(self, db_path: str, timestamp: str) -> bool:
+        if not os.path.exists(db_path):
+            return False
+
+        conn, should_close = self._open_history_db_for_read(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM message_history")
+            count = int(cur.fetchone()[0] or 0)
+            if count <= 0:
+                return False
+
+            if self._history_metadata_value(conn, "closed_at"):
+                return True
+
+            if self.history_rotation in {"message_count", "both"}:
+                if count >= self.history_max_messages:
+                    return True
+
+            if self.history_rotation in {"time_period", "both"}:
+                created_at = self._history_metadata_value(conn, "created_at")
+                created_dt = self._parse_history_datetime(created_at)
+                current_dt = self._parse_history_datetime(timestamp)
+                if created_dt is not None and current_dt is not None:
+                    elapsed = (current_dt - created_dt).total_seconds()
+                    if elapsed >= self.history_period_seconds:
+                        return True
+            return False
+        finally:
+            if should_close:
+                conn.close()
+
+    def _mark_shared_history_db_closed(self, db_path: str, timestamp: str) -> None:
+        if not os.path.exists(db_path):
+            return
+        conn, should_close = self._open_history_db_for_read(db_path)
+        try:
+            self._set_history_metadata(conn, "closed_at", timestamp)
+        finally:
+            if should_close:
+                conn.close()
+
+    def _get_shared_history_db_path_for_write(self, timestamp: str) -> str:
+        latest_path = self._get_latest_shared_history_db_path()
+        if self._shared_history_db_should_rotate(latest_path, timestamp):
+            self._mark_shared_history_db_closed(latest_path, timestamp)
+            latest_sequence = self._shared_history_sequence(latest_path) or 0
+            return self._shared_history_db_path(latest_sequence + 1)
+        return latest_path
+
+    def _ensure_shared_history_db(
+        self,
+        *,
+        for_write: bool = False,
+        timestamp: Optional[str] = None
+    ) -> sqlite3.Connection:
+        if for_write:
+            db_path = self._get_shared_history_db_path_for_write(
+                timestamp or self._history_now_iso()
+            )
+        else:
+            db_path = self._get_latest_shared_history_db_path()
+        return self._connect_history_db(db_path, self._shared_history_db_key(db_path))
+
+    def _max_msg_number_for_user(
+        self,
+        user_id: str,
+        *,
+        current_path: Optional[str] = None,
+        current_conn: Optional[sqlite3.Connection] = None
+    ) -> int:
+        if not self._history_mode_is_shared():
+            conn = current_conn
+            if conn is None:
+                conn = self._ensure_user_db(user_id)
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(MAX(msg_number), 0) FROM message_history")
+            return int(cur.fetchone()[0] or 0)
+
+        max_num = 0
+        for db_path in self._list_shared_history_db_paths():
+            if current_path and os.path.abspath(db_path) == os.path.abspath(current_path):
+                conn = current_conn
+                should_close = False
+            else:
+                conn, should_close = self._open_history_db_for_read(db_path)
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "SELECT COALESCE(MAX(msg_number), 0) FROM message_history WHERE user_id = ?",
+                        (str(user_id),),
+                    )
+                except sqlite3.OperationalError:
+                    cur.execute("SELECT COALESCE(MAX(msg_number), 0) FROM message_history")
+                max_num = max(max_num, int(cur.fetchone()[0] or 0))
+            finally:
+                if should_close:
+                    conn.close()
+        return max_num
+
     def _get_db_path_for_user(self, user_id: str) -> str:
         return os.path.join(self.history_folder, f"{self._safe_user_id(user_id)}.sqlite")
 
@@ -1290,27 +1644,12 @@ class AgentSystemManager:
         return f"u_{encoded or 'empty'}"
 
     def _ensure_user_db(self, user_id: str) -> sqlite3.Connection:
-        if not hasattr(self, "_db_pool"):
-            self._db_pool = {}
-        if not hasattr(self, "_db_locks"):
-            self._db_locks = {}
+        if self._history_mode_is_shared():
+            return self._ensure_shared_history_db()
+
         user_id = str(user_id)
-        if user_id in self._db_pool:
-            return self._db_pool[user_id]
         db_path = self._get_db_path_for_user(user_id)
-
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-
-        self._migrate_history_schema(conn)
-
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-        except Exception:
-            pass
-        self._db_pool[user_id] = conn
-        self._db_locks.setdefault(user_id, threading.RLock())
-        return conn
+        return self._connect_history_db(db_path, user_id)
     
     def _active_user_id(self) -> Optional[str]:
         if hasattr(self, "_tls") and getattr(self._tls, "current_user_id", None):
@@ -1319,6 +1658,10 @@ class AgentSystemManager:
 
 
     def export_history(self, user_id: str) -> bytes:
+        user_id = str(user_id)
+        if self._history_mode_is_shared():
+            return self._export_shared_user_history(user_id)
+
         db_path = self._get_db_path_for_user(user_id)
 
         if hasattr(self, "_db_pool") and user_id in self._db_pool:
@@ -1330,10 +1673,17 @@ class AgentSystemManager:
 
             with open(db_path, "rb") as f:
                 return f.read()
-        else:
-            return b""
+        if os.path.exists(db_path):
+            with open(db_path, "rb") as f:
+                return f.read()
+        return b""
     
     def import_history(self, user_id: str, sqlite_bytes: bytes):
+        user_id = str(user_id)
+        if self._history_mode_is_shared():
+            self._import_shared_user_history(user_id, sqlite_bytes)
+            return
+
         if hasattr(self, "_db_pool") and user_id in self._db_pool:
             try:
                 self._db_pool[user_id].close()
@@ -1354,18 +1704,179 @@ class AgentSystemManager:
         with open(db_path, "wb") as f:
             f.write(sqlite_bytes)
 
+    def _export_shared_user_history(self, user_id: str) -> bytes:
+        rows = self._get_all_messages(
+            None,
+            include_model=True,
+            user_id=user_id,
+            include_user_id=True,
+        )
+        if not rows:
+            return b""
+
+        tmp_path = None
+        conn = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite")
+            tmp_path = tmp.name
+            tmp.close()
+            conn = sqlite3.connect(tmp_path)
+            self._migrate_history_schema(conn)
+            cur = conn.cursor()
+            for role, content, msg_number, msg_type, model, timestamp, row_user_id in rows:
+                cur.execute(
+                    """
+                    INSERT INTO message_history
+                        (user_id, msg_number, role, content, type, model, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (row_user_id or user_id, msg_number, role, content, msg_type, model, timestamp),
+                )
+            conn.commit()
+            conn.close()
+            conn = None
+            with open(tmp_path, "rb") as fp:
+                return fp.read()
+        finally:
+            if conn is not None:
+                conn.close()
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _read_history_rows_from_bytes(self, sqlite_bytes: bytes) -> List[Dict[str, Any]]:
+        if not sqlite_bytes:
+            return []
+
+        tmp_path = None
+        conn = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite")
+            tmp_path = tmp.name
+            tmp.write(sqlite_bytes)
+            tmp.flush()
+            tmp.close()
+
+            conn = sqlite3.connect(tmp_path)
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='message_history';")
+            if not cur.fetchone():
+                return []
+
+            cur.execute("PRAGMA table_info(message_history)")
+            columns = {row[1] for row in cur.fetchall()}
+            select_exprs = [
+                "msg_number" if "msg_number" in columns else "id AS msg_number",
+                "role" if "role" in columns else "'user' AS role",
+                "content" if "content" in columns else "'' AS content",
+                "type" if "type" in columns else "'user' AS type",
+                "timestamp" if "timestamp" in columns else "NULL AS timestamp",
+                "model" if "model" in columns else "NULL AS model",
+                "user_id" if "user_id" in columns else "NULL AS user_id",
+            ]
+            order_expr = "msg_number ASC"
+            if "id" in columns:
+                order_expr += ", id ASC"
+            cur.execute(
+                f"SELECT {', '.join(select_exprs)} FROM message_history ORDER BY {order_expr}"
+            )
+            rows = []
+            for msg_number, role, content, msg_type, timestamp, model, row_user_id in cur.fetchall():
+                rows.append({
+                    "msg_number": msg_number,
+                    "role": role,
+                    "content": content,
+                    "type": msg_type,
+                    "timestamp": timestamp,
+                    "model": model,
+                    "user_id": row_user_id,
+                })
+            return rows
+        finally:
+            if conn is not None:
+                conn.close()
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _insert_shared_history_row(
+        self,
+        *,
+        user_id: str,
+        msg_number: int,
+        role: str,
+        content: str,
+        msg_type: str,
+        model: Optional[str],
+        timestamp: Optional[str],
+    ) -> None:
+        timestamp = timestamp or self._history_now_iso()
+        with self._shared_history_lock:
+            db_path = self._get_shared_history_db_path_for_write(timestamp)
+            conn = self._connect_history_db(db_path, self._shared_history_db_key(db_path))
+            if hasattr(self, "_tls"):
+                self._tls.db_conn = conn
+            lock = self._db_locks.get(self._shared_history_db_key(db_path), self._shared_history_lock)
+            with lock:
+                cur = conn.cursor()
+                try:
+                    cur.execute("BEGIN IMMEDIATE")
+                    cur.execute(
+                        """
+                        INSERT INTO message_history
+                            (user_id, msg_number, role, content, type, model, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (str(user_id), msg_number, role, content, msg_type, model, timestamp),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+    def _import_shared_user_history(self, user_id: str, sqlite_bytes: bytes) -> None:
+        self.clear_message_history(user_id)
+        if not sqlite_bytes:
+            self.set_current_user(user_id)
+            return
+
+        rows = self._read_history_rows_from_bytes(sqlite_bytes)
+        self.set_current_user(user_id)
+        for row in rows:
+            self._insert_shared_history_row(
+                user_id=user_id,
+                msg_number=int(row["msg_number"] or 0),
+                role=str(row["role"] or "user"),
+                content=str(row["content"] or ""),
+                msg_type=str(row["type"] or "user"),
+                model=row.get("model"),
+                timestamp=row.get("timestamp"),
+            )
+
 
     def _create_table(self, conn: sqlite3.Connection):
         cur = conn.cursor()
-        cur.execute("""
+        user_id_column = "user_id TEXT NOT NULL DEFAULT ''," if self._history_mode_is_shared() else ""
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS message_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                {user_id_column}
                 msg_number INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 type TEXT NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 model TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS history_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             )
         """)
         conn.commit()
@@ -1391,6 +1902,8 @@ class AgentSystemManager:
             migrations.append("ALTER TABLE message_history ADD COLUMN timestamp DATETIME")
         if "model" not in columns:
             migrations.append("ALTER TABLE message_history ADD COLUMN model TEXT")
+        if self._history_mode_is_shared() and "user_id" not in columns:
+            migrations.append("ALTER TABLE message_history ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
 
         for statement in migrations:
             cur.execute(statement)
@@ -1400,17 +1913,51 @@ class AgentSystemManager:
         if "timestamp" not in columns:
             cur.execute(
                 "UPDATE message_history SET timestamp = ? WHERE timestamp IS NULL",
-                (datetime.now(self.timezone).isoformat(),)
+                (self._history_now_iso(),)
+            )
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS history_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        cur.execute("SELECT value FROM history_metadata WHERE key = 'created_at'")
+        if not cur.fetchone():
+            cur.execute("SELECT MIN(timestamp) FROM message_history")
+            first_timestamp = cur.fetchone()[0]
+            cur.execute(
+                "INSERT INTO history_metadata (key, value) VALUES ('created_at', ?)",
+                (first_timestamp or self._history_now_iso(),),
             )
 
         cur.execute("PRAGMA user_version = 1")
         conn.commit()
 
     def has_new_updates(self) -> bool:
-        db_conn = self._get_user_db()
-        cur = db_conn.cursor()
-        cur.execute("SELECT MAX(timestamp) FROM message_history")
-        latest_timestamp = cur.fetchone()[0]
+        if self._history_mode_is_shared():
+            uid = self._active_user_id()
+            latest_timestamp = None
+            if uid is not None:
+                for db_path in self._list_shared_history_db_paths():
+                    conn, should_close = self._open_history_db_for_read(db_path)
+                    try:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "SELECT MAX(timestamp) FROM message_history WHERE user_id = ?",
+                            (str(uid),),
+                        )
+                        row_timestamp = cur.fetchone()[0]
+                        if row_timestamp and (latest_timestamp is None or row_timestamp > latest_timestamp):
+                            latest_timestamp = row_timestamp
+                    finally:
+                        if should_close:
+                            conn.close()
+        else:
+            db_conn = self._get_user_db()
+            cur = db_conn.cursor()
+            cur.execute("SELECT MAX(timestamp) FROM message_history")
+            latest_timestamp = cur.fetchone()[0]
 
         if latest_timestamp != self._last_known_update:
             self._last_known_update = latest_timestamp
@@ -1451,40 +1998,71 @@ class AgentSystemManager:
 
 
     def _get_next_msg_number(self, conn: sqlite3.Connection) -> int:
+        if self._history_mode_is_shared():
+            uid = self._active_user_id()
+            if uid is None:
+                self.ensure_user()
+                uid = self._active_user_id()
+            return self._max_msg_number_for_user(str(uid)) + 1
         cur = conn.cursor()
         cur.execute("SELECT COALESCE(MAX(msg_number), 0) FROM message_history")
         max_num = cur.fetchone()[0]
         return max_num + 1
 
     def _save_message(self, conn: sqlite3.Connection, role: str, content: Union[str, dict, list], type="user", model: Optional[str] = None):
+        uid = self._uid()
+        if uid is None:
+            self.ensure_user()
+            uid = self._uid()
+
         timestamp = datetime.now(self.timezone).isoformat()
 
-        content = self._to_blocks(content, user_id=self._uid())
+        content = self._to_blocks(content, user_id=uid)
         if isinstance(content, (dict, list)):
             content_str = json.dumps(
-                self._persist_non_json_values(content, self._uid()),
+                self._persist_non_json_values(content, uid),
                 indent=2, ensure_ascii=False
             )
         else:
             content_str = str(content)
 
-        uid = self._uid()
-        lock = self._db_locks.get(str(uid)) if uid is not None and hasattr(self, "_db_locks") else None
+        if self._history_mode_is_shared():
+            lock = getattr(self, "_shared_history_lock", self._db_write_lock)
+        else:
+            lock = self._db_locks.get(str(uid)) if uid is not None and hasattr(self, "_db_locks") else None
         lock = lock or getattr(self, "_db_write_lock", threading.RLock())
 
         with lock:
+            if self._history_mode_is_shared():
+                db_path = self._get_shared_history_db_path_for_write(timestamp)
+                conn = self._connect_history_db(db_path, self._shared_history_db_key(db_path))
+                if hasattr(self, "_tls"):
+                    self._tls.db_conn = conn
+                next_num = self._max_msg_number_for_user(
+                    str(uid),
+                    current_path=db_path,
+                    current_conn=conn,
+                ) + 1
+                insert_sql = """
+                    INSERT INTO message_history
+                        (user_id, msg_number, role, content, type, model, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+                insert_params = (str(uid), next_num, role, content_str, type, model, timestamp)
+            else:
+                insert_sql = """
+                    INSERT INTO message_history (msg_number, role, content, type, model, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """
+
             cur = conn.cursor()
             try:
                 cur.execute("BEGIN IMMEDIATE")
-                cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
-                next_num = cur.fetchone()[0]
-                cur.execute(
-                    """
-                    INSERT INTO message_history (msg_number, role, content, type, model, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (next_num, role, content_str, type, model, timestamp)
-                )
+                if not self._history_mode_is_shared():
+                    cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
+                    next_num = cur.fetchone()[0]
+                    insert_params = (next_num, role, content_str, type, model, timestamp)
+                cur.execute(insert_sql, insert_params)
                 conn.commit()
                 return next_num
             except Exception:
@@ -1683,7 +2261,82 @@ class AgentSystemManager:
                         b["content"] = sub
         return new_blocks
     
-    def _get_all_messages(self, conn: sqlite3.Connection, include_model = False) -> List[tuple]:
+    def _get_all_messages(
+        self,
+        conn: sqlite3.Connection,
+        include_model = False,
+        user_id: Optional[str] = None,
+        include_user_id: bool = False
+    ) -> List[tuple]:
+        if self._history_mode_is_shared():
+            uid = str(user_id) if user_id is not None else self._active_user_id()
+            rows_with_order = []
+            for db_path in self._list_shared_history_db_paths():
+                sequence = self._shared_history_sequence(db_path) or 0
+                read_conn, should_close = self._open_history_db_for_read(db_path)
+                try:
+                    cur = read_conn.cursor()
+                    where = ""
+                    params = ()
+                    if uid is not None:
+                        where = "WHERE user_id = ?"
+                        params = (str(uid),)
+
+                    try:
+                        if include_model:
+                            cur.execute(
+                                "SELECT id, role, content, msg_number, type, model, timestamp, user_id "
+                                f"FROM message_history {where}",
+                                params,
+                            )
+                        else:
+                            cur.execute(
+                                "SELECT id, role, content, msg_number, type, timestamp, user_id "
+                                f"FROM message_history {where}",
+                                params,
+                            )
+                    except sqlite3.OperationalError:
+                        if include_model:
+                            cur.execute(
+                                "SELECT id, role, content, msg_number, type, model, timestamp "
+                                "FROM message_history"
+                            )
+                            fetched = [
+                                (row_id, role, content, msg_number, msg_type, model, timestamp, uid)
+                                for row_id, role, content, msg_number, msg_type, model, timestamp
+                                in cur.fetchall()
+                            ]
+                        else:
+                            cur.execute(
+                                "SELECT id, role, content, msg_number, type, timestamp "
+                                "FROM message_history"
+                            )
+                            fetched = [
+                                (row_id, role, content, msg_number, msg_type, timestamp, uid)
+                                for row_id, role, content, msg_number, msg_type, timestamp
+                                in cur.fetchall()
+                            ]
+                    else:
+                        fetched = cur.fetchall()
+
+                    for row in fetched:
+                        row_id = row[0]
+                        if include_model:
+                            _, role, content, msg_number, msg_type, model, timestamp, row_user_id = row
+                            payload = (role, content, msg_number, msg_type, model, timestamp)
+                        else:
+                            _, role, content, msg_number, msg_type, timestamp, row_user_id = row
+                            payload = (role, content, msg_number, msg_type, timestamp)
+                        if include_user_id:
+                            payload = payload + (row_user_id,)
+                        rows_with_order.append((int(msg_number or 0), sequence, int(row_id or 0), payload))
+                finally:
+                    if should_close:
+                        read_conn.close()
+
+            rows_with_order.sort(key=lambda item: (item[0], item[1], item[2]))
+            return [payload for _, _, _, payload in rows_with_order]
+
         cur = conn.cursor()
 
         if include_model:
@@ -1697,7 +2350,7 @@ class AgentSystemManager:
             self.set_current_user(user_id)
 
         conn = self._get_user_db()
-        rows = self._get_all_messages(conn, include_model = True)
+        rows = self._get_all_messages(conn, include_model = True, user_id=self._uid())
         logger.info(f"=== Message History for user [{self._uid()}] ===")
         for i, (role, content, msg_number, msg_type, model, timestamp) in enumerate(rows, start=1):
             model_str = f" ({model})" if model else ""
@@ -1712,10 +2365,22 @@ class AgentSystemManager:
             self.set_current_user(user_id)
 
         conn = self._get_user_db()
-        rows = self._get_all_messages(conn, include_model=True)
+        include_user_id = self._history_mode_is_shared()
+        rows = self._get_all_messages(
+            conn,
+            include_model=True,
+            user_id=self._uid(),
+            include_user_id=include_user_id,
+        )
 
         messages = []
-        for role, content, msg_number, msg_type, model, timestamp in rows:
+        for row in rows:
+            if include_user_id:
+                role, content, msg_number, msg_type, model, timestamp, row_user_id = row
+            else:
+                role, content, msg_number, msg_type, model, timestamp = row
+                row_user_id = self._uid()
+
             if isinstance(content, str):
                 try:
                     content_data = json.loads(content)
@@ -1724,16 +2389,35 @@ class AgentSystemManager:
             else:
                 content_data = content
 
-            messages.append({
+            message = {
                 "source": role,
                 "message": content_data,
                 "msg_number": msg_number,
                 "type": msg_type,
                 "model": model,
                 "timestamp": timestamp
-            })
+            }
+            if include_user_id:
+                message["user_id"] = row_user_id
+            messages.append(message)
 
         return messages
+
+    def _get_last_message_content(self, user_id: Optional[str] = None) -> Optional[str]:
+        uid = str(user_id) if user_id is not None else self._active_user_id()
+        if self._history_mode_is_shared():
+            rows = self._get_all_messages(
+                None,
+                include_model=False,
+                user_id=uid,
+            )
+            return rows[-1][1] if rows else None
+
+        conn = self._get_user_db()
+        cur = conn.cursor()
+        cur.execute("SELECT content FROM message_history ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        return row[0] if row else None
     
     def _extract_metadata_from_blocks(self, content):
         if isinstance(content, dict):
@@ -2210,12 +2894,7 @@ class AgentSystemManager:
                 component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
             )
 
-            db_conn = self._get_user_db()
-            cur = db_conn.cursor()
-            cur.execute("SELECT content FROM message_history ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            
-            last_content_str = row[0]
+            last_content_str = self._get_last_message_content(user_id or self._uid())
             final_blocks = json.loads(last_content_str)
 
             if return_token_count and prev_usage is not None:
@@ -2302,6 +2981,35 @@ class AgentSystemManager:
         self.include_timestamp = general_params.get("include_timestamp", False)
         self._usage_logging_enabled  = general_params.get("usage_logging", self._usage_logging_enabled)
         self.timezone = general_params.get("timezone", 'UTC')
+
+        history_storage = general_params.get("history_storage", {})
+        if history_storage is None:
+            history_storage = {}
+        if not isinstance(history_storage, dict):
+            raise ValueError("general_parameters.history_storage must be a JSON object.")
+
+        history_period = history_storage.get(
+            "period",
+            history_storage.get(
+                "period_seconds",
+                general_params.get(
+                    "history_period",
+                    general_params.get("history_period_seconds", self.history_period),
+                ),
+            ),
+        )
+        self._configure_history_storage(
+            mode=history_storage.get("mode", general_params.get("history_mode", self.history_mode)),
+            rotation=history_storage.get(
+                "rotation",
+                general_params.get("history_rotation", self.history_rotation),
+            ),
+            max_messages=history_storage.get(
+                "max_messages",
+                general_params.get("history_max_messages", self.history_max_messages),
+            ),
+            period=history_period,
+        )
 
         admin_from_cfg = general_params.get("admin_user_id", None)
         self.admin_user_id = str(admin_from_cfg) if admin_from_cfg is not None else getattr(self, "admin_user_id", None)
@@ -2511,7 +3219,7 @@ class AgentSystemManager:
             return values
 
         conn = self._ensure_user_db(uid)
-        rows = self._get_all_messages(conn)
+        rows = self._get_all_messages(conn, user_id=uid)
         for block in self._iter_variable_blocks_from_rows(rows):
             key = self._validate_variable_key(block.get("key"))
             values[key] = self._validate_variable_value(key, block.get("value"))
@@ -2971,6 +3679,28 @@ class AgentSystemManager:
         if not self._uid():
             return
 
+        if self._history_mode_is_shared():
+            uid = str(self._uid())
+            with self._shared_history_lock:
+                for db_path in self._list_shared_history_db_paths():
+                    conn = self._connect_history_db(db_path, self._shared_history_db_key(db_path))
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM message_history WHERE user_id = ?", (uid,))
+                    cur.execute("SELECT COUNT(*) FROM message_history")
+                    remaining = int(cur.fetchone()[0] or 0)
+                    if remaining == 0:
+                        cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
+                        cur.execute(
+                            """
+                            INSERT INTO history_metadata (key, value)
+                            VALUES ('created_at', ?)
+                            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                            """,
+                            (self._history_now_iso(),),
+                        )
+                    conn.commit()
+            return
+
         conn = self._get_user_db()
         cur = conn.cursor()
         cur.execute("DELETE FROM message_history")
@@ -2988,18 +3718,17 @@ class AgentSystemManager:
             try:
                 conn = sqlite3.connect(db_path, check_same_thread=False)
                 cur = conn.cursor()
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS message_history (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        msg_number INTEGER NOT NULL,
-                        role TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        type TEXT NOT NULL,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        model TEXT
-                    )
-                """)
+                self._migrate_history_schema(conn)
                 cur.execute("DELETE FROM message_history")
+                cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
+                cur.execute(
+                    """
+                    INSERT INTO history_metadata (key, value)
+                    VALUES ('created_at', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (self._history_now_iso(),),
+                )
                 conn.commit()
                 conn.close()
                 cleared += 1
@@ -3656,5 +4385,6 @@ class AgentSystemManager:
                 except Exception:
                     pass
             self._db_pool.clear()
-
+        if hasattr(self, "_tls") and getattr(self._tls, "db_conn", None) is not None:
+            self._tls.db_conn = None
 

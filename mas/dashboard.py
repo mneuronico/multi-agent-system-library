@@ -207,6 +207,83 @@ def _read_history_file(path: Path, limit: int) -> dict:
     }
 
 
+def _history_mode_from_config(config: dict, manager: Optional[AgentSystemManager] = None) -> str:
+    if manager is not None:
+        return getattr(manager, "history_mode", "per_user")
+    general = config.get("general_parameters", {}) if isinstance(config, dict) else {}
+    storage = general.get("history_storage", {}) if isinstance(general, dict) else {}
+    if isinstance(storage, dict) and storage.get("mode"):
+        mode = storage.get("mode")
+    else:
+        mode = general.get("history_mode", "per_user") if isinstance(general, dict) else "per_user"
+    mode = str(mode).strip().lower().replace("-", "_")
+    if mode in {"shared", "global", "all_users", "allusers", "aggregate", "aggregated"}:
+        return "shared"
+    return "per_user"
+
+
+def _read_shared_history_files(paths: List[Path], limit: int) -> List[dict]:
+    grouped = {}
+    errors = {}
+    for path in paths:
+        try:
+            conn = sqlite3.connect(str(path))
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "SELECT user_id, role, content, msg_number, type, model, timestamp "
+                        "FROM message_history ORDER BY msg_number ASC, id ASC"
+                    )
+                    fetched = cur.fetchall()
+                except sqlite3.OperationalError:
+                    cur.execute(
+                        "SELECT role, content, msg_number, type, model, timestamp "
+                        "FROM message_history ORDER BY msg_number ASC, id ASC"
+                    )
+                    fetched = [
+                        ("", role, content, msg_number, msg_type, model, timestamp)
+                        for role, content, msg_number, msg_type, model, timestamp in cur.fetchall()
+                    ]
+            finally:
+                conn.close()
+
+            for user_id, role, content, msg_number, msg_type, model, timestamp in fetched:
+                uid = str(user_id or "unknown")
+                grouped.setdefault(uid, {
+                    "user_id": uid,
+                    "path": ", ".join(str(p) for p in paths),
+                    "messages": [],
+                    "error": None,
+                })
+                grouped[uid]["messages"].append({
+                    "role": role,
+                    "type": msg_type,
+                    "model": model,
+                    "timestamp": timestamp,
+                    "msg_number": msg_number,
+                    "user_id": uid,
+                    "blocks": _coerce_blocks(content),
+                })
+        except Exception as exc:
+            errors[str(path)] = str(exc)
+
+    histories = []
+    for uid in sorted(grouped):
+        history = grouped[uid]
+        history["messages"] = history["messages"][-limit:]
+        histories.append(history)
+
+    for path, error in errors.items():
+        histories.append({
+            "user_id": Path(path).stem,
+            "path": path,
+            "messages": [],
+            "error": error,
+        })
+    return histories
+
+
 def _history_folder(project_dir: Path, config: dict, manager: Optional[AgentSystemManager] = None) -> Path:
     if manager is not None and getattr(manager, "history_folder", None):
         return Path(manager.history_folder)
@@ -275,10 +352,15 @@ def build_dashboard_state(project_dir: Path, history_limit: int = 200) -> dict:
 
     folder = _history_folder(project_dir, config, manager)
     if folder.is_dir():
-        state["histories"] = [
-            _read_history_file(path, history_limit)
-            for path in sorted(folder.glob("*.sqlite"))
-        ]
+        if _history_mode_from_config(config, manager) == "shared":
+            shared_paths = sorted(folder.glob("shared_history_*.sqlite"))
+            state["histories"] = _read_shared_history_files(shared_paths, history_limit)
+        else:
+            state["histories"] = [
+                _read_history_file(path, history_limit)
+                for path in sorted(folder.glob("*.sqlite"))
+                if not path.name.startswith("shared_history_")
+            ]
     return state
 
 

@@ -167,6 +167,31 @@ def test_dashboard_state_loads_config_automations_and_histories(workspace_tmp_pa
     assert history["messages"][-1]["blocks"][0]["value"] == "brief"
 
 
+def test_dashboard_groups_shared_history_files_by_user(workspace_tmp_path):
+    config = {
+        "general_parameters": {
+            "history_storage": {
+                "mode": "shared",
+                "max_messages": 10,
+            },
+        },
+        "components": [],
+    }
+    config_path = workspace_tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    manager = AgentSystemManager(config=str(config_path), base_directory=str(workspace_tmp_path))
+    manager.add_blocks({"response": "alice"}, user_id="alice")
+    manager.add_blocks({"response": "bob"}, user_id="bob")
+
+    state = build_dashboard_state(workspace_tmp_path, history_limit=20)
+
+    histories = {item["user_id"]: item for item in state["histories"]}
+    assert set(histories) == {"alice", "bob"}
+    assert histories["alice"]["messages"][0]["blocks"][0]["content"]["response"] == "alice"
+    assert histories["bob"]["messages"][0]["blocks"][0]["content"]["response"] == "bob"
+
+
 def test_dashboard_state_reports_missing_config(workspace_tmp_path):
     state = build_dashboard_state(workspace_tmp_path)
 

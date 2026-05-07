@@ -500,7 +500,7 @@ The heart of the `mas` library is its message history and block-based data syste
 
 #### The Message History Database
 
-All interactions between components are recorded in a per-user SQLite database. This provides a complete, chronological record of the conversation or workflow. Each message in the history table includes:
+All interactions between components are recorded in SQLite history databases. By default, MAS uses one SQLite database per `user_id`, preserving an isolated chronological record for each conversation or workflow. Each message in the history table includes:
 
 -   A unique identifier (`id`).
 -   A sequential message number (`msg_number`), which ensures chronological order.
@@ -510,7 +510,7 @@ All interactions between components are recorded in a per-user SQLite database. 
 -   The `content` of the message, which is stored as a JSON string representing a **list of blocks**. This is the core of the data exchange system.
 -   The `timestamp` indicating when the message was added, in the specified timezone (defaults to `UTC`).
 
-Each `user_id` has its own isolated message history, allowing the manager to handle multiple concurrent and independent sessions.
+Each `user_id` has its own isolated message history by default, allowing the manager to handle multiple concurrent and independent sessions. For deployments that prefer fewer history files, set `history_mode="shared"` to store all users in shared history databases. In shared mode every row includes a `user_id` column, reads are filtered back to the requested user, and files rotate by `history_max_messages` (default `1000`) or, when selected, by `history_rotation="time_period"` with `history_period` defaulting to one week.
 
 #### The Block System: A Universal Data Format
 
@@ -677,6 +677,10 @@ The `AgentSystemManager` manages your system’s components, user histories, and
 -   **`config`**: Path to a JSON file or a plain-English description (triggers automatic bootstrap of system).
 -   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
 -   **`history_folder`**: Path for storing per-user SQLite databases. Defaults to `<base_directory>/history`.
+-   **`history_mode`**: History storage mode. Defaults to `per_user`, which creates one SQLite database per `user_id`. Set to `shared` (aliases: `global`, `all_users`) to store all users together in `shared_history_000001.sqlite`, `shared_history_000002.sqlite`, etc., with a `user_id` column on each message row.
+-   **`history_rotation`**: Shared-history rotation strategy. Defaults to `message_count`; use `time_period` to rotate by elapsed time, or `both` to rotate on either threshold.
+-   **`history_max_messages`**: Maximum messages per shared history file when count rotation is active. Defaults to `1000`.
+-   **`history_period`**: Period for time-based shared history rotation. Accepts values like `1w`, `7 days`, or seconds. Defaults to one week.
 -   **`files_folder`**: Path for storing serialized object files. Defaults to `<base_directory>/files`.
 -   **`api_keys_path`**: Path to a `.env` or `json` file containing API keys. Keys from this file are given priority over system environment variables, making it easy to manage keys for different environments.
 -   **`costs_path`**: Path to a `.json` file containing model and tool costs. If provided, the system will calculate and store the USD cost for agent and tool executions when `return_token_count` is set to `True`.
@@ -1524,6 +1528,7 @@ A **list** of dictionaries, each representing a message with the following keys:
 - **`type`**: Component type (`"agent"`, `"tool"`, `"process"`, `"user"`, etc.).
 - **`model`**: Model used, in the format `"<provider>:<model-name>"`.
 - **`timestamp`**: Timestamp indicating when the message was saved to history, in the specified timezone.
+- **`user_id`**: Included when `history_mode="shared"` so consumers can inspect the stored owner of each returned message.
 
 ### Reading and Querying Messages: `read()`
 
@@ -1578,7 +1583,7 @@ The `read()` method dramatically simplifies accessing specific data from the his
 
 ### Deleting User History `clear_message_history`
 
-If you need to clear the message history for a user, the `manager` offers a simple method to delete the database associated to a specific user.
+If you need to clear the message history for a user, the `manager` offers a simple method to delete that user's history. In `per_user` mode this clears the user's database; in `shared` mode it deletes only rows for that `user_id` and leaves other users untouched.
 
 ```python
 manager.clear_message_history(user_id) # if not provided, it will use the current user_id
@@ -1653,8 +1658,10 @@ This method is the recommended way to programmatically add multimodal content to
 sqlite_bytes = manager.export_history(user_id)
 ```
 
-Exports the SQLite database for the specified user and returns its raw bytes. This
-is useful for creating backups or sending the history to another storage system.
+Exports the SQLite history for the specified user and returns its raw bytes. In
+`per_user` mode this is the user's database; in `shared` mode the export contains
+only that user's rows. This is useful for creating backups or sending the history
+to another storage system.
 
 ### Importing History `import_history`
 
@@ -1663,7 +1670,7 @@ manager.import_history(user_id, sqlite_bytes)
 ```
 
 Loads a SQLite database from bytes for the given user, overwriting any existing
-history file.
+history for that user. In `shared` mode only that user's rows are replaced.
 
 `manager.has_new_updates()` can then be used as a boolean check to detect if new
 messages were added to the current user's history since the last check.
