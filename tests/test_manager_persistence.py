@@ -88,6 +88,36 @@ def test_default_history_mode_keeps_one_database_per_user(workspace_tmp_path):
     ]
 
 
+def test_get_messages_without_active_user_does_not_create_empty_history(workspace_tmp_path):
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
+
+    assert manager.get_messages() == []
+    assert list(Path(manager.history_folder).glob("*.sqlite")) == []
+
+
+def test_nonblocking_run_uses_resolved_user_id_for_history_and_callback(workspace_tmp_path):
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
+    manager.create_process("echo", lambda messages=None: {"ok": True})
+    seen = []
+
+    manager.run(
+        input="hello",
+        component_name="echo",
+        user_id="alice",
+        blocking=False,
+        on_complete=lambda messages, manager: seen.append(messages),
+    )
+
+    import time
+    for _ in range(50):
+        if seen:
+            break
+        time.sleep(0.02)
+
+    assert seen
+    assert [msg["source"] for msg in manager.get_messages("alice")] == ["user", "echo"]
+
+
 def test_shared_history_stores_user_id_and_rotates_by_message_count(workspace_tmp_path):
     manager = AgentSystemManager(
         base_directory=str(workspace_tmp_path),

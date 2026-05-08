@@ -3297,6 +3297,15 @@ class Automation(Component):
 
         db_conn = self.manager._get_user_db()
 
+        def _truthy(value) -> bool:
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"false", "f", "no", "n", "0", "none", "null", ""}:
+                    return False
+                if normalized in {"true", "t", "yes", "y", "1"}:
+                    return True
+            return bool(value)
+
         if isinstance(condition, str):
             parsed = self.manager.parser.parse_input_string(condition)
 
@@ -3312,11 +3321,11 @@ class Automation(Component):
             else:
                 data = self._gather_data_for_parser_result(parsed, db_conn)
                 if isinstance(data, dict):
-                    return all(bool(v) for v in data.values())
+                    return all(_truthy(v) for v in data.values())
                 elif isinstance(data, list):
-                    return all(bool(item) for item in data)
+                    return all(_truthy(item) for item in data)
                 else:
-                    return bool(data)
+                    return _truthy(data)
 
         if isinstance(condition, dict):
             input_spec = condition.get("input")

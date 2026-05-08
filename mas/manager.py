@@ -2348,6 +2348,11 @@ class AgentSystemManager:
     def show_history(self, user_id: Optional[str] = None, message_char_limit: int = 2000):
         if user_id is not None:
             self.set_current_user(user_id)
+        elif self._uid() is None:
+            logger.info("=== Message History: no active user selected ===")
+            logger.info("Pass a user_id to show_history(user_id) or call set_current_user(user_id) first.")
+            logger.info("============================================\n")
+            return
 
         conn = self._get_user_db()
         rows = self._get_all_messages(conn, include_model = True, user_id=self._uid())
@@ -2363,6 +2368,8 @@ class AgentSystemManager:
     def get_messages(self, user_id: Optional[str] = None) -> List[Dict[str, str]]:
         if user_id is not None:
             self.set_current_user(user_id)
+        elif self._uid() is None:
+            return []
 
         conn = self._get_user_db()
         include_user_id = self._history_mode_is_shared()
@@ -2884,17 +2891,17 @@ class AgentSystemManager:
 
         def task():
             self._run_internal(
-                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
+                component_name, input, run_user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
             )
             if on_complete:
-                self._invoke_callback(on_complete, self.get_messages(user_id), self, on_complete_params)
+                self._invoke_callback(on_complete, self.get_messages(run_user_id), self, on_complete_params)
 
         if blocking:
             self._run_internal(
-                component_name, input, user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
+                component_name, input, run_user_id, role, verbose, target_input, target_index, target_custom, on_update, on_update_params, return_token_count
             )
 
-            last_content_str = self._get_last_message_content(user_id or self._uid())
+            last_content_str = self._get_last_message_content(run_user_id)
             final_blocks = json.loads(last_content_str)
 
             if return_token_count and prev_usage is not None:
@@ -2928,7 +2935,7 @@ class AgentSystemManager:
                     final_blocks[0]["metadata"]["usage_summary"] = usage_summary
 
             if on_complete:
-                self._invoke_callback(on_complete, self.get_messages(user_id), self, on_complete_params)
+                self._invoke_callback(on_complete, self.get_messages(run_user_id), self, on_complete_params)
             return final_blocks
         else:
             thread = threading.Thread(target=task)
@@ -4387,4 +4394,3 @@ class AgentSystemManager:
             self._db_pool.clear()
         if hasattr(self, "_tls") and getattr(self._tls, "db_conn", None) is not None:
             self._tls.db_conn = None
-
