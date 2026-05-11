@@ -2858,7 +2858,7 @@ This is an alpha version of the `mas` library. It has not yet been tested extens
 
 # MAWS: 1-Command AWS Deploys for Telegram & WhatsApp Bots (Beta)
 
-`maws` is a tiny companion to the `mas` library that bootstraps a **serverless bot backend** on AWS (API Gateway + Lambda + S3, with optional DynamoDB locks and SSM Parameter Store). It ships with:
+`maws` is a tiny companion to the `mas` library that bootstraps a **serverless bot backend** on AWS (API Gateway + Lambda + S3, with optional DynamoDB locks, SQS FIFO processing, S3 file persistence, and SSM Parameter Store). It ships with:
 
 * A **runtime** (`MawsRuntime`) that turns your MAS config into a webhook-driven bot (Telegram or WhatsApp).
 * A **CLI** (`maws`) that scaffolds a project, wires AWS resources, and deploys with AWS SAM.
@@ -2905,6 +2905,7 @@ On AWS, the stack includes:
 * **S3** buckets: one for **history** (per-user SQLite DB) and one for **deployment artifacts**
 * **SSM Parameter Store (SecureString)** to hold your `.env` securely
 * **(Optional)** DynamoDB table for **user locks** (prevents concurrent processing by multiple invocations)
+* **(Optional)** SQS FIFO queue and DLQ for durable, ordered bot work
 
 ---
 
@@ -2912,13 +2913,16 @@ On AWS, the stack includes:
 
 * Loads secrets from **SSM** (`ENV_PARAMETER_NAME`) into `os.environ` on cold start.
 * Optionally **syncs “token files”** (API tokens, etc.) from **S3** into `/tmp` and exposes their paths via env vars.
+* Optionally verifies Telegram POSTs with `X-Telegram-Bot-Api-Secret-Token` and WhatsApp POSTs with `X-Hub-Signature-256`.
+* Optionally syncs user media/files to S3 when `persist_files_s3=true`.
 * On each webhook:
 
-  1. Extracts a **chat\_id** (Telegram/WhatsApp).
-  2. **(Optional)** acquires a **DynamoDB distributed lock** for that user.
-  3. Downloads `history/<chat_id>.sqlite` from S3 and **imports** it into the MAS manager.
-  4. Feeds the update to **TelegramBot**/**WhatsappBot** (webhook mode).
-  5. **Exports** the updated SQLite back to S3 and releases the lock.
+  1. Normalizes provider payloads into one job per processable message.
+  2. Either self-invokes immediately (`busy_policy="drop"`, default) or enqueues to SQS FIFO (`busy_policy="fifo"`).
+  3. **(Optional)** acquires a **DynamoDB distributed lock** for that user, or one global lock in shared-history mode.
+  4. Downloads history from S3 and **imports** it into the MAS manager.
+  5. Feeds the update to **TelegramBot**/**WhatsappBot** (webhook mode).
+  6. **Exports** the updated history and optional files back to S3 and releases the lock.
 
 You don’t have to wire any of this — the CLI’s deploy scripts generate all infra and environment linkage.
 
@@ -3102,6 +3106,12 @@ Return codes mirror the CLI behavior (`0` on success, non-zero on error where ap
 * `tokens_s3_prefix` – S3 prefix for token files (default `secrets`)
 * `verbose` (bool) – extra logging in Lambda
 
+### Production-oriented MAWS params
+
+Optional production params include `busy_policy` (`drop` by default, `fifo` for SQS FIFO), `persist_files_s3`, `files_s3_prefix`, `history_mode`, `history_rotation`, `history_max_messages`, `history_period`, `webhook_security`, `runtime.manager_kwargs`, `runtime.bot_kwargs`, `failure_handling`, `infra`, `requirements_source`, and `requirements_ref`.
+
+Security uses only provider-supported mechanisms: Telegram webhook secret tokens and WhatsApp `X-Hub-Signature-256` verification. These are opt-in so existing projects do not break, but production bots should enable the relevant provider mechanism.
+
 ### Lambda environment variables (read by runtime)
 
 * `ENV_PARAMETER_NAME` – SSM parameter name that contains your `.env` lines
@@ -3132,11 +3142,13 @@ NVIDIA_API_KEY=
 
 # Telegram (if using Telegram)
 TELEGRAM_TOKEN=
+TELEGRAM_WEBHOOK_SECRET_TOKEN=
 
 # WhatsApp Cloud API (if using WhatsApp)
 WHATSAPP_TOKEN=
 WHATSAPP_PHONE_NUMBER_ID=
 WHATSAPP_VERIFY_TOKEN=
+WHATSAPP_APP_SECRET=
 ```
 
 > MAWS loads this env securely from **SSM** at runtime (`ENV_PARAMETER_NAME`).

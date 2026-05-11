@@ -504,16 +504,20 @@ def start(
 
     if bot == "telegram":
         env_lines.append(_line("TELEGRAM_TOKEN", entered["telegram_token"]))
+        env_lines.append("# TELEGRAM_WEBHOOK_SECRET_TOKEN=")
         # If you want to keep this generic, leave it commented:
         env_lines.append("# WEBHOOK_VERIFY_TOKEN=")
         env_lines.append("# WHATSAPP_TOKEN=")
         env_lines.append("# WHATSAPP_PHONE_NUMBER_ID=")
         env_lines.append("# WHATSAPP_VERIFY_TOKEN=")
+        env_lines.append("# WHATSAPP_APP_SECRET=")
     else:
         env_lines.append(_line("WHATSAPP_TOKEN",           entered["whatsapp_token"]))
         env_lines.append(_line("WHATSAPP_PHONE_NUMBER_ID", entered["whatsapp_phone_id"]))
         env_lines.append(_line("WHATSAPP_VERIFY_TOKEN",    entered["whatsapp_verify"]))
+        env_lines.append("# WHATSAPP_APP_SECRET=")
         env_lines.append("# TELEGRAM_TOKEN=")
+        env_lines.append("# TELEGRAM_WEBHOOK_SECRET_TOKEN=")
         env_lines.append("# WEBHOOK_VERIFY_TOKEN=")
 
     _write(env_path, "\n".join(env_lines) + "\n")
@@ -656,9 +660,32 @@ def setup(
 
     lambda_timeout = _ask("Lambda function timeout (in seconds)", data.get("lambda_timeout") or "120")
 
+    busy_policy = _ask("Busy message policy (drop/fifo)", data.get("busy_policy") or "drop").lower()
+    if busy_policy not in ("drop", "fifo"):
+        print(f"[maws] Invalid busy policy '{busy_policy}', using 'drop'.")
+        busy_policy = "drop"
+
     sync_tokens_s3 = _ask_bool("Sync tokens from S3 (SYNC_TOKENS_S3)", bool(data.get("sync_tokens_s3", True)))
     tokens_prefix  = _ask("S3 prefix for tokens (TOKENS_S3_PREFIX)",
                           data.get("tokens_s3_prefix") or "secrets")
+    persist_files_s3 = _ask_bool("Persist user files/media to S3", bool(data.get("persist_files_s3", False)))
+    files_prefix = _ask("S3 prefix for persisted files",
+                        data.get("files_s3_prefix") or "files")
+    history_mode = _ask("History mode (per_user/shared)", data.get("history_mode") or "per_user").lower()
+    if history_mode not in ("per_user", "shared"):
+        print(f"[maws] Invalid history mode '{history_mode}', using 'per_user'.")
+        history_mode = "per_user"
+    history_rotation = _ask("Shared history rotation (message_count/time_period/both)",
+                            data.get("history_rotation") or "message_count")
+    history_max_messages = _ask("Shared history max messages",
+                                data.get("history_max_messages") or "1000")
+    history_period = _ask("Shared history period",
+                          data.get("history_period") or "1w")
+    webhook_security = data.get("webhook_security") if isinstance(data.get("webhook_security"), dict) else {}
+    whatsapp_verify_signature = _ask_bool(
+        "Verify WhatsApp POST signatures when WHATSAPP_APP_SECRET is configured",
+        bool(webhook_security.get("whatsapp_verify_signature", False)),
+    )
     verbose        = _ask_bool("Verbose mode in Lambda (VERBOSE)", bool(data.get("verbose", False)))
 
     # update minimal structure
@@ -672,8 +699,19 @@ def setup(
         "env_param_name": env_param_name,
         "api_path": api_path,
         "lambda_timeout": int(lambda_timeout),
+        "busy_policy": busy_policy,
         "sync_tokens_s3": bool(sync_tokens_s3),
         "tokens_s3_prefix": tokens_prefix,
+        "persist_files_s3": bool(persist_files_s3),
+        "files_s3_prefix": files_prefix,
+        "history_mode": history_mode,
+        "history_rotation": history_rotation,
+        "history_max_messages": int(history_max_messages),
+        "history_period": history_period,
+        "webhook_security": {
+            **webhook_security,
+            "whatsapp_verify_signature": bool(whatsapp_verify_signature),
+        },
         "verbose": bool(verbose),
     })
 
@@ -715,9 +753,18 @@ def describe(
     deploy_bucket  = data.get("deployment_bucket") or f"{project}-deployment-bucket"
 
     print("\nparams.json")
-    for k in ("project","region","bot","stack_name","history_bucket","deployment_bucket","env_param_name","api_path","sync_tokens_s3","tokens_s3_prefix","verbose"):
+    for k in (
+        "project","region","bot","stack_name","history_bucket","deployment_bucket",
+        "env_param_name","api_path","lambda_timeout","busy_policy",
+        "sync_tokens_s3","tokens_s3_prefix","persist_files_s3","files_s3_prefix",
+        "history_mode","history_rotation","history_max_messages","history_period",
+        "verbose","requirements_source","requirements_ref",
+    ):
         if k in data:
             print(f"   - {k}: {data[k]}")
+    for nested in ("webhook_security", "runtime", "failure_handling", "infra"):
+        if nested in data:
+            print(f"   - {nested}: {json.dumps(data[nested], sort_keys=True)}")
 
     if no_aws:
         return 0

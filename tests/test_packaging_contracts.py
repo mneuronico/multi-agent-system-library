@@ -101,3 +101,43 @@ def test_maws_operator_files_are_ascii_clean():
     ]
 
     assert offenders == []
+
+
+def test_maws_shell_resources_are_lf_and_parse_with_bash():
+    import shutil
+    import subprocess
+
+    paths = [
+        ROOT / "maws" / "resources" / "bootstrap.sh",
+        ROOT / "maws" / "resources" / "pull_history.sh",
+    ]
+
+    for path in paths:
+        raw = path.read_bytes()
+        assert b"\r\n" not in raw
+
+    bash = shutil.which("bash")
+    if bash:
+        for path in paths:
+            subprocess.check_call([bash, "-n", path.relative_to(ROOT).as_posix()], cwd=ROOT)
+
+
+def test_maws_bootstrap_exposes_production_params():
+    bootstrap = (ROOT / "maws" / "resources" / "bootstrap.sh").read_text(encoding="utf-8")
+
+    for expected in [
+        "BUSY_POLICY",
+        "MAWS_BUSY_POLICY",
+        "MAWS_QUEUE_URL",
+        "PERSIST_FILES_S3",
+        "FILES_S3_PREFIX",
+        "HISTORY_MODE",
+        "MAWS_MANAGER_KWARGS_JSON",
+        "TELEGRAM_WEBHOOK_SECRET_TOKEN_ENV_KEY",
+        "WHATSAPP_VERIFY_SIGNATURE",
+        "WHATSAPP_APP_SECRET_ENV_KEY",
+        "CAPTURE_FAILED_EVENTS",
+        "requirements_ref",
+        "WorkerQueue",
+    ]:
+        assert expected in bootstrap

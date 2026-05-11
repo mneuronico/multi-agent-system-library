@@ -47,6 +47,47 @@ SYNC_TOKENS_S3=$(jq -r '.sync_tokens_s3 // true' "${CONF}")
 TOKENS_PREFIX=$(jq -r '.tokens_s3_prefix // "secrets"' "${CONF}")
 VERBOSE=$(jq -r '.verbose // false' "${CONF}")
 LAMBDA_TIMEOUT=$(jq -r '.lambda_timeout // 120' "${CONF}")
+VISIBILITY_TIMEOUT=$((LAMBDA_TIMEOUT + 30))
+
+BUSY_POLICY=$(jq -r '.busy_policy // "drop"' "${CONF}")
+PERSIST_FILES_S3=$(jq -r '.persist_files_s3 // false' "${CONF}")
+FILES_PREFIX=$(jq -r '.files_s3_prefix // "files"' "${CONF}")
+
+HISTORY_MODE=$(jq -r '.history_mode // empty' "${CONF}")
+[[ -z "${HISTORY_MODE}" || "${HISTORY_MODE}" == "null" ]] && HISTORY_MODE="per_user"
+HISTORY_ROTATION=$(jq -r '.history_rotation // "message_count"' "${CONF}")
+HISTORY_MAX_MESSAGES=$(jq -r '.history_max_messages // 1000' "${CONF}")
+HISTORY_PERIOD=$(jq -r '.history_period // "1w"' "${CONF}")
+
+MANAGER_KWARGS_JSON=$(jq -c '.runtime.manager_kwargs // {}' "${CONF}")
+BOT_KWARGS_JSON=$(jq -c '.runtime.bot_kwargs // {}' "${CONF}")
+ENSURE_DELIVERY=$(jq -r '.runtime.ensure_delivery // true' "${CONF}")
+DELIVERY_TIMEOUT=$(jq -r '.runtime.delivery_timeout // 60.0' "${CONF}")
+MAX_ALLOWED_MESSAGE_DELAY=$(jq -r '.runtime.max_allowed_message_delay // empty' "${CONF}")
+
+TELEGRAM_SECRET_ENV_KEY=$(jq -r '.webhook_security.telegram_secret_token_env_key // empty' "${CONF}")
+[[ -z "${TELEGRAM_SECRET_ENV_KEY}" || "${TELEGRAM_SECRET_ENV_KEY}" == "null" ]] && TELEGRAM_SECRET_ENV_KEY="TELEGRAM_WEBHOOK_SECRET_TOKEN"
+WHATSAPP_VERIFY_SIGNATURE=$(jq -r '.webhook_security.whatsapp_verify_signature // false' "${CONF}")
+WHATSAPP_APP_SECRET_ENV_KEY=$(jq -r '.webhook_security.whatsapp_app_secret_env_key // empty' "${CONF}")
+[[ -z "${WHATSAPP_APP_SECRET_ENV_KEY}" || "${WHATSAPP_APP_SECRET_ENV_KEY}" == "null" ]] && WHATSAPP_APP_SECRET_ENV_KEY="WHATSAPP_APP_SECRET"
+
+CAPTURE_FAILED_EVENTS=$(jq -r '.failure_handling.capture_failed_events // false' "${CONF}")
+WORKER_DLQ=$(jq -r '.failure_handling.worker_dlq // false' "${CONF}")
+
+LAMBDA_RUNTIME=$(jq -r '.infra.runtime // "python3.9"' "${CONF}")
+ARCHITECTURE=$(jq -r '.infra.architecture // "x86_64"' "${CONF}")
+MEMORY_SIZE=$(jq -r '.infra.memory_size // 256' "${CONF}")
+LOG_RETENTION_DAYS=$(jq -r '.infra.log_retention_days // empty' "${CONF}")
+RESERVED_CONCURRENCY=$(jq -r '.infra.reserved_concurrency // empty' "${CONF}")
+S3_VERSIONING=$(jq -r '.infra.s3_versioning // false' "${CONF}")
+S3_LIFECYCLE_DAYS=$(jq -r '.infra.s3_lifecycle_days // empty' "${CONF}")
+S3_ENCRYPTION=$(jq -r '.infra.s3_encryption // empty' "${CONF}")
+TRACING_ENABLED=$(jq -r '.infra.tracing // true' "${CONF}")
+FUNCTION_TRACING="Active"
+[[ "${TRACING_ENABLED}" == "false" ]] && FUNCTION_TRACING="PassThrough"
+
+REQUIREMENTS_SOURCE=$(jq -r '.requirements_source // "git"' "${CONF}")
+REQUIREMENTS_REF=$(jq -r '.requirements_ref // empty' "${CONF}")
 
 TELEGRAM_ENV_KEY=$(jq -r '.telegram.env_token_key // empty' "${CONF}")
 [[ -z "${TELEGRAM_ENV_KEY}" || "${TELEGRAM_ENV_KEY}" == "null" ]] && TELEGRAM_ENV_KEY="TELEGRAM_TOKEN"
@@ -87,10 +128,33 @@ set +a
 
 # --- requirements.txt ---
 echo ">> Generating requirements.txt"
+MAS_EXTRA="maws,telegram,whatsapp,env"
+case "${REQUIREMENTS_SOURCE}" in
+  pypi)
+    if [[ -n "${REQUIREMENTS_REF}" && "${REQUIREMENTS_REF}" != "null" ]]; then
+      MAS_REQUIREMENT="mas[${MAS_EXTRA}]==${REQUIREMENTS_REF}"
+    else
+      MAS_REQUIREMENT="mas[${MAS_EXTRA}]"
+    fi
+    ;;
+  local)
+    if [[ -z "${REQUIREMENTS_REF}" || "${REQUIREMENTS_REF}" == "null" ]]; then
+      echo "requirements_source=local requires requirements_ref to point at a local package path"
+      exit 1
+    fi
+    MAS_REQUIREMENT="${REQUIREMENTS_REF}"
+    ;;
+  git|*)
+    MAS_REQUIREMENT="mas[${MAS_EXTRA}] @ git+https://github.com/mneuronico/multi-agent-system-library.git"
+    if [[ -n "${REQUIREMENTS_REF}" && "${REQUIREMENTS_REF}" != "null" ]]; then
+      MAS_REQUIREMENT="${MAS_REQUIREMENT}@${REQUIREMENTS_REF}"
+    fi
+    ;;
+esac
 {
   echo "requests"
   echo "boto3"
-  echo "mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git"
+  echo "${MAS_REQUIREMENT}"
   for r in "${EXTRA_REQ[@]}"; do echo "$r"; done
 } | awk 'NF' | sort -u > requirements.txt
 
@@ -150,13 +214,13 @@ Description: ${PROJECT}
 Globals:
   Function:
     Timeout: ${LAMBDA_TIMEOUT}
-    Runtime: python3.9
-    MemorySize: 256
-    Tracing: Active
+    Runtime: ${LAMBDA_RUNTIME}
+    MemorySize: ${MEMORY_SIZE}
+    Tracing: ${FUNCTION_TRACING}
     LoggingConfig:
       LogFormat: JSON
   Api:
-    TracingEnabled: true
+    TracingEnabled: ${TRACING_ENABLED}
 
 Parameters:
   EnvParamName:
@@ -182,15 +246,84 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: ${HISTORY_BUCKET}
+EOF
 
+if [[ "${S3_VERSIONING}" == "true" ]]; then
+  cat >> template.yaml <<'EOF'
+      VersioningConfiguration:
+        Status: Enabled
+EOF
+fi
+
+if [[ -n "${S3_ENCRYPTION}" && "${S3_ENCRYPTION}" != "null" ]]; then
+  cat >> template.yaml <<EOF
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: ${S3_ENCRYPTION}
+EOF
+fi
+
+if [[ -n "${S3_LIFECYCLE_DAYS}" && "${S3_LIFECYCLE_DAYS}" != "null" ]]; then
+  cat >> template.yaml <<EOF
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireMawsObjects
+            Status: Enabled
+            ExpirationInDays: ${S3_LIFECYCLE_DAYS}
+EOF
+fi
+
+if [[ "${BUSY_POLICY}" == "fifo" && "${WORKER_DLQ}" == "true" ]]; then
+  cat >> template.yaml <<EOF
+  ${PROJECT_LOGICAL}WorkerDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "\${AWS::StackName}-worker-dlq.fifo"
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+EOF
+fi
+
+if [[ "${BUSY_POLICY}" == "fifo" ]]; then
+  cat >> template.yaml <<EOF
+  ${PROJECT_LOGICAL}WorkerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "\${AWS::StackName}-worker.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: ${VISIBILITY_TIMEOUT}
+EOF
+  if [[ "${WORKER_DLQ}" == "true" ]]; then
+    cat >> template.yaml <<EOF
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ${PROJECT_LOGICAL}WorkerDlq.Arn
+        maxReceiveCount: 3
+EOF
+  fi
+  echo "" >> template.yaml
+fi
+
+cat >> template.yaml <<EOF
   ${FUNC_ID}:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: .
       Handler: lambda_function.lambda_handler
-      Runtime: python3.9
+      Runtime: ${LAMBDA_RUNTIME}
       Description: "MAS Bot Lambda"
-      Architectures: [ x86_64 ]
+      Architectures: [ ${ARCHITECTURE} ]
+EOF
+
+if [[ -n "${RESERVED_CONCURRENCY}" && "${RESERVED_CONCURRENCY}" != "null" ]]; then
+  cat >> template.yaml <<EOF
+      ReservedConcurrentExecutions: ${RESERVED_CONCURRENCY}
+EOF
+fi
+
+cat >> template.yaml <<EOF
       Policies:
         - AWSLambdaBasicExecutionRole
         - AWSXRayDaemonWriteAccess
@@ -209,6 +342,18 @@ Resources:
             - Effect: Allow
               Action: [ "lambda:InvokeFunction" ]
               Resource: "*"
+EOF
+
+if [[ "${BUSY_POLICY}" == "fifo" ]]; then
+  cat >> template.yaml <<EOF
+        - Statement:
+            - Effect: Allow
+              Action: [ "sqs:SendMessage" ]
+              Resource: !GetAtt ${PROJECT_LOGICAL}WorkerQueue.Arn
+EOF
+fi
+
+cat >> template.yaml <<EOF
         - Statement:
             - Effect: Allow
               Action:
@@ -223,11 +368,42 @@ Resources:
           BUCKET_NAME: "${HISTORY_BUCKET}"
           ENV_PARAMETER_NAME: "${ENV_PARAM}"
 
+          # Runtime behavior
+          MAWS_BUSY_POLICY: "${BUSY_POLICY}"
+          PERSIST_FILES_S3: "${PERSIST_FILES_S3}"
+          FILES_S3_PREFIX: "${FILES_PREFIX}"
+          HISTORY_MODE: "${HISTORY_MODE}"
+          HISTORY_ROTATION: "${HISTORY_ROTATION}"
+          HISTORY_MAX_MESSAGES: "${HISTORY_MAX_MESSAGES}"
+          HISTORY_PERIOD: "${HISTORY_PERIOD}"
+          MAWS_MANAGER_KWARGS_JSON: '${MANAGER_KWARGS_JSON}'
+          MAWS_BOT_KWARGS_JSON: '${BOT_KWARGS_JSON}'
+          ENSURE_DELIVERY: "${ENSURE_DELIVERY}"
+          DELIVERY_TIMEOUT: "${DELIVERY_TIMEOUT}"
+          MAX_ALLOWED_MESSAGE_DELAY: "${MAX_ALLOWED_MESSAGE_DELAY}"
+
           # Tokens / files
           SYNC_TOKENS_S3: "${SYNC_TOKENS_S3}"
           TOKENS_S3_PREFIX: "${TOKENS_PREFIX}"
           SPECIAL_TOKEN_FILES_JSON: '${SPECIAL_JSON}'
           TOKEN_ENV_MAP_JSON: '${TOKEN_ENV_MAP}'
+
+          # Provider-supported webhook security
+          TELEGRAM_WEBHOOK_SECRET_TOKEN_ENV_KEY: "${TELEGRAM_SECRET_ENV_KEY}"
+          WHATSAPP_VERIFY_SIGNATURE: "${WHATSAPP_VERIFY_SIGNATURE}"
+          WHATSAPP_APP_SECRET_ENV_KEY: "${WHATSAPP_APP_SECRET_ENV_KEY}"
+
+          # Failure capture
+          CAPTURE_FAILED_EVENTS: "${CAPTURE_FAILED_EVENTS}"
+EOF
+
+if [[ "${BUSY_POLICY}" == "fifo" ]]; then
+  cat >> template.yaml <<EOF
+          MAWS_QUEUE_URL: !Ref ${PROJECT_LOGICAL}WorkerQueue
+EOF
+fi
+
+cat >> template.yaml <<EOF
 
           # Locks
           LOCKS_TABLE_NAME: !Ref ProcessingLocksTable
@@ -251,6 +427,27 @@ else
         WhatsAppWebhookPOST:
           Type: Api
           Properties: { Path: "${API_PATH}", Method: post }
+EOF
+fi
+
+if [[ "${BUSY_POLICY}" == "fifo" ]]; then
+  cat >> template.yaml <<EOF
+        WorkerQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ${PROJECT_LOGICAL}WorkerQueue.Arn
+            BatchSize: 1
+EOF
+fi
+
+if [[ -n "${LOG_RETENTION_DAYS}" && "${LOG_RETENTION_DAYS}" != "null" ]]; then
+  cat >> template.yaml <<EOF
+
+  ${PROJECT_LOGICAL}FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/\${${FUNC_ID}}"
+      RetentionInDays: ${LOG_RETENTION_DAYS}
 EOF
 fi
 
@@ -307,14 +504,19 @@ touch "${STATE_FILE}"
 if [[ "${BOT}" == "telegram" ]]; then
   KEY="${TELEGRAM_ENV_KEY:-TELEGRAM_TOKEN}"
   TOKEN="${!KEY:-}"
+  SECRET_KEY="${TELEGRAM_SECRET_ENV_KEY:-TELEGRAM_WEBHOOK_SECRET_TOKEN}"
+  SECRET_TOKEN="${!SECRET_KEY:-}"
   if [[ -z "${TOKEN}" ]]; then
     echo "[WARN] Could not find ${KEY} in .env.prod; cannot set the Telegram webhook."
   else
     PREV=$(jq -r '."telegram_webhook" // empty' "${STATE_FILE}" 2>/dev/null || true)
     if [[ "${PREV}" != "${WEBHOOK_URL}" ]]; then
       echo ">> Setting Telegram webhook..."
-      curl -s "https://api.telegram.org/bot${TOKEN}/setWebhook" \
-        -d "url=${WEBHOOK_URL}" >/dev/null
+      CURL_ARGS=(-d "url=${WEBHOOK_URL}")
+      if [[ -n "${SECRET_TOKEN}" ]]; then
+        CURL_ARGS+=(-d "secret_token=${SECRET_TOKEN}")
+      fi
+      curl -s "https://api.telegram.org/bot${TOKEN}/setWebhook" "${CURL_ARGS[@]}" >/dev/null
       tmp=$(mktemp)
       jq --arg url "${WEBHOOK_URL}" '.telegram_webhook=$url' "${STATE_FILE}" 2>/dev/null > "$tmp" || echo "{\"telegram_webhook\":\"${WEBHOOK_URL}\"}" > "$tmp"
       mv "$tmp" "${STATE_FILE}"
@@ -329,6 +531,11 @@ else
   echo "      ${WEBHOOK_URL}"
   echo "    - Verify token (from .env.prod) => key: ${WHATSAPP_VERIFY_ENV_KEY:-WHATSAPP_VERIFY_TOKEN}"
   echo "    - Remember to add the same verify token in your Meta app."
+  if [[ "${WHATSAPP_VERIFY_SIGNATURE}" == "true" ]]; then
+    echo "    - POST signature verification is enabled; .env.prod must contain ${WHATSAPP_APP_SECRET_ENV_KEY}."
+  else
+    echo "    - For production, consider setting webhook_security.whatsapp_verify_signature=true and ${WHATSAPP_APP_SECRET_ENV_KEY}."
+  fi
 fi
 
 echo "[OK] Done."
