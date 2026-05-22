@@ -86,7 +86,7 @@ TRACING_ENABLED=$(jq -r '.infra.tracing // true' "${CONF}")
 FUNCTION_TRACING="Active"
 [[ "${TRACING_ENABLED}" == "false" ]] && FUNCTION_TRACING="PassThrough"
 
-REQUIREMENTS_SOURCE=$(jq -r '.requirements_source // "pypi"' "${CONF}")
+REQUIREMENTS_SOURCE=$(jq -r '.requirements_source // "git"' "${CONF}")
 REQUIREMENTS_REF=$(jq -r '.requirements_ref // empty' "${CONF}")
 
 TELEGRAM_ENV_KEY=$(jq -r '.telegram.env_token_key // empty' "${CONF}")
