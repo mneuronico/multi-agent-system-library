@@ -2659,14 +2659,25 @@ class AgentSystemManager:
         self._component_order.append(name)
         return name
 
-    def create_automation(self, name: Optional[str] = None, sequence: List[Union[str, dict]] = None, description: str = None):
+    def create_automation(
+        self,
+        name: Optional[str] = None,
+        sequence: List[Union[str, dict]] = None,
+        description: str = None,
+        parallel: bool = True
+    ):
         if name is None:
             name = self._generate_automation_name()
 
         if name in self.automations:
             raise ValueError(f"Automation '{name}' already exists.")
 
-        automation = Automation(name=name, sequence=sequence, description=description)
+        automation = Automation(
+            name=name,
+            sequence=sequence,
+            description=description,
+            parallel=parallel,
+        )
         automation.manager = self
         self.automations[name] = automation
         self._component_order.append(name)
@@ -3403,7 +3414,7 @@ class AgentSystemManager:
                 )),
             })
         else:
-            for attr in ("default_output", "inputs", "outputs", "sequence", "description"):
+            for attr in ("default_output", "inputs", "outputs", "sequence", "parallel", "description"):
                 if hasattr(component, attr):
                     config[attr] = self.resolve_runtime_value(getattr(component, attr), uid, name)
             for param_name, param_value in overrides.items():
@@ -3504,7 +3515,8 @@ class AgentSystemManager:
             self.create_automation(
                 name=name,
                 sequence=self._resolve_automation_sequence(component.get("sequence", [])),
-                description=description
+                description=description,
+                parallel=component.get("parallel", True)
             )
 
         else:

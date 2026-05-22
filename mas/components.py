@@ -3034,27 +3034,459 @@ class Process(Component):
 
 
 class Automation(Component):
-    def __init__(self, name: str, sequence: List[Union[str, dict]], description: str = None):
+    def __init__(
+        self,
+        name: str,
+        sequence: List[Union[str, dict]],
+        description: str = None,
+        parallel: bool = True
+    ):
         super().__init__(name)
         self.sequence = sequence
         self.description = description if description else "Automation"
+        self.parallel = True if parallel is None else bool(parallel)
 
     def to_string(self) -> str:
-        return f"Name: {self.name}\nSequence: {self.sequence}\nDescription: {self.description}"
+        return (
+            f"Name: {self.name}\n"
+            f"Sequence: {self.sequence}\n"
+            f"Parallel: {self.parallel}\n"
+            f"Description: {self.description}"
+        )
 
     def run(self, verbose: bool = False,
             on_update: Optional[Callable] = None,
             on_update_params: Optional[Dict] = None,
             return_token_count = False) -> Dict:
         db_conn = self.manager._get_user_db()
-        current_output = {}
-
-        for step in self.sequence:
-            current_output = self._execute_step(step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
+        current_output = self._execute_sequence(
+            self._runtime_sequence(),
+            {},
+            db_conn,
+            verbose,
+            on_update,
+            on_update_params,
+            return_token_count
+        )
 
         if verbose:
             logger.info(f"[Automation:{self.name}] => Execution completed.")
         return current_output
+
+    def _runtime_config(self) -> Dict[str, Any]:
+        resolver = getattr(self.manager, "resolve_component_runtime_config", None)
+        if callable(resolver):
+            cfg = resolver(self)
+            if isinstance(cfg, dict):
+                return cfg
+        return {}
+
+    def _runtime_sequence(self) -> List[Union[str, dict]]:
+        cfg = self._runtime_config()
+        sequence = cfg.get("sequence", self.sequence)
+        return copy.deepcopy(sequence) if isinstance(sequence, list) else []
+
+    def _runtime_parallel(self) -> bool:
+        cfg = self._runtime_config()
+        return bool(cfg.get("parallel", self.parallel))
+
+    def _resolve_step_runtime(self, step):
+        resolver = getattr(self.manager, "resolve_runtime_value", None)
+        if callable(resolver):
+            return resolver(step, component_name=self.name)
+        return step
+
+    def _execute_sequence(self, sequence, current_output, db_conn, verbose,
+                          on_update=None, on_update_params=None,
+                          return_token_count=False):
+        if not self._runtime_parallel():
+            for step in sequence:
+                current_output = self._execute_step(
+                    step,
+                    current_output,
+                    db_conn,
+                    verbose,
+                    on_update,
+                    on_update_params,
+                    return_token_count
+                )
+            return current_output
+
+        pending_string_steps = []
+        for step in sequence:
+            if isinstance(step, str) and not self._string_step_must_run_serial(step):
+                pending_string_steps.append(self._resolve_step_runtime(step))
+                continue
+
+            current_output = self._flush_parallel_string_steps(
+                pending_string_steps,
+                current_output,
+                db_conn,
+                verbose,
+                on_update,
+                on_update_params,
+                return_token_count
+            )
+            pending_string_steps = []
+            current_output = self._execute_step(
+                step,
+                current_output,
+                db_conn,
+                verbose,
+                on_update,
+                on_update_params,
+                return_token_count
+            )
+
+        return self._flush_parallel_string_steps(
+            pending_string_steps,
+            current_output,
+            db_conn,
+            verbose,
+            on_update,
+            on_update_params,
+            return_token_count
+        )
+
+    def _string_step_must_run_serial(self, step: str) -> bool:
+        if self._contains_runtime_placeholder(step):
+            return True
+
+        try:
+            comp_name, *_ = self._parse_automation_step_string(step)
+        except Exception:
+            return True
+
+        comp = self.manager._get_component(comp_name)
+        if comp is None or isinstance(comp, Automation):
+            return True
+
+        if self._component_uses_manager_directly(comp):
+            return True
+
+        return self._component_has_runtime_placeholders(comp)
+
+    def _contains_runtime_placeholder(self, value) -> bool:
+        if isinstance(value, str):
+            return "$" in value
+        if isinstance(value, dict):
+            return any(
+                self._contains_runtime_placeholder(k) or self._contains_runtime_placeholder(v)
+                for k, v in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(self._contains_runtime_placeholder(item) for item in value)
+        return False
+
+    def _component_has_runtime_placeholders(self, comp) -> bool:
+        attrs = []
+        if isinstance(comp, Agent):
+            attrs = [
+                comp.system_prompt,
+                comp.system_prompt_original,
+                comp.required_outputs,
+                comp.models,
+                comp.default_output,
+                comp.positive_filter,
+                comp.negative_filter,
+                comp.model_params,
+                comp.include_timestamp,
+                comp.timeout,
+            ]
+        elif isinstance(comp, Tool):
+            attrs = [comp.inputs, comp.outputs, comp.default_output]
+        elif isinstance(comp, Process):
+            attrs = [comp.description]
+        return any(self._contains_runtime_placeholder(attr) for attr in attrs)
+
+    def _component_uses_manager_directly(self, comp) -> bool:
+        if isinstance(comp, Tool):
+            return bool(getattr(comp, "expects_manager", False))
+        if isinstance(comp, Process):
+            return "manager" in getattr(comp, "expected_params", [])
+        return False
+
+    def _flush_parallel_string_steps(self, steps, current_output, db_conn, verbose,
+                                     on_update=None, on_update_params=None,
+                                     return_token_count=False):
+        steps = [step for step in steps if isinstance(step, str)]
+        if not steps:
+            return current_output
+        if len(steps) == 1:
+            return self._execute_step(
+                steps[0],
+                current_output,
+                db_conn,
+                verbose,
+                on_update,
+                on_update_params,
+                return_token_count
+            )
+
+        nodes = self._build_parallel_step_nodes(steps)
+        active_user_id = self.manager._active_user_id()
+        max_workers = min(len(nodes), 32)
+        pending = {node["index"] for node in nodes}
+        running = {}
+        completed = {}
+        committed = set()
+        next_commit = 0
+
+        def submit_ready(executor):
+            submitted = False
+            for node in nodes:
+                idx = node["index"]
+                if idx not in pending:
+                    continue
+                if not node["dependencies"].issubset(committed):
+                    continue
+                future = executor.submit(
+                    self._run_string_step_without_commit,
+                    node,
+                    active_user_id,
+                    verbose,
+                    on_update,
+                    return_token_count
+                )
+                running[future] = idx
+                pending.remove(idx)
+                submitted = True
+            return submitted
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            submit_ready(executor)
+            while next_commit < len(nodes):
+                while next_commit in completed:
+                    result = completed.pop(next_commit)
+                    if "exception" in result:
+                        raise result["exception"]
+                    current_output = self._commit_string_step_result(
+                        result,
+                        current_output,
+                        db_conn,
+                        verbose,
+                        on_update,
+                        on_update_params
+                    )
+                    committed.add(next_commit)
+                    next_commit += 1
+                    submit_ready(executor)
+
+                if next_commit >= len(nodes):
+                    break
+
+                if not running:
+                    if not submit_ready(executor):
+                        raise RuntimeError(
+                            f"[Automation:{self.name}] Parallel scheduler stalled; "
+                            "no runnable steps remain."
+                        )
+                    continue
+
+                done, _ = wait(running.keys(), return_when=FIRST_COMPLETED)
+                for future in done:
+                    idx = running.pop(future)
+                    try:
+                        completed[idx] = future.result()
+                    except Exception as exc:
+                        completed[idx] = {"exception": exc}
+
+        return current_output
+
+    def _build_parallel_step_nodes(self, steps) -> List[dict]:
+        nodes = []
+        prior_indices_by_component: Dict[str, List[int]] = {}
+
+        for idx, step in enumerate(steps):
+            (
+                comp_name,
+                parsed_target_input,
+                parsed_target_index,
+                parsed_target_fields,
+                parsed_target_custom
+            ) = self._parse_automation_step_string(step)
+            parsed = self.manager.parser.parse_input_string(step)
+            comp = self.manager._get_component(comp_name)
+            previous_indices = set(range(idx))
+            dependencies = self._infer_step_dependencies(
+                parsed,
+                comp,
+                idx,
+                previous_indices,
+                prior_indices_by_component,
+            )
+
+            if comp_name in prior_indices_by_component:
+                dependencies.add(prior_indices_by_component[comp_name][-1])
+
+            nodes.append({
+                "index": idx,
+                "step": step,
+                "component_name": comp_name,
+                "component": comp,
+                "target_input": parsed_target_input,
+                "target_index": parsed_target_index,
+                "target_fields": parsed_target_fields,
+                "target_custom": parsed_target_custom,
+                "dependencies": dependencies,
+            })
+            prior_indices_by_component.setdefault(comp_name, []).append(idx)
+
+        return nodes
+
+    def _infer_step_dependencies(
+        self,
+        parsed: dict,
+        comp,
+        step_index: int,
+        previous_indices: set,
+        prior_indices_by_component: Dict[str, List[int]]
+    ) -> set:
+        if step_index == 0:
+            return set()
+
+        if comp is None or isinstance(comp, Automation):
+            return previous_indices
+
+        if self._component_uses_manager_directly(comp):
+            return previous_indices
+
+        if self._has_timeline_selection(parsed):
+            selection = parsed.get("selection") or {}
+            selector = selection.get("selector") or {}
+            global_index = selection.get("global_index")
+            if global_index not in (None, "~"):
+                return previous_indices
+
+            selector_type = selector.get("type")
+            if selector_type in {"all", "exclude"}:
+                if selector_type == "exclude":
+                    excluded = set(selector.get("components", []) or [])
+                    return {
+                        idx
+                        for name, indices in prior_indices_by_component.items()
+                        if name not in excluded
+                        for idx in indices
+                    }
+                return previous_indices
+
+            if selector_type == "include":
+                return self._dependencies_for_sources(
+                    selector.get("sources", []) or [],
+                    prior_indices_by_component,
+                )
+
+        if parsed.get("multiple_sources"):
+            return self._dependencies_for_sources(
+                parsed["multiple_sources"],
+                prior_indices_by_component,
+            )
+
+        if parsed.get("single_source"):
+            source = parsed["single_source"].get("component")
+            if source:
+                return self._dependencies_for_source_name(source, prior_indices_by_component)
+            return previous_indices
+
+        if isinstance(comp, Tool):
+            return {step_index - 1}
+
+        return previous_indices
+
+    def _dependencies_for_sources(self, sources, prior_indices_by_component) -> set:
+        dependencies = set()
+        for source in sources:
+            name = source.get("component") if isinstance(source, dict) else None
+            dependencies.update(self._dependencies_for_source_name(name, prior_indices_by_component))
+        return dependencies
+
+    def _dependencies_for_source_name(self, name, prior_indices_by_component) -> set:
+        if not name or name not in prior_indices_by_component:
+            return set()
+        return {prior_indices_by_component[name][-1]}
+
+    def _run_string_step_without_commit(
+        self,
+        node: dict,
+        active_user_id: Optional[str],
+        verbose: bool,
+        on_update: Optional[Callable],
+        return_token_count: bool
+    ) -> dict:
+        if active_user_id is not None:
+            self.manager.set_current_user(active_user_id)
+        comp = node["component"]
+        if comp is None:
+            if verbose:
+                logger.warning(
+                    f"[Automation:{self.name}] => no such component "
+                    f"'{node['component_name']}'. Skipping."
+                )
+            return {"node": node, "component": None, "output": None, "skipped": True}
+
+        output = self._run_component_step(
+            comp,
+            node["target_input"],
+            node["target_index"],
+            node["target_fields"],
+            node["target_custom"],
+            verbose,
+            on_update,
+            return_token_count
+        )
+        return {"node": node, "component": comp, "output": output, "skipped": False}
+
+    def _run_component_step(
+        self,
+        comp,
+        parsed_target_input,
+        parsed_target_index,
+        parsed_target_fields,
+        parsed_target_custom,
+        verbose,
+        on_update=None,
+        return_token_count=False
+    ):
+        if isinstance(comp, Automation):
+            return comp.run(
+                verbose=verbose,
+                on_update=lambda messages, manager=None: self.manager._invoke_callback(on_update, messages, manager),
+                return_token_count=return_token_count
+            )
+        if isinstance(comp, Agent):
+            return comp.run(
+                verbose=verbose,
+                target_input=parsed_target_input,
+                target_index=parsed_target_index,
+                target_fields=parsed_target_fields,
+                target_custom=parsed_target_custom,
+                return_token_count=return_token_count
+            )
+        return comp.run(
+            verbose=verbose,
+            target_input=parsed_target_input,
+            target_index=parsed_target_index,
+            target_fields=parsed_target_fields,
+            target_custom=parsed_target_custom
+        )
+
+    def _commit_string_step_result(self, result, current_output, db_conn, verbose,
+                                   on_update=None, on_update_params=None):
+        if result.get("skipped"):
+            return current_output
+
+        comp = result["component"]
+        step_output = result["output"]
+        self.manager._save_component_output(db_conn, comp, step_output, verbose)
+
+        if on_update:
+            self.manager._invoke_callback(
+                on_update,
+                self.manager.get_messages(self.manager._active_user_id()),
+                self.manager,
+                on_update_params,
+            )
+        return step_output
 
     def _execute_step(self, step, current_output, db_conn, verbose,
                       on_update = None, on_update_params = None,
@@ -3081,39 +3513,24 @@ class Automation(Component):
             if verbose:
                 logger.debug(f"[Automation:{self.name}] => running component '{comp_name}'")
 
-            if isinstance(comp, Automation):
-                step_output = comp.run(
-                    verbose=verbose,
-                    on_update=lambda messages, manager=None: self.manager._invoke_callback(on_update, messages, manager),
-                    return_token_count=return_token_count
-                )
-            elif isinstance(comp, Agent):
-                step_output = comp.run(
-                    verbose=verbose,
-                    target_input=parsed_target_input,
-                    target_index=parsed_target_index,
-                    target_fields=parsed_target_fields,
-                    target_custom=parsed_target_custom,
-                    return_token_count=return_token_count
-                )
-            else:
-                step_output = comp.run(
-                    verbose=verbose,
-                    target_input=parsed_target_input,
-                    target_index=parsed_target_index,
-                    target_fields=parsed_target_fields,
-                    target_custom=parsed_target_custom
-                )
-            self.manager._save_component_output(db_conn, comp, step_output, verbose)
-
-            if on_update:
-                self.manager._invoke_callback(
-                    on_update,
-                    self.manager.get_messages(self.manager._active_user_id()),
-                    self.manager,
-                    on_update_params,
-                )
-            return step_output
+            step_output = self._run_component_step(
+                comp,
+                parsed_target_input,
+                parsed_target_index,
+                parsed_target_fields,
+                parsed_target_custom,
+                verbose,
+                on_update,
+                return_token_count
+            )
+            return self._commit_string_step_result(
+                {"component": comp, "output": step_output, "skipped": False},
+                current_output,
+                db_conn,
+                verbose,
+                on_update,
+                on_update_params
+            )
 
         elif isinstance(step, dict):
             control_flow_type = step.get("control_flow_type")
@@ -3126,8 +3543,15 @@ class Automation(Component):
                     logger.debug(f"[Automation:{self.name}] => branching condition evaluated to {condition_met}.")
 
                 next_steps = step["if_true"] if condition_met else step["if_false"]
-                for branch_step in next_steps:
-                    current_output = self._execute_step(branch_step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
+                current_output = self._execute_sequence(
+                    next_steps,
+                    current_output,
+                    db_conn,
+                    verbose,
+                    on_update,
+                    on_update_params,
+                    return_token_count
+                )
 
             elif control_flow_type == "while":
                 run_first_pass = step.get("run_first_pass", True)
@@ -3140,8 +3564,15 @@ class Automation(Component):
                     while True:
                         if verbose:
                             logger.debug(f"[Automation:{self.name}] => executing while loop body.")
-                        for nested_step in body:
-                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
+                        current_output = self._execute_sequence(
+                            body,
+                            current_output,
+                            db_conn,
+                            verbose,
+                            on_update,
+                            on_update_params,
+                            return_token_count
+                        )
 
                         if (isinstance(end_condition, bool) and end_condition) or \
                         (isinstance(end_condition, (str, dict)) and self._evaluate_condition(end_condition, current_output)):
@@ -3169,12 +3600,15 @@ class Automation(Component):
                     }
                     self.manager._save_message(db_conn, "iterator", iterator_msg, "iterator")
 
-                    for nested_step in body:
-                        current_output = self._execute_step(
-                            nested_step, current_output, db_conn, 
-                            verbose, on_update, on_update_params,
-                            return_token_count
-                        )
+                    current_output = self._execute_sequence(
+                        body,
+                        current_output,
+                        db_conn,
+                        verbose,
+                        on_update,
+                        on_update_params,
+                        return_token_count
+                    )
 
             elif control_flow_type == "switch":
                 switch_value = self._resolve_switch_value(step["value"], db_conn, verbose)
@@ -3190,8 +3624,15 @@ class Automation(Component):
                     if self._case_matches(switch_value, case_value, verbose):
                         if verbose:
                             logger.debug(f"[Automation:{self.name}] Switch matched case: {case_value}")
-                        for nested_step in case_body:
-                            current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
+                        current_output = self._execute_sequence(
+                            case_body,
+                            current_output,
+                            db_conn,
+                            verbose,
+                            on_update,
+                            on_update_params,
+                            return_token_count
+                        )
                         executed = True
                         break
                 
@@ -3200,8 +3641,15 @@ class Automation(Component):
                         if case.get("case") == "default":
                             if verbose:
                                 logger.debug(f"[Automation:{self.name}] Executing default case")
-                            for nested_step in case.get("body", []):
-                                current_output = self._execute_step(nested_step, current_output, db_conn, verbose, on_update, on_update_params, return_token_count)
+                            current_output = self._execute_sequence(
+                                case.get("body", []),
+                                current_output,
+                                db_conn,
+                                verbose,
+                                on_update,
+                                on_update_params,
+                                return_token_count
+                            )
                             break
 
             else:

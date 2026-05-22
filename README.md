@@ -960,6 +960,7 @@ Automations allow you to orchestrate multiple components (agents, tools, process
 automation_name = manager.create_automation(
     name="myautomation",   # Optional, defaults to automation-<n>
     description="Orchestrates a series of agents and tools for end-to-end processing.",
+    parallel=True,          # Optional, defaults to True
     sequence=[
         "first_agent",
         "first_tool",
@@ -991,6 +992,7 @@ automation_name = manager.create_automation(
 
 -   **`name`**: The name of the automation.  If not specified, defaults to `automation-<n>`.
 -   **`description`**: Optional description of the component, solely to be read by the developer.
+-   **`parallel`**: Whether MAS may execute independent component steps concurrently inside a single automation run. Defaults to `True`. Outputs are still committed to history, and `on_update` is still called, in the original logical sequence order.
 -   **`sequence`**: An ordered list of steps to execute. Steps can be:
     -   A string representing a component name, with an optional input specification (more on **`mas` input syntax** below).
     -   A control flow dictionary (`"branch"`, `"while"`, `"for"`, or `"switch"`) - for more details, please refer to the section below.
@@ -1004,6 +1006,7 @@ Defining an automation in the config JSON file is as simple as including it in t
       "type": "automation",
       "name": "myautomation",
       "description": "Orchestrates a series of agents and tools for end-to-end processing.",
+      "parallel": true,
       "sequence": [
         "first_agent",
         "first_tool",
@@ -1035,6 +1038,8 @@ Defining an automation in the config JSON file is as simple as including it in t
 ```
 
 Note that these examples use the `mas input syntax`, which will be explained below.
+
+When `parallel` is enabled, MAS uses the input syntax and conservative component visibility rules to infer which earlier steps a component can actually read. A step can start early only when the earlier component outputs it may read have already been committed. Finished outputs are kept pending until their original sequence position is reached, so the final history and callback order match serial execution.
 
 ### Control Flow Statements
 
