@@ -1,4 +1,6 @@
 mas.egg-info/
+dist/
+build/
 **/__pycache__/
 .pytest_cache/
 .pytest_tmp/
