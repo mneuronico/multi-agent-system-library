@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hmac
 import hashlib
+import time
 import types
 
 import pytest
@@ -201,6 +202,106 @@ def test_whatsapp_bad_signature_is_rejected_before_invocation():
     assert response["statusCode"] == 403
 
 
+def test_history_append_requires_valid_hmac_and_queues_a_worker_job():
+    runtime = object.__new__(MawsRuntime)
+    runtime.bot_type = "whatsapp"
+    runtime.history_write_secret = "history-secret"
+    runtime.busy_policy = "drop"
+    invocations = []
+    runtime.lambda_client = types.SimpleNamespace(
+        invoke=lambda **kwargs: invocations.append(kwargs) or {"StatusCode": 202}
+    )
+    body = json.dumps({
+        "chat_id": "5491100000000",
+        "event_id": "wamid.outbound-1",
+        "content": "Hola desde el bulk",
+    }, separators=(",", ":"))
+    timestamp = str(int(time.time()))
+    signature = "sha256=" + hmac.new(
+        b"history-secret",
+        timestamp.encode("ascii") + b"." + body.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    response = MawsRuntime.handle_apigw_event(
+        runtime,
+        {
+            "requestContext": {"http": {"method": "POST"}},
+            "rawPath": "/Prod/history/outgoing",
+            "headers": {
+                "X-MAWS-Timestamp": timestamp,
+                "X-MAWS-Signature": signature,
+            },
+            "body": body,
+        },
+        _Context(),
+    )
+
+    assert response["statusCode"] == 202
+    assert len(invocations) == 1
+    job = json.loads(invocations[0]["Payload"])["maws_job"]
+    assert job["operation"] == "append_history"
+    assert job["chat_id"] == "5491100000000"
+    assert job["event_id"] == "wamid.outbound-1"
+    assert job["payload"]["content"] == "Hola desde el bulk"
+
+
+def test_history_append_rejects_invalid_signature():
+    runtime = object.__new__(MawsRuntime)
+    runtime.bot_type = "whatsapp"
+    runtime.history_write_secret = "history-secret"
+    runtime.lambda_client = types.SimpleNamespace(
+        invoke=lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not invoke"))
+    )
+    body = json.dumps({
+        "chat_id": "user-1",
+        "event_id": "evt-1",
+        "content": "sent",
+    })
+
+    response = MawsRuntime.handle_apigw_event(
+        runtime,
+        {
+            "requestContext": {"http": {"method": "POST"}},
+            "rawPath": "/Prod/history/outgoing",
+            "headers": {
+                "X-MAWS-Timestamp": str(int(time.time())),
+                "X-MAWS-Signature": "sha256=bad",
+            },
+            "body": body,
+        },
+        _Context(),
+    )
+
+    assert response["statusCode"] == 403
+
+
+def test_history_append_requires_configured_secret():
+    runtime = object.__new__(MawsRuntime)
+    body = json.dumps({
+        "chat_id": "user-1",
+        "event_id": "evt-1",
+        "content": "sent",
+    })
+    timestamp = str(int(time.time()))
+
+    response = MawsRuntime.handle_apigw_event(
+        runtime,
+        {
+            "requestContext": {"http": {"method": "POST"}},
+            "rawPath": "/Prod/history/outgoing",
+            "headers": {
+                "X-MAWS-Timestamp": timestamp,
+                "X-MAWS-Signature": "sha256=unused",
+            },
+            "body": body,
+        },
+        _Context(),
+    )
+
+    assert response["statusCode"] == 503
+
+
 @pytest.mark.parametrize(
     ("event", "expected"),
     [
@@ -334,6 +435,87 @@ def test_worker_imports_processes_and_exports_per_user_history(workspace_tmp_pat
     assert ("export", "123") in calls
     assert ("release", "123") in calls
     assert runtime.s3.puts[("history-bucket", "history/123.sqlite")] == b"new-history"
+
+
+def test_worker_appends_outgoing_history_without_processing_webhook(workspace_tmp_path):
+    runtime = object.__new__(MawsRuntime)
+    runtime.bot_type = "whatsapp"
+    runtime.bucket_name = "history-bucket"
+    runtime.history_prefix = "history"
+    runtime.history_mode = "per_user"
+    runtime.TMP_DIR = str(workspace_tmp_path)
+    runtime.special_files = []
+    runtime.persist_files_s3 = False
+    runtime.capture_failed_events = False
+    runtime._loop = None
+    runtime.s3 = _FakeS3({
+        ("history-bucket", "history/5491100000000.sqlite"): b"old-history",
+    })
+    calls = []
+
+    class _Manager:
+        def import_history(self, user_id, sqlite_bytes):
+            calls.append(("import", user_id, sqlite_bytes))
+
+        def set_current_user(self, user_id):
+            calls.append(("current", user_id))
+
+        def get_messages(self, user_id):
+            return []
+
+        def add_blocks(self, content, **kwargs):
+            calls.append(("add_blocks", content, kwargs))
+
+        def export_history(self, user_id):
+            calls.append(("export", user_id))
+            return b"history-with-outgoing"
+
+    class _Bot:
+        async def process_webhook_update(self, update):
+            raise AssertionError("outgoing history must not process a webhook")
+
+    runtime.manager = _Manager()
+    runtime.bot_instance = _Bot()
+    runtime.initialize_system = lambda: None
+    runtime.try_acquire_user_lock = lambda chat_id: True
+    runtime.release_user_lock = lambda chat_id: calls.append(("release", chat_id))
+
+    response = MawsRuntime.handle_apigw_event(
+        runtime,
+        {"maws_job": {
+            "provider": "history",
+            "chat_id": "5491100000000",
+            "event_id": "wamid.outbound-1",
+            "operation": "append_history",
+            "payload": {"content": "Hola desde el bulk"},
+        }},
+        _Context(),
+    )
+
+    assert response["statusCode"] == 200
+    assert ("add_blocks", [{
+        "type": "text",
+        "content": {"response": "Hola desde el bulk"},
+        "metadata": {"maws_event_id": "wamid.outbound-1"},
+    }], {
+        "role": "assistant",
+        "msg_type": "assistant",
+        "user_id": "5491100000000",
+    }) in calls
+    assert ("export", "5491100000000") in calls
+    assert ("release", "5491100000000") in calls
+    assert runtime.s3.puts[("history-bucket", "history/5491100000000.sqlite")] == b"history-with-outgoing"
+
+
+def test_history_append_deduplicates_existing_event_id():
+    runtime = object.__new__(MawsRuntime)
+    runtime.manager = types.SimpleNamespace(get_messages=lambda user_id: [{
+        "message": [{"type": "text", "content": {"response": "sent"},
+                     "metadata": {"maws_event_id": "evt-1"}}]
+    }])
+
+    assert MawsRuntime._history_contains_external_event(runtime, "user-1", "evt-1")
+    assert not MawsRuntime._history_contains_external_event(runtime, "user-1", "evt-2")
 
 
 def test_optional_user_file_s3_persistence_round_trips(workspace_tmp_path):

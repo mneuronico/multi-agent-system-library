@@ -430,6 +430,12 @@ else
 EOF
 fi
 
+cat >> template.yaml <<'EOF'
+        HistoryAppendPOST:
+          Type: Api
+          Properties: { Path: "/history/outgoing", Method: post }
+EOF
+
 if [[ "${BUSY_POLICY}" == "fifo" ]]; then
   cat >> template.yaml <<EOF
         WorkerQueueEvent:

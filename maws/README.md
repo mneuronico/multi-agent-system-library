@@ -90,6 +90,7 @@ That's it. `maws` wires everything to MAS, handles webhook GET/POST, background 
 | `TELEGRAM_WEBHOOK_SECRET_TOKEN` | No  | none         | Provider-supported Telegram webhook secret token.                    |
 | `WHATSAPP_VERIFY_SIGNATURE` | No      | `"false"`   | When `true`, verify WhatsApp `X-Hub-Signature-256`.                  |
 | `WHATSAPP_APP_SECRET`      | If verifying | none    | Meta app secret used for WhatsApp signature verification.            |
+| `MAWS_HISTORY_WRITE_SECRET` | For history writes | none | Shared secret used to authenticate external history append requests. |
 | `MAWS_MANAGER_KWARGS_JSON` | No       | `"{}"`       | Extra kwargs for `AgentSystemManager`; MAWS-managed paths still win. |
 | `MAWS_BOT_KWARGS_JSON`     | No       | `"{}"`       | Extra kwargs for the selected MAS bot constructor.                   |
 | `CAPTURE_FAILED_EVENTS`    | No       | `"false"`    | Write failed jobs/events to S3 under `failed-events/`.               |
@@ -237,7 +238,37 @@ MAWS only uses provider-supported webhook security mechanisms:
 * **Telegram**: set `TELEGRAM_WEBHOOK_SECRET_TOKEN` in `.env.prod`. During deploy, MAWS passes it to Telegram `setWebhook` as `secret_token`. At runtime, MAWS requires incoming POSTs to include the matching `X-Telegram-Bot-Api-Secret-Token` header.
 * **WhatsApp**: keep the existing GET verify-token flow. For POST authenticity, set `webhook_security.whatsapp_verify_signature=true` in `params.json` and set `WHATSAPP_APP_SECRET` in `.env.prod`. MAWS verifies `X-Hub-Signature-256` against the raw request body.
 
+The `/history/outgoing` endpoint is separate from the provider webhook and always requires `MAWS_HISTORY_WRITE_SECRET`. It verifies `X-MAWS-Timestamp` and `X-MAWS-Signature`; the signature is `sha256=` plus the HMAC-SHA256 of `<timestamp>.<raw-body>`. Requests more than five minutes from the current time are rejected.
+
 Both checks are opt-in so existing bots do not break. Production deployments should enable the matching provider mechanism.
+
+### Appending externally sent messages
+
+POST to `/history/outgoing` with a JSON body containing the recipient's MAWS `chat_id`, a stable `event_id`, and the message text. MAWS queues a worker job that appends the message with the `assistant` role, under the normal per-user lock and S3 history import/export lifecycle. It does not call `process_webhook_update`. The event ID is stored in block metadata so retries do not append the same message twice.
+
+```json
+{
+  "chat_id": "5491100000000",
+  "event_id": "wamid.outbound-1",
+  "content": "Hola desde el envio masivo"
+}
+```
+
+Sign the exact serialized request body and send both headers:
+
+```js
+const timestamp = String(Math.floor(Date.now() / 1000));
+const signature = createHmac("sha256", historyWriteSecret)
+  .update(`${timestamp}.${rawBody}`)
+  .digest("hex");
+
+headers: {
+  "X-MAWS-Timestamp": timestamp,
+  "X-MAWS-Signature": `sha256=${signature}`,
+}
+```
+
+Store the same random secret in MAWS `.env.prod` (so it reaches Lambda through SSM) and in the sending service. A `202` response means the history write was accepted for processing, not that the WhatsApp message was delivered.
 
 ---
 

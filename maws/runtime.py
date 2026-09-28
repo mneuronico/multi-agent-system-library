@@ -221,6 +221,7 @@ class MawsRuntime:
             os.environ.get(self.whatsapp_app_secret_env_key, "")
             or os.environ.get("WHATSAPP_APP_SECRET", "")
         )
+        self.history_write_secret = os.environ.get("MAWS_HISTORY_WRITE_SECRET", "")
 
         # Failure capture. Off by default; FIFO mode can rely on SQS retries/DLQs.
         self.capture_failed_events = _as_bool(os.environ.get("CAPTURE_FAILED_EVENTS"), default=False)
@@ -807,8 +808,11 @@ class MawsRuntime:
             event.get("requestContext", {}).get("http", {}).get("method")
             or event.get("httpMethod")
         )
+        http_path = event.get("rawPath") or event.get("path") or ""
 
         if http_method == "POST":
+            if http_path.rstrip("/").endswith("/history/outgoing"):
+                return self._handle_history_append(event, context)
             return self._handle_http_post(event, context)
 
         # GET verification (WhatsApp)
@@ -829,6 +833,118 @@ class MawsRuntime:
         if not jobs:
             return {"statusCode": 400, "body": json.dumps("Invocation not recognized.")}
         return self._process_jobs(jobs, context=context, raise_on_error=False)
+
+    def _verify_history_write_signature(self, event: dict, raw_body: bytes) -> Optional[dict]:
+        secret = getattr(self, "history_write_secret", "")
+        if not secret:
+            return {
+                "statusCode": 503,
+                "body": json.dumps("MAWS_HISTORY_WRITE_SECRET is not configured."),
+            }
+
+        headers = event.get("headers") or {}
+        timestamp = _header_value(headers, "x-maws-timestamp")
+        signature = _header_value(headers, "x-maws-signature")
+        if (
+            not timestamp.isascii()
+            or not timestamp.isdigit()
+            or not signature.isascii()
+        ):
+            return {"statusCode": 403, "body": json.dumps("Forbidden")}
+        try:
+            timestamp_seconds = int(timestamp)
+        except (TypeError, ValueError):
+            return {"statusCode": 403, "body": json.dumps("Forbidden")}
+
+        if abs(time.time() - timestamp_seconds) > 300:
+            return {"statusCode": 403, "body": json.dumps("Forbidden")}
+
+        signed_body = timestamp.encode("ascii") + b"." + raw_body
+        expected = "sha256=" + hmac.new(
+            secret.encode("utf-8"), signed_body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return {"statusCode": 403, "body": json.dumps("Forbidden")}
+        return None
+
+    def _handle_history_append(self, event: dict, context):
+        raw_body = _event_body_bytes(event)
+        security_response = self._verify_history_write_signature(event, raw_body)
+        if security_response is not None:
+            return security_response
+
+        try:
+            data = json.loads(raw_body.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {"statusCode": 400, "body": json.dumps("Invalid JSON body.")}
+        if not isinstance(data, dict):
+            return {"statusCode": 400, "body": json.dumps("JSON body must be an object.")}
+
+        chat_id = data.get("chat_id")
+        event_id = data.get("event_id")
+        content = data.get("content")
+        if (
+            not isinstance(chat_id, str)
+            or not chat_id.strip()
+            or len(chat_id) > 256
+            or not isinstance(event_id, str)
+            or not event_id.strip()
+            or len(event_id) > 256
+            or not isinstance(content, str)
+            or not content.strip()
+            or len(content) > 65536
+        ):
+            return {
+                "statusCode": 400,
+                "body": json.dumps("chat_id, event_id and content are required."),
+            }
+
+        job = {
+            "maws_job_version": 1,
+            "provider": "history",
+            "bot_type": getattr(self, "bot_type", "whatsapp"),
+            "chat_id": chat_id.strip(),
+            "event_id": event_id.strip(),
+            "operation": "append_history",
+            "payload": {"content": content},
+        }
+
+        if getattr(self, "busy_policy", "drop") == "fifo":
+            queued = self._enqueue_jobs([job])
+            if queued["statusCode"] >= 300:
+                return queued
+        else:
+            try:
+                invocation = self.lambda_client.invoke(
+                    FunctionName=context.invoked_function_arn,
+                    InvocationType="Event",
+                    Payload=json.dumps({"maws_job": job}),
+                )
+                if invocation.get("StatusCode") != 202:
+                    return {"statusCode": 502, "body": json.dumps("History append could not be queued.")}
+            except Exception as e:
+                self._capture_failed_event(job, "self_invoke_failed", e)
+                return {"statusCode": 502, "body": json.dumps("History append could not be queued.")}
+
+        return {
+            "statusCode": 202,
+            "body": json.dumps({"status": "accepted", "event_id": event_id.strip()}),
+        }
+
+    def _history_contains_external_event(self, chat_id: str, event_id: str) -> bool:
+        for message in self.manager.get_messages(chat_id):
+            blocks = message.get("message", [])
+            if isinstance(blocks, dict):
+                blocks = [blocks]
+            if not isinstance(blocks, list):
+                continue
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                metadata = block.get("metadata")
+                if isinstance(metadata, dict) and metadata.get("maws_event_id") == event_id:
+                    return True
+        return False
 
     def _handle_http_post(self, event: dict, context):
         print("[maws] Received webhook POST.")
@@ -956,9 +1072,22 @@ class MawsRuntime:
             self._sync_user_files_from_s3(chat_id)
             self.manager.set_current_user(chat_id)
 
-            # Process
-            loop = self.get_event_loop()
-            loop.run_until_complete(self.bot_instance.process_webhook_update(job.get("payload") or {}))
+            if job.get("operation") == "append_history":
+                event_id = str(job.get("event_id") or "")
+                if not self._history_contains_external_event(chat_id, event_id):
+                    self.manager.add_blocks(
+                        [{
+                            "type": "text",
+                            "content": {"response": job.get("payload", {}).get("content", "")},
+                            "metadata": {"maws_event_id": event_id},
+                        }],
+                        role="assistant",
+                        msg_type="assistant",
+                        user_id=chat_id,
+                    )
+            else:
+                loop = self.get_event_loop()
+                loop.run_until_complete(self.bot_instance.process_webhook_update(job.get("payload") or {}))
         except Exception as e:
             print(f"[maws][process][ERR] {e}")
             traceback.print_exc()
