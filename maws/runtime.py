@@ -14,7 +14,7 @@ import time
 import traceback
 import types as _types
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import boto3, botocore
@@ -155,6 +155,10 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+class HistoryAppendLockBusy(RuntimeError):
+    """Raised so Lambda/SQS retries a history append instead of dropping it."""
+
+
 # -------------------------
 # Main runtime
 # -------------------------
@@ -221,7 +225,13 @@ class MawsRuntime:
             os.environ.get(self.whatsapp_app_secret_env_key, "")
             or os.environ.get("WHATSAPP_APP_SECRET", "")
         )
+
+        # External history append endpoint (/history/outgoing). Off unless explicitly enabled,
+        # so bots that do not opt in keep the exact previous request and worker paths.
+        self.history_append_enabled = _as_bool(os.environ.get("MAWS_HISTORY_APPEND_ENABLED"), default=False)
         self.history_write_secret = os.environ.get("MAWS_HISTORY_WRITE_SECRET", "")
+        self.history_append_role = os.environ.get("MAWS_HISTORY_APPEND_ROLE", "").strip()
+        self.history_append_lock_wait = _as_float(os.environ.get("MAWS_HISTORY_APPEND_LOCK_WAIT_SECONDS"), 60.0)
 
         # Failure capture. Off by default; FIFO mode can rely on SQS retries/DLQs.
         self.capture_failed_events = _as_bool(os.environ.get("CAPTURE_FAILED_EVENTS"), default=False)
@@ -808,10 +818,9 @@ class MawsRuntime:
             event.get("requestContext", {}).get("http", {}).get("method")
             or event.get("httpMethod")
         )
-        http_path = event.get("rawPath") or event.get("path") or ""
 
         if http_method == "POST":
-            if http_path.rstrip("/").endswith("/history/outgoing"):
+            if self._history_append_enabled() and self._is_history_append_path(event):
                 return self._handle_history_append(event, context)
             return self._handle_http_post(event, context)
 
@@ -833,6 +842,20 @@ class MawsRuntime:
         if not jobs:
             return {"statusCode": 400, "body": json.dumps("Invocation not recognized.")}
         return self._process_jobs(jobs, context=context, raise_on_error=False)
+
+    # -------------------------
+    # External history append (/history/outgoing)
+    # -------------------------
+    def _history_append_enabled(self) -> bool:
+        return bool(getattr(self, "history_append_enabled", False))
+
+    @staticmethod
+    def _is_history_append_path(event: dict) -> bool:
+        http_path = event.get("rawPath") or event.get("path") or ""
+        return http_path.rstrip("/").endswith("/history/outgoing")
+
+    def _is_history_append_job(self, job: dict) -> bool:
+        return self._history_append_enabled() and job.get("operation") == "append_history"
 
     def _verify_history_write_signature(self, event: dict, raw_body: bytes) -> Optional[dict]:
         secret = getattr(self, "history_write_secret", "")
@@ -910,10 +933,20 @@ class MawsRuntime:
         }
 
         if getattr(self, "busy_policy", "drop") == "fifo":
-            queued = self._enqueue_jobs([job])
+            try:
+                queued = self._enqueue_jobs([job])
+            except Exception as e:
+                print(f"[maws][history][ERR] Could not enqueue history append: {e}")
+                self._capture_failed_event(job, "enqueue_failed", e)
+                return {"statusCode": 502, "body": json.dumps("History append could not be queued.")}
             if queued["statusCode"] >= 300:
                 return queued
         else:
+            if getattr(self, "history_mode", "per_user") == "shared":
+                print(
+                    "[maws][history][WARN] Shared history with busy_policy=drop serializes every append "
+                    "behind one global lock; use busy_policy=fifo for bulk sends."
+                )
             try:
                 invocation = self.lambda_client.invoke(
                     FunctionName=context.invoked_function_arn,
@@ -945,6 +978,71 @@ class MawsRuntime:
                 if isinstance(metadata, dict) and metadata.get("maws_event_id") == event_id:
                     return True
         return False
+
+    def _wait_for_history_append_lock(self, chat_id: str, context=None):
+        """
+        Unlike webhook jobs, history appends must not be dropped when the user is busy:
+        wait for the lock, then raise so Lambda async retries (or SQS) try again later.
+        """
+        max_wait = getattr(self, "history_append_lock_wait", 60.0) or 0.0
+        get_remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
+        if callable(get_remaining_ms):
+            try:
+                # Keep ~20s for S3 import/export once the lock is acquired.
+                max_wait = min(max_wait, get_remaining_ms() / 1000.0 - 20.0)
+            except Exception:
+                pass
+        deadline = time.monotonic() + max(0.0, max_wait)
+        while not self.try_acquire_user_lock(chat_id):
+            if time.monotonic() >= deadline:
+                raise HistoryAppendLockBusy(
+                    f"History append for {chat_id} is still waiting for the user lock; retrying later."
+                )
+            time.sleep(getattr(self, "history_append_lock_poll", 1.0))
+
+    def _history_append_author(self) -> Tuple[str, str]:
+        """
+        Return (role, msg_type) for an appended message. MAS shows a message to an agent as its
+        own turn only when role == agent name, so resolve the agent that answers this bot.
+        """
+        agents = getattr(getattr(self, "manager", None), "agents", None)
+        agents = agents if isinstance(agents, dict) else {}
+
+        role = getattr(self, "history_append_role", "")
+        if not role:
+            component = getattr(getattr(self, "bot_instance", None), "component_name", None)
+            if component in agents:
+                role = component
+            elif len(agents) == 1:
+                role = next(iter(agents))
+
+        if not role:
+            print(
+                "[maws][history][WARN] Could not infer which agent answers this bot; storing the "
+                "message as 'assistant'. Set MAWS_HISTORY_APPEND_ROLE to the agent name."
+            )
+            return "assistant", "assistant"
+        if role not in agents:
+            print(f"[maws][history][WARN] MAWS_HISTORY_APPEND_ROLE={role!r} is not an agent in this system.")
+            return role, "assistant"
+        return role, "agent"
+
+    def _append_external_history(self, chat_id: str, job: dict):
+        event_id = str(job.get("event_id") or "")
+        if self._history_contains_external_event(chat_id, event_id):
+            print(f"[maws][history] Event {event_id} already in history for {chat_id}; skipping.")
+            return
+        role, msg_type = self._history_append_author()
+        self.manager.add_blocks(
+            [{
+                "type": "text",
+                "content": {"response": (job.get("payload") or {}).get("content", "")},
+                "metadata": {"maws_event_id": event_id},
+            }],
+            role=role,
+            msg_type=msg_type,
+            user_id=chat_id,
+        )
 
     def _handle_http_post(self, event: dict, context):
         print("[maws] Received webhook POST.")
@@ -1044,10 +1142,16 @@ class MawsRuntime:
         result = {"statusCode": 200, "body": json.dumps("Processed.")}
         s3_key = self.s3_sqlite_key(chat_id)
         local_db = os.path.join(getattr(self, "TMP_DIR", "/tmp"), "history", f"{_safe_key_part(chat_id)}.sqlite")
+        is_history_append = self._is_history_append_job(job)
+        if is_history_append:
+            # The caller already got a 202, so failures must surface for Lambda/SQS retries.
+            raise_on_error = True
 
         try:
             # Lock. In shared history mode this becomes a global lock/group.
-            if not self.try_acquire_user_lock(chat_id):
+            if is_history_append:
+                self._wait_for_history_append_lock(chat_id, context)
+            elif not self.try_acquire_user_lock(chat_id):
                 print(f"[maws] Another worker is processing {chat_id}. Ignoring update.")
                 result = {"statusCode": 200, "body": json.dumps("Already processing; update ignored.")}
                 return {"statusCode": 200, "body": json.dumps("Already processing; update ignored.")}
@@ -1072,20 +1176,10 @@ class MawsRuntime:
             self._sync_user_files_from_s3(chat_id)
             self.manager.set_current_user(chat_id)
 
-            if job.get("operation") == "append_history":
-                event_id = str(job.get("event_id") or "")
-                if not self._history_contains_external_event(chat_id, event_id):
-                    self.manager.add_blocks(
-                        [{
-                            "type": "text",
-                            "content": {"response": job.get("payload", {}).get("content", "")},
-                            "metadata": {"maws_event_id": event_id},
-                        }],
-                        role="assistant",
-                        msg_type="assistant",
-                        user_id=chat_id,
-                    )
+            if is_history_append:
+                self._append_external_history(chat_id, job)
             else:
+                # Process
                 loop = self.get_event_loop()
                 loop.run_until_complete(self.bot_instance.process_webhook_update(job.get("payload") or {}))
         except Exception as e:

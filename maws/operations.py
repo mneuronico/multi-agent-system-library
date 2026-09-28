@@ -762,7 +762,7 @@ def describe(
     ):
         if k in data:
             print(f"   - {k}: {data[k]}")
-    for nested in ("webhook_security", "runtime", "failure_handling", "infra"):
+    for nested in ("webhook_security", "runtime", "failure_handling", "infra", "history_append"):
         if nested in data:
             print(f"   - {nested}: {json.dumps(data[nested], sort_keys=True)}")
 
