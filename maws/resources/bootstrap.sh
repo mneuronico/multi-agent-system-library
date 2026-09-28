@@ -74,6 +74,10 @@ WHATSAPP_APP_SECRET_ENV_KEY=$(jq -r '.webhook_security.whatsapp_app_secret_env_k
 CAPTURE_FAILED_EVENTS=$(jq -r '.failure_handling.capture_failed_events // false' "${CONF}")
 WORKER_DLQ=$(jq -r '.failure_handling.worker_dlq // false' "${CONF}")
 
+# Optional external history append endpoint (/history/outgoing). Off by default.
+HISTORY_APPEND_ENABLED=$(jq -r '.history_append.enabled // false' "${CONF}")
+HISTORY_APPEND_ROLE=$(jq -r '.history_append.role // empty' "${CONF}")
+
 LAMBDA_RUNTIME=$(jq -r '.infra.runtime // "python3.9"' "${CONF}")
 ARCHITECTURE=$(jq -r '.infra.architecture // "x86_64"' "${CONF}")
 MEMORY_SIZE=$(jq -r '.infra.memory_size // 256' "${CONF}")
@@ -403,6 +407,17 @@ if [[ "${BUSY_POLICY}" == "fifo" ]]; then
 EOF
 fi
 
+if [[ "${HISTORY_APPEND_ENABLED}" == "true" ]]; then
+  cat >> template.yaml <<EOF
+          MAWS_HISTORY_APPEND_ENABLED: "true"
+EOF
+  if [[ -n "${HISTORY_APPEND_ROLE}" ]]; then
+    cat >> template.yaml <<EOF
+          MAWS_HISTORY_APPEND_ROLE: "${HISTORY_APPEND_ROLE}"
+EOF
+  fi
+fi
+
 cat >> template.yaml <<EOF
 
           # Locks
@@ -427,6 +442,14 @@ else
         WhatsAppWebhookPOST:
           Type: Api
           Properties: { Path: "${API_PATH}", Method: post }
+EOF
+fi
+
+if [[ "${HISTORY_APPEND_ENABLED}" == "true" ]]; then
+  cat >> template.yaml <<'EOF'
+        HistoryAppendPOST:
+          Type: Api
+          Properties: { Path: "/history/outgoing", Method: post }
 EOF
 fi
 
@@ -539,6 +562,13 @@ else
     echo "    - POST signature verification is enabled; .env.prod must contain ${WHATSAPP_APP_SECRET_ENV_KEY}."
   else
     echo "    - For production, consider setting webhook_security.whatsapp_verify_signature=true and ${WHATSAPP_APP_SECRET_ENV_KEY}."
+  fi
+fi
+
+if [[ "${HISTORY_APPEND_ENABLED}" == "true" ]]; then
+  echo "[INFO] History append endpoint: ${API_URL}/history/outgoing"
+  if [[ -z "${MAWS_HISTORY_WRITE_SECRET:-}" ]]; then
+    echo "[WARN] history_append.enabled=true but .env.prod has no MAWS_HISTORY_WRITE_SECRET; the endpoint will answer 503."
   fi
 fi
 
