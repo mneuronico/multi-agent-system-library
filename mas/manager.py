@@ -1502,13 +1502,11 @@ class AgentSystemManager:
             return None
 
     def _set_history_metadata(self, conn: sqlite3.Connection, key: str, value: str) -> None:
+        # INSERT OR REPLACE instead of UPSERT: AWS Lambda's python3.9 runtime ships SQLite 3.7.17,
+        # and UPSERT needs 3.24+. Equivalent here because key is the primary key of a 2-column table.
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT INTO history_metadata (key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
+            "INSERT OR REPLACE INTO history_metadata (key, value) VALUES (?, ?)",
             (key, value),
         )
         conn.commit()
@@ -3710,11 +3708,7 @@ class AgentSystemManager:
                     if remaining == 0:
                         cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
                         cur.execute(
-                            """
-                            INSERT INTO history_metadata (key, value)
-                            VALUES ('created_at', ?)
-                            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                            """,
+                            "INSERT OR REPLACE INTO history_metadata (key, value) VALUES ('created_at', ?)",
                             (self._history_now_iso(),),
                         )
                     conn.commit()
@@ -3741,11 +3735,7 @@ class AgentSystemManager:
                 cur.execute("DELETE FROM message_history")
                 cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
                 cur.execute(
-                    """
-                    INSERT INTO history_metadata (key, value)
-                    VALUES ('created_at', ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
+                    "INSERT OR REPLACE INTO history_metadata (key, value) VALUES ('created_at', ?)",
                     (self._history_now_iso(),),
                 )
                 conn.commit()
