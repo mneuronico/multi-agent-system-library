@@ -44,6 +44,7 @@ class _FakeS3:
 def test_apigw_post_acknowledges_without_initializing_system():
     runtime = object.__new__(MawsRuntime)
     runtime.bot_type = "whatsapp"
+    runtime.allow_unauthenticated_webhooks = True  # routing test; auth is covered separately
     runtime.lambda_client = types.SimpleNamespace(
         invoke=lambda **kwargs: {"StatusCode": 202}
     )
@@ -66,6 +67,7 @@ def test_apigw_post_acknowledges_without_initializing_system():
 def test_whatsapp_post_splits_batches_into_per_message_jobs():
     runtime = object.__new__(MawsRuntime)
     runtime.bot_type = "whatsapp"
+    runtime.allow_unauthenticated_webhooks = True  # routing test; auth is covered separately
     runtime.busy_policy = "drop"
     invocations = []
     runtime.lambda_client = types.SimpleNamespace(
@@ -104,6 +106,7 @@ def test_whatsapp_post_splits_batches_into_per_message_jobs():
 def test_fifo_policy_enqueues_jobs_with_stable_group_and_dedupe():
     runtime = object.__new__(MawsRuntime)
     runtime.bot_type = "telegram"
+    runtime.telegram_secret_token = "tg-secret"
     runtime.busy_policy = "fifo"
     runtime.queue_url = "https://sqs.test/queue.fifo"
     runtime.history_mode = "per_user"
@@ -114,6 +117,7 @@ def test_fifo_policy_enqueues_jobs_with_stable_group_and_dedupe():
 
     event = {
         "requestContext": {"http": {"method": "POST"}},
+        "headers": {"X-Telegram-Bot-Api-Secret-Token": "tg-secret"},
         "body": json.dumps({"update_id": 99, "message": {"message_id": 3, "chat": {"id": 123}, "text": "hi"}}),
     }
 
@@ -127,7 +131,7 @@ def test_fifo_policy_enqueues_jobs_with_stable_group_and_dedupe():
     assert json.loads(sent[0]["MessageBody"])["maws_job"]["event_id"] == "99"
 
 
-def test_telegram_secret_token_is_enforced_only_when_configured():
+def test_telegram_secret_token_is_enforced():
     runtime = object.__new__(MawsRuntime)
     runtime.bot_type = "telegram"
     runtime.telegram_secret_token = "expected"
@@ -371,7 +375,7 @@ def test_worker_lock_denied_returns_explicit_response():
         runtime.manager = object()
 
     runtime.initialize_system = initialize_system
-    runtime.try_acquire_user_lock = lambda chat_id: False
+    runtime.try_acquire_user_lock = lambda chat_id, context=None: False
 
     response = MawsRuntime.handle_apigw_event(
         runtime,
@@ -417,7 +421,7 @@ def test_worker_imports_processes_and_exports_per_user_history(workspace_tmp_pat
     runtime.manager = _Manager()
     runtime.bot_instance = _Bot()
     runtime.initialize_system = lambda: None
-    runtime.try_acquire_user_lock = lambda chat_id: True
+    runtime.try_acquire_user_lock = lambda chat_id, context=None: True
     runtime.release_user_lock = lambda chat_id: calls.append(("release", chat_id))
 
     response = MawsRuntime.handle_apigw_event(
@@ -483,7 +487,7 @@ def test_worker_appends_outgoing_history_without_processing_webhook(workspace_tm
     runtime.manager = _Manager()
     runtime.bot_instance = _Bot()
     runtime.initialize_system = lambda: None
-    runtime.try_acquire_user_lock = lambda chat_id: True
+    runtime.try_acquire_user_lock = lambda chat_id, context=None: True
     runtime.release_user_lock = lambda chat_id: calls.append(("release", chat_id))
 
     response = MawsRuntime.handle_apigw_event(
@@ -574,8 +578,9 @@ def test_sqs_worker_raises_processing_errors_for_retry():
     runtime = object.__new__(MawsRuntime)
     runtime.bot_type = "telegram"
 
-    def fail_process_jobs(jobs, context=None, raise_on_error=False):
+    def fail_process_jobs(jobs, context=None, raise_on_error=False, retry_when_busy=False):
         assert raise_on_error is True
+        assert retry_when_busy is True
         raise RuntimeError("retry me")
 
     runtime._process_jobs = fail_process_jobs
@@ -602,6 +607,7 @@ def test_failed_self_invoke_can_be_captured_to_s3():
     runtime = object.__new__(MawsRuntime)
     runtime.bot_type = "telegram"
     runtime.busy_policy = "drop"
+    runtime.allow_unauthenticated_webhooks = True  # routing test; auth is covered separately
     runtime.capture_failed_events = True
     runtime.bucket_name = "history-bucket"
     runtime.failed_events_prefix = "failed-events"
@@ -756,7 +762,7 @@ def _history_worker_runtime(workspace_tmp_path, *, enabled=True, lock_results=(T
 
     pending_locks = list(lock_results)
 
-    def try_acquire_user_lock(chat_id):
+    def try_acquire_user_lock(chat_id, context=None):
         calls.append(("lock", chat_id))
         return pending_locks.pop(0) if pending_locks else False
 
@@ -919,7 +925,7 @@ def test_appended_message_is_the_agents_own_turn_in_real_manager(workspace_tmp_p
     MawsRuntime._append_external_history(runtime, "user-1", dict(_HISTORY_JOB))  # retry is deduplicated
 
     assert len(manager.get_messages("user-1")) == 2
-    rows = manager._get_all_messages(manager._get_user_db())
+    rows = manager._get_all_messages(manager._ensure_user_db("user-1"))
     chef = manager.agents["chef"]
     chef_view = chef._transform_to_conversation(chef._apply_filters(rows))
     assert chef_view[-1] == {"role": "assistant", "content": [{"type": "text", "content": {"response": "sent"}}]}

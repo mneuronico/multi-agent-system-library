@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+from typing import Iterable
+
 from ._shared import *
+
+DEFAULT_ERROR_MSG = "Sorry, something went wrong while processing your message. Please try again later."
+
 
 class Bot(abc.ABC):
     def __init__(
@@ -19,9 +25,11 @@ class Bot(abc.ABC):
         unknown_command_msg: Optional[str] = "I don't recognize that command. Type /help to see what I can do.",
         custom_commands: Optional[Union[Dict, List[Dict]]] = None,
         return_token_count: bool = False,
-        ensure_delivery: bool = False, 
+        ensure_delivery: bool = False,
         delivery_timeout: float = 5.0,
-        max_allowed_message_delay: float = 120.0
+        max_allowed_message_delay: Optional[float] = 120.0,
+        error_msg: Optional[str] = DEFAULT_ERROR_MSG,
+        allowed_user_ids: Optional[Iterable[Union[str, int]]] = None,
     ):
         self.manager = manager
         self.component_name = component_name
@@ -44,11 +52,39 @@ class Bot(abc.ABC):
         self.ensure_delivery = ensure_delivery
         self.delivery_timeout = delivery_timeout
         self.max_allowed_message_delay = max_allowed_message_delay
+        self.error_msg = error_msg
+        self.allowed_user_ids = self._normalize_allowed_user_ids(allowed_user_ids)
 
         self.logger = logging.getLogger(__name__)
 
-        self._processing_users = set()
-        self._user_lock = threading.Lock()
+        # (event loop, user_id) -> [asyncio.Lock, number of messages holding or waiting for it].
+        # Locks are created lazily on the loop that uses them and removed when the count drops
+        # to zero, so the map only ever holds users that have a message in flight.
+        self._user_locks: Dict[Any, List[Any]] = {}
+        self._user_locks_guard = threading.Lock()
+
+    @staticmethod
+    def _normalize_user_id(value: Any) -> str:
+        text = str(value).strip()
+        # WhatsApp sends phone numbers without "+"; accept "+5491..." in the allow list too.
+        return text[1:] if text.startswith("+") else text
+
+    @classmethod
+    def _normalize_allowed_user_ids(cls, allowed_user_ids: Any) -> Optional[frozenset]:
+        if allowed_user_ids is None:
+            return None
+        if isinstance(allowed_user_ids, (str, int)):
+            allowed_user_ids = [allowed_user_ids]
+        return frozenset(cls._normalize_user_id(uid) for uid in allowed_user_ids)
+
+    def _is_user_allowed(self, user_id: Any) -> bool:
+        if self.allowed_user_ids is None:
+            return True
+        normalized = self._normalize_user_id(user_id)
+        if normalized in self.allowed_user_ids:
+            return True
+        admin_user_id = getattr(self.manager, "admin_user_id", None)
+        return bool(admin_user_id) and normalized == self._normalize_user_id(admin_user_id)
 
 
     @abc.abstractmethod
@@ -332,15 +368,48 @@ class Bot(abc.ABC):
         return blocks
 
 
-    def _is_too_old(self, msg_dt, *, max_age=120) -> bool:
+    def _message_age_seconds(self, msg_dt) -> Optional[float]:
         if not isinstance(msg_dt, datetime):
-            return False
+            return None
         if msg_dt.tzinfo is None:
             msg_dt = msg_dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - msg_dt) > timedelta(seconds=max_age)
+        return (datetime.now(timezone.utc) - msg_dt).total_seconds()
+
+    def _is_too_old(self, msg_dt, *, max_age=120) -> bool:
+        if max_age is None:
+            return False
+        age = self._message_age_seconds(msg_dt)
+        return age is not None and age > max_age
+
+    @contextlib.asynccontextmanager
+    async def _user_turn(self, user_id: str):
+        """Run one message of ``user_id`` at a time; later messages wait in arrival order.
+
+        Different users never wait for each other. ``asyncio.Lock`` wakes waiters in FIFO
+        order, and callers reach this point without suspending after the message arrives,
+        so a user's messages are handled in the order they were received.
+        """
+        key = (asyncio.get_running_loop(), str(user_id))
+        with self._user_locks_guard:
+            entry = self._user_locks.get(key)
+            if entry is None:
+                entry = self._user_locks[key] = [asyncio.Lock(), 0]
+            entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            with self._user_locks_guard:
+                entry[1] -= 1
+                if entry[1] <= 0 and self._user_locks.get(key) is entry:
+                    del self._user_locks[key]
 
     async def process_payload(self, payload: Any) -> None:
-        parsed_message = await self._parse_payload(payload)
+        try:
+            parsed_message = await self._parse_payload(payload)
+        except Exception:
+            self.logger.exception("[Bot] Could not parse an incoming payload; it was skipped.")
+            return
 
         if not parsed_message:
             self.logger.debug("[Bot] Payload ignored or not parseable.")
@@ -348,86 +417,107 @@ class Bot(abc.ABC):
 
         user_id = parsed_message['user_id']
 
-        with self._user_lock:
-            if user_id in self._processing_users:
-                self.logger.debug(f"[Bot] User {user_id} is already being processed. Ignoring new message.")
-                return
-            self._processing_users.add(user_id)
+        if not self._is_user_allowed(user_id):
+            self.logger.info(
+                "[Bot] Ignored a message from user %s: not in allowed_user_ids.", user_id
+            )
+            return
 
+        # The age is measured now, when the message arrives, and not after it has waited for
+        # this user's earlier messages: time spent queued behind a slow run must not get it dropped.
+        if self._is_too_old(parsed_message.get('timestamp'), max_age=self.max_allowed_message_delay):
+            age = self._message_age_seconds(parsed_message.get('timestamp'))
+            self.logger.warning(
+                "[Bot] Dropped a message from user %s: it was %.0f s old on arrival "
+                "(max_allowed_message_delay=%s).",
+                user_id, age, self.max_allowed_message_delay,
+            )
+            return
+
+        async with self._user_turn(user_id):
+            try:
+                await self._process_parsed_message(user_id, parsed_message)
+            except Exception:
+                self.logger.exception("[Bot] Error while processing a message from user %s.", user_id)
+                await self._send_error_reply(user_id, parsed_message)
+
+    async def _send_error_reply(self, user_id: str, parsed_message: Dict[str, Any]) -> None:
+        if not self.error_msg:
+            return
         try:
-            
-            if self._is_too_old(parsed_message['timestamp'], max_age = self.max_allowed_message_delay):
-                self.logger.debug(f"[Bot] Message from {user_id} ignored for being too old.")
+            await self._send_blocks(
+                user_id,
+                [{"type": "text", "content": {"response": self.error_msg}}],
+                parsed_message,
+            )
+        except Exception:
+            self.logger.exception("[Bot] Could not send the error reply to user %s.", user_id)
+
+    async def _process_parsed_message(self, user_id: str, parsed_message: Dict[str, Any]) -> None:
+        if parsed_message.get('message_type') == 'text' and (parsed_message.get('text') or '').startswith('/'):
+            is_command = await self._handle_command(user_id, parsed_message['text'], parsed_message)
+            if is_command:
                 return
-                
-            if parsed_message.get('message_type') == 'text' and parsed_message.get('text', '').startswith('/'):
-                is_command = await self._handle_command(user_id, parsed_message['text'], parsed_message)
-                if is_command:
-                    return
 
-            mas_blocks = await self._build_mas_blocks(parsed_message)
-            
-            if not mas_blocks:
-                if self.verbose:
-                    self.logger.debug(f"[Bot] No blocks generated for message from {user_id}.")
-                return
-            
-            callback_params = {
-                "user_id": user_id,
-                "original_payload": parsed_message['original_payload'],
-                "event_loop": asyncio.get_running_loop()
-            }
+        mas_blocks = await self._build_mas_blocks(parsed_message)
 
-            def _send_response_from_callback(response):
-                if response is not None:
-                    blocks = self.manager._to_blocks(response, user_id=user_id)
+        if not mas_blocks:
+            if self.verbose:
+                self.logger.debug(f"[Bot] No blocks generated for message from {user_id}.")
+            return
 
-                    loop = callback_params["event_loop"]
-                    fut = asyncio.run_coroutine_threadsafe(
+        callback_params = {
+            "user_id": user_id,
+            "original_payload": parsed_message['original_payload'],
+            "event_loop": asyncio.get_running_loop()
+        }
+
+        def _send_response_from_callback(response):
+            if response is not None:
+                blocks = self.manager._to_blocks(response, user_id=user_id)
+
+                loop = callback_params["event_loop"]
+                fut = asyncio.run_coroutine_threadsafe(
                     self._send_blocks(user_id, blocks, parsed_message), loop
-                    )
-                    if self.ensure_delivery:
-                        try:
-                            fut.result(timeout=self.delivery_timeout)
-                        except Exception as e:
-                            self.logger.exception(f"Bot delivery failed or timed out: {e}")
+                )
+                if self.ensure_delivery:
+                    try:
+                        fut.result(timeout=self.delivery_timeout)
+                    except Exception as e:
+                        self.logger.exception(f"Bot delivery failed or timed out: {e}")
 
-            def on_update_wrapper(messages, manager, params):
-                if self.on_update_user_callback:
-                    response = self.manager._invoke_callback(
-                        self.on_update_user_callback, messages, manager, params
-                    )
-                    _send_response_from_callback(response)
-
-            def on_complete_wrapper(messages, manager, params):
-                response = None
-                if self.on_complete_user_callback:
-                    response = self.manager._invoke_callback(
-                        self.on_complete_user_callback, messages, manager, params
-                    )
-                elif messages:
-                    response = messages[-1].get("message")
-                
+        def on_update_wrapper(messages, manager, params):
+            if self.on_update_user_callback:
+                response = self.manager._invoke_callback(
+                    self.on_update_user_callback, messages, manager, params
+                )
                 _send_response_from_callback(response)
 
-            await asyncio.to_thread(
-                self.manager.run,
-                input=mas_blocks,
-                component_name=self.component_name,
-                user_id=user_id,
-                role="user",
-                verbose=self.verbose,
-                blocking=True,
-                on_update=on_update_wrapper,
-                on_update_params=callback_params,
-                on_complete=on_complete_wrapper,
-                on_complete_params=callback_params,
-                return_token_count=self.return_token_count
-            )
-        finally:
-            with self._user_lock:
-                if user_id in self._processing_users:
-                    self._processing_users.remove(user_id)
+        def on_complete_wrapper(messages, manager, params):
+            response = None
+            if self.on_complete_user_callback:
+                response = self.manager._invoke_callback(
+                    self.on_complete_user_callback, messages, manager, params
+                )
+            elif messages:
+                response = messages[-1].get("message")
+
+            _send_response_from_callback(response)
+
+        await asyncio.to_thread(
+            self.manager.run,
+            input=mas_blocks,
+            component_name=self.component_name,
+            user_id=user_id,
+            role="user",
+            verbose=self.verbose,
+            blocking=True,
+            on_update=on_update_wrapper,
+            on_update_params=callback_params,
+            on_complete=on_complete_wrapper,
+            on_complete_params=callback_params,
+            return_token_count=self.return_token_count
+        )
 
     def _register_commands(self, custom_commands: Optional[Union[Dict, List[Dict]]]):
         self.commands["/start"] = {
@@ -585,24 +675,34 @@ class Bot(abc.ABC):
         is_voice = parsed_message.get('is_voice_note', False)
         blocks = []
 
-        try:
-            self.manager.set_current_user(str(user_id))
-        except Exception:
-            pass
-
         transcript = None
         if msg_type == 'audio':
             audio_ref = await self._download_media_and_save(user_id, media_info)
             transcript = None
             if self.speech_to_text:
                 stt_params = {
-                    "manager": self.manager, 
+                    "manager": self.manager,
                     "file_path": audio_ref[5:],
+                    "user_id": user_id,
                 }
+                # Other users' messages run on this event loop too. Functions that still rely on
+                # the manager's current user get it set right before the call (no await in between);
+                # new code should pass stt_params["user_id"] explicitly.
+                self.manager.set_current_user(str(user_id))
                 transcript = self.speech_to_text(stt_params)
+                if inspect.isawaitable(transcript):
+                    transcript = await transcript
             else:
                 try:
-                    transcript = self.manager.stt(audio_ref, self.whisper_provider, self.whisper_model, user_id=user_id)
+                    # manager.stt is a blocking network call: keep it off the event loop so other
+                    # users' messages keep flowing while it runs.
+                    transcript = await asyncio.to_thread(
+                        self.manager.stt,
+                        audio_ref,
+                        self.whisper_provider,
+                        self.whisper_model,
+                        user_id=user_id,
+                    )
                 except Exception as e:
                     self.logger.error(f"Error in automatic STT for {user_id}: {e}")
 
@@ -661,19 +761,24 @@ class TelegramBot(Bot):
         self,
         manager: AgentSystemManager,
         telegram_token: str = None,
+        concurrent_updates: Union[bool, int] = True,
         **kwargs
     ):
         super().__init__(manager=manager, **kwargs)
         if Application is None or HTTPXRequest is None:
             raise ImportError("python-telegram-bot is required for TelegramBot. Install mas[telegram].")
-        
+
         token = telegram_token or self.manager.get_key("telegram_token")
         if not token:
             raise ValueError("Telegram token was not provided or found in the manager's API keys.")
 
         self.telegram_token = token
+        self.concurrent_updates = concurrent_updates
 
         request = HTTPXRequest(
+            # Concurrent updates send replies in parallel; a single pooled connection would
+            # make them queue (and hit pool_timeout) behind each other.
+            connection_pool_size=256,
             connect_timeout=15.0,
             read_timeout=60.0,
             write_timeout=60.0,
@@ -681,8 +786,12 @@ class TelegramBot(Bot):
             http_version="1.1",
         )
 
-
-        self.application = Application.builder().token(self.telegram_token).request(request).build()
+        builder = Application.builder().token(self.telegram_token).request(request)
+        # PTB processes one update at a time by default, so one user's slow run would block
+        # every other user. Updates run concurrently here (True = up to 256 at once); each
+        # user's own messages are still handled one at a time, in order, by _user_turn.
+        builder = builder.concurrent_updates(concurrent_updates)
+        self.application = builder.build()
         self.bot = self.application.bot
         self._register_handlers()
         
@@ -1015,14 +1124,41 @@ class WhatsappBot(Bot):
         ).hexdigest()
         return hmac.compare_digest(signature_header.strip().encode("utf-8"), expected.encode("utf-8"))
 
+    def _webhook_messages(self, update_data: Any) -> List[Dict[str, Any]]:
+        messages = []
+        if not isinstance(update_data, dict):
+            self.logger.warning("[WhatsappBot] Ignored a webhook body that is not a JSON object.")
+            return messages
+        for entry in update_data.get("entry") or []:
+            if not isinstance(entry, dict):
+                continue
+            for change in entry.get("changes") or []:
+                if not isinstance(change, dict):
+                    continue
+                value = change.get("value") or {}
+                if not isinstance(value, dict):
+                    continue
+                for msg in value.get("messages") or []:
+                    if isinstance(msg, dict):
+                        messages.append(msg)
+        return messages
+
     async def process_webhook_update(self, update_data: dict):
-        try:
-            for entry in update_data.get("entry", []):
-                for change in entry.get("changes", []):
-                    for msg in change.get("value", {}).get("messages", []):
-                        await self.process_payload(msg)
-        except Exception as e:
-            self.logger.exception(f"Error processing WhatsApp webhook payload: {e}")
+        # One webhook can carry several messages. Each one is handled on its own: a failure in
+        # one never drops the others, and different users are served concurrently while each
+        # user's messages keep their order (process_payload serializes per user).
+        messages = self._webhook_messages(update_data)
+        if not messages:
+            return
+        results = await asyncio.gather(
+            *(self.process_payload(msg) for msg in messages), return_exceptions=True
+        )
+        for msg, result in zip(messages, results):
+            if isinstance(result, Exception):
+                self.logger.error(
+                    "[WhatsappBot] Error processing WhatsApp message %s from %s.",
+                    msg.get("id"), msg.get("from"), exc_info=result,
+                )
 
 
     async def _parse_payload(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1289,7 +1425,7 @@ class WhatsappBot(Bot):
                 self.logger.error(f"Error sending log file {file_info['filename']} to WhatsApp user {user_id}: {e}")
         
         if sent_count > 0:
-            await self._send_blocks(user_id, self.manager._to_blocks(f"Sent {sent_count} log file(s)."), original_message)
+            await self._send_blocks(user_id, self.manager._to_blocks(f"Sent {sent_count} log file(s).", user_id=user_id), original_message)
         
         return sent_count
 

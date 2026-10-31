@@ -7,12 +7,14 @@ import datetime as _dt
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
 import time
 import traceback
 import types as _types
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -159,6 +161,20 @@ class HistoryAppendLockBusy(RuntimeError):
     """Raised so Lambda/SQS retries a history append instead of dropping it."""
 
 
+class UserLockBusy(RuntimeError):
+    """
+    Raised on the SQS (busy_policy=fifo) path when another worker holds the user lock. SQS deletes
+    a message when the invocation succeeds, so the invocation must fail for the message to be retried.
+    """
+
+
+# A lock taken inside Lambda expires this long after the invocation's own deadline. It must stay
+# below the 30 s that bootstrap.sh adds to lambda_timeout for the SQS visibility timeout, so a
+# crashed worker's lock is gone before SQS makes its message visible again; the margin covers clock
+# skew between Lambda hosts.
+LOCK_EXPIRY_MARGIN_SECONDS = 15
+
+
 # -------------------------
 # Main runtime
 # -------------------------
@@ -203,11 +219,22 @@ class MawsRuntime:
         self.persist_files_s3 = _as_bool(os.environ.get("PERSIST_FILES_S3"), default=False)
         self.files_prefix = os.environ.get("FILES_S3_PREFIX", "files").strip().strip("/") or "files"
 
-        # DynamoDB locks (optional)
+        # DynamoDB locks (optional). LOCK_TTL_SECONDS is only used when no Lambda context is
+        # available; inside Lambda the lock lifetime follows the invocation deadline.
         self.lock_table = os.environ.get("LOCKS_TABLE_NAME") or ""
-        self.lock_ttl = int(os.environ.get("LOCK_TTL_SECONDS", "180"))
+        self.lock_ttl = _as_int(os.environ.get("LOCK_TTL_SECONDS"), 180)
+        self._lock_tokens: Dict[str, str] = {}
 
-        # Provider-compatible webhook authenticity checks. Opt-in for compatibility.
+        # Provider webhook authentication is mandatory. MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS=true
+        # (params.json webhook_security.allow_unauthenticated) is the explicit opt-out.
+        self.allow_unauthenticated_webhooks = _as_bool(
+            os.environ.get("MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS"), default=False
+        )
+        if self.allow_unauthenticated_webhooks:
+            print(
+                "[maws][security][WARN] MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS=true: webhook POSTs are "
+                "accepted without a provider secret/signature when none is configured."
+            )
         self.telegram_secret_token_env_key = os.environ.get(
             "TELEGRAM_WEBHOOK_SECRET_TOKEN_ENV_KEY",
             "TELEGRAM_WEBHOOK_SECRET_TOKEN",
@@ -216,7 +243,7 @@ class MawsRuntime:
             os.environ.get(self.telegram_secret_token_env_key, "")
             or os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN", "")
         )
-        self.whatsapp_verify_signature = _as_bool(os.environ.get("WHATSAPP_VERIFY_SIGNATURE"), default=False)
+        self.whatsapp_verify_signature = _as_bool(os.environ.get("WHATSAPP_VERIFY_SIGNATURE"), default=True)
         self.whatsapp_app_secret_env_key = os.environ.get(
             "WHATSAPP_APP_SECRET_ENV_KEY",
             "WHATSAPP_APP_SECRET",
@@ -581,35 +608,76 @@ class MawsRuntime:
             return "__maws_shared_history__"
         return str(user_id)
 
-    def try_acquire_user_lock(self, user_id: str) -> bool:
+    def _lock_ttl_seconds(self, context=None) -> int:
+        """
+        Lifetime of a lock taken now. Inside Lambda the lock lives until this invocation's hard
+        deadline plus LOCK_EXPIRY_MARGIN_SECONDS: it outlives any running invocation, and a crashed
+        worker's lock expires before SQS makes the message visible again (visibility timeout is
+        lambda_timeout + 30 s and the deadline is at most lambda_timeout after the message was
+        received). Without a Lambda context, LOCK_TTL_SECONDS is used.
+        """
+        get_remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
+        if callable(get_remaining_ms):
+            try:
+                remaining = int(math.ceil(float(get_remaining_ms()) / 1000.0))
+                return max(1, remaining) + LOCK_EXPIRY_MARGIN_SECONDS
+            except Exception:
+                pass
+        return max(1, int(getattr(self, "lock_ttl", 180) or 180))
+
+    def _held_lock_tokens(self) -> Dict[str, str]:
+        tokens = getattr(self, "_lock_tokens", None)
+        if tokens is None:
+            tokens = self._lock_tokens = {}
+        return tokens
+
+    def try_acquire_user_lock(self, user_id: str, context=None) -> bool:
         """Return True if the lock is acquired; False if another worker is processing the user."""
         if not (getattr(self, "lock_table", "") and self.dynamodb):
             return True
         lock_id = self._lock_id_for(user_id)
         now = self._lock_now_epoch()
-        expires_at = now + getattr(self, "lock_ttl", 180)
+        expires_at = now + self._lock_ttl_seconds(context)
+        token = uuid.uuid4().hex
         try:
             self.dynamodb.put_item(
                 TableName=self.lock_table,
-                Item={"user_id": {"S": str(lock_id)}, "expiresAt": {"N": str(expires_at)}},
+                Item={
+                    "user_id": {"S": str(lock_id)},
+                    "expiresAt": {"N": str(expires_at)},
+                    "lockToken": {"S": token},
+                },
+                # Expiry is enforced by this condition, not by DynamoDB TTL: TTL deletion is lazy
+                # (it can lag for days), so an expired item still exists and is overwritten here.
                 ConditionExpression="attribute_not_exists(user_id) OR expiresAt < :now",
                 ExpressionAttributeValues={":now": {"N": str(now)}},
             )
-            return True
         except self.dynamodb.exceptions.ConditionalCheckFailedException:
             return False
+        self._held_lock_tokens()[str(lock_id)] = token
+        return True
 
     def release_user_lock(self, user_id: str):
         if not (getattr(self, "lock_table", "") and self.dynamodb):
             return
         lock_id = self._lock_id_for(user_id)
+        token = self._held_lock_tokens().pop(str(lock_id), None)
+        request = {
+            "TableName": self.lock_table,
+            "Key": {"user_id": {"S": str(lock_id)}},
+        }
+        if token:
+            # Delete only our own lock: if it expired and another worker took it over, keep theirs.
+            request["ConditionExpression"] = "lockToken = :token"
+            request["ExpressionAttributeValues"] = {":token": {"S": token}}
         try:
-            self.dynamodb.delete_item(
-                TableName=self.lock_table,
-                Key={"user_id": {"S": str(lock_id)}},
+            self.dynamodb.delete_item(**request)
+        except Exception as e:
+            conditional_failed = getattr(
+                getattr(self.dynamodb, "exceptions", None), "ConditionalCheckFailedException", None
             )
-        except Exception:
-            pass
+            if isinstance(conditional_failed, type) and isinstance(e, conditional_failed):
+                print(f"[maws][unlock][WARN] Lock for {lock_id} was taken over by another worker; leaving it.")
 
     # -------------------------
     # MAS initialization + bots
@@ -780,29 +848,53 @@ class MawsRuntime:
     # Webhook security
     # -------------------------
     def _verify_post_security(self, event: dict, raw_body: bytes) -> Optional[dict]:
+        """
+        Authenticate a provider webhook POST. Authentication is mandatory: without the provider
+        secret the POST is refused with 500 (a misconfiguration; providers retry once it is fixed)
+        unless MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS=true opted out explicitly.
+        """
         headers = event.get("headers") or {}
+        allow_unauthenticated = bool(getattr(self, "allow_unauthenticated_webhooks", False))
+        misconfigured = {"statusCode": 500, "body": json.dumps("Webhook authentication is misconfigured.")}
         if getattr(self, "bot_type", "whatsapp") == "telegram":
             expected = getattr(self, "telegram_secret_token", "")
             if not expected:
-                return None
+                if allow_unauthenticated:
+                    return None
+                print(
+                    "[maws][security][ERR] TELEGRAM_WEBHOOK_SECRET_TOKEN is empty; refusing an "
+                    "unauthenticated Telegram webhook. Set it in .env.prod and redeploy, or set "
+                    "MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS=true."
+                )
+                return misconfigured
             provided = _header_value(headers, "X-Telegram-Bot-Api-Secret-Token")
-            if not hmac.compare_digest(provided, expected):
+            if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
                 print("[maws][security] Invalid Telegram webhook secret token.")
                 return {"statusCode": 403, "body": json.dumps("Forbidden")}
             return None
 
-        if not getattr(self, "whatsapp_verify_signature", False):
-            return None
+        verify = bool(getattr(self, "whatsapp_verify_signature", True))
         secret = getattr(self, "whatsapp_app_secret", "")
-        if not secret:
-            print("[maws][security][ERR] WHATSAPP_VERIFY_SIGNATURE=true but WHATSAPP_APP_SECRET is empty.")
-            return {"statusCode": 500, "body": json.dumps("Webhook signature verification is misconfigured.")}
+        if not (verify and secret):
+            if allow_unauthenticated:
+                return None
+            if not verify:
+                print(
+                    "[maws][security][ERR] WHATSAPP_VERIFY_SIGNATURE=false requires "
+                    "MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS=true; refusing an unverified WhatsApp webhook."
+                )
+            else:
+                print(
+                    "[maws][security][ERR] WHATSAPP_APP_SECRET is empty; refusing an unverified "
+                    "WhatsApp webhook. Set it in .env.prod and redeploy."
+                )
+            return misconfigured
         signature = _header_value(headers, "X-Hub-Signature-256")
         if not signature.startswith("sha256="):
             print("[maws][security] Missing WhatsApp X-Hub-Signature-256 header.")
             return {"statusCode": 403, "body": json.dumps("Forbidden")}
         expected = "sha256=" + hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected):
+        if not hmac.compare_digest(signature.encode("utf-8"), expected.encode("utf-8")):
             print("[maws][security] Invalid WhatsApp webhook signature.")
             return {"statusCode": 403, "body": json.dumps("Forbidden")}
         return None
@@ -993,7 +1085,7 @@ class MawsRuntime:
             except Exception:
                 pass
         deadline = time.monotonic() + max(0.0, max_wait)
-        while not self.try_acquire_user_lock(chat_id):
+        while not self.try_acquire_user_lock(chat_id, context=context):
             if time.monotonic() >= deadline:
                 raise HistoryAppendLockBusy(
                     f"History append for {chat_id} is still waiting for the user lock; retrying later."
@@ -1110,17 +1202,36 @@ class MawsRuntime:
             except Exception as e:
                 print(f"[maws][sqs][ERR] Could not parse record: {e}")
                 raise
-        return self._process_jobs(jobs, context=context, raise_on_error=True)
+        # Any exception makes SQS redeliver the message after the visibility timeout; returning
+        # normally deletes it. A busy user must therefore raise here instead of being ignored.
+        return self._process_jobs(jobs, context=context, raise_on_error=True, retry_when_busy=True)
 
-    def _process_jobs(self, jobs: List[dict], context=None, raise_on_error: bool = False):
+    def _process_jobs(
+        self,
+        jobs: List[dict],
+        context=None,
+        raise_on_error: bool = False,
+        retry_when_busy: bool = False,
+    ):
         if not jobs:
             return {"statusCode": 200, "body": json.dumps("No jobs found.")}
         last_result = {"statusCode": 200, "body": json.dumps("Processed.")}
         for job in jobs:
-            last_result = self._process_job(job, context=context, raise_on_error=raise_on_error)
+            last_result = self._process_job(
+                job,
+                context=context,
+                raise_on_error=raise_on_error,
+                retry_when_busy=retry_when_busy,
+            )
         return last_result
 
-    def _process_job(self, job: dict, context=None, raise_on_error: bool = False):
+    def _process_job(
+        self,
+        job: dict,
+        context=None,
+        raise_on_error: bool = False,
+        retry_when_busy: bool = False,
+    ):
         chat_id = str(job.get("chat_id") or "")
         provider = str(job.get("provider") or getattr(self, "bot_type", "whatsapp"))
         event_id = str(job.get("event_id") or "")
@@ -1151,10 +1262,17 @@ class MawsRuntime:
             # Lock. In shared history mode this becomes a global lock/group.
             if is_history_append:
                 self._wait_for_history_append_lock(chat_id, context)
-            elif not self.try_acquire_user_lock(chat_id):
+            elif not self.try_acquire_user_lock(chat_id, context=context):
+                if retry_when_busy:
+                    # SQS (busy_policy=fifo): fail the invocation so the message is redelivered
+                    # after the visibility timeout instead of being deleted.
+                    print(f"[maws] Another worker is processing {chat_id}. Leaving the SQS message for retry.")
+                    result = {"statusCode": 409, "body": json.dumps("Already processing; will retry.")}
+                    raise UserLockBusy(f"User lock for {chat_id} is held by another worker; SQS will retry.")
+                # busy_policy=drop: the documented behaviour is to acknowledge and ignore the update.
                 print(f"[maws] Another worker is processing {chat_id}. Ignoring update.")
                 result = {"statusCode": 200, "body": json.dumps("Already processing; update ignored.")}
-                return {"statusCode": 200, "body": json.dumps("Already processing; update ignored.")}
+                return result
             acquired_lock = True
 
             if self._uses_shared_history():
@@ -1182,6 +1300,8 @@ class MawsRuntime:
                 # Process
                 loop = self.get_event_loop()
                 loop.run_until_complete(self.bot_instance.process_webhook_update(job.get("payload") or {}))
+        except UserLockBusy:
+            raise
         except Exception as e:
             print(f"[maws][process][ERR] {e}")
             traceback.print_exc()
@@ -1192,41 +1312,44 @@ class MawsRuntime:
         else:
             result = {"statusCode": 200, "body": json.dumps("Processed.")}
         finally:
-            # Persistence only if we imported/synced history
-            if imported_history:
-                for f in getattr(self, "special_files", []):
-                    self.upload_token_back_if_exists(f)
-                try:
-                    if self._uses_shared_history():
-                        self._upload_shared_history_to_s3()
-                    else:
-                        sqlite_bytes = self.manager.export_history(chat_id)
-                        if sqlite_bytes:
-                            self.s3.put_object(Bucket=self.bucket_name, Key=s3_key, Body=sqlite_bytes)
-                    self._sync_user_files_to_s3(chat_id)
-                except Exception as e:
-                    print(f"[maws][save][ERR] {e}")
-                    self._capture_failed_event(job, "worker_save_failed", e)
-                    result = {"statusCode": 200, "body": json.dumps("Processed with warning.")}
-                    if raise_on_error:
-                        raise
+            try:
+                # Persistence only if we imported/synced history
+                if imported_history:
+                    for f in getattr(self, "special_files", []):
+                        self.upload_token_back_if_exists(f)
+                    try:
+                        if self._uses_shared_history():
+                            self._upload_shared_history_to_s3()
+                        else:
+                            sqlite_bytes = self.manager.export_history(chat_id)
+                            if sqlite_bytes:
+                                self.s3.put_object(Bucket=self.bucket_name, Key=s3_key, Body=sqlite_bytes)
+                        self._sync_user_files_to_s3(chat_id)
+                    except Exception as e:
+                        print(f"[maws][save][ERR] {e}")
+                        self._capture_failed_event(job, "worker_save_failed", e)
+                        result = {"statusCode": 200, "body": json.dumps("Processed with warning.")}
+                        if raise_on_error:
+                            raise
+            finally:
+                # Always release, even when saving failed and the error is re-raised for a retry;
+                # otherwise the retry would find the user busy until the lock expires.
+                if acquired_lock:
+                    try:
+                        self.release_user_lock(chat_id)
+                    except Exception as e:
+                        print(f"[maws][unlock][WARN] {e}")
 
-            if acquired_lock:
-                try:
-                    self.release_user_lock(chat_id)
-                except Exception as e:
-                    print(f"[maws][unlock][WARN] {e}")
-
-            self._log(
-                "worker_job_finished",
-                provider=provider,
-                chat_id=chat_id,
-                event_id=event_id,
-                busy_policy=getattr(self, "busy_policy", "drop"),
-                history_mode="shared" if self._uses_shared_history() else "per_user",
-                status=json.loads(result["body"]),
-                duration_ms=int((time.time() - start) * 1000),
-            )
+                self._log(
+                    "worker_job_finished",
+                    provider=provider,
+                    chat_id=chat_id,
+                    event_id=event_id,
+                    busy_policy=getattr(self, "busy_policy", "drop"),
+                    history_mode="shared" if self._uses_shared_history() else "per_user",
+                    status=json.loads(result["body"]),
+                    duration_ms=int((time.time() - start) * 1000),
+                )
 
         return result
 

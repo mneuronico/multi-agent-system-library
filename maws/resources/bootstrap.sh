@@ -50,7 +50,12 @@ SYNC_TOKENS_S3=$(jq -r '.sync_tokens_s3 // true' "${CONF}")
 TOKENS_PREFIX=$(jq -r '.tokens_s3_prefix // "secrets"' "${CONF}")
 VERBOSE=$(jq -r '.verbose // false' "${CONF}")
 LAMBDA_TIMEOUT=$(jq -r '.lambda_timeout // 120' "${CONF}")
+# SQS makes a message visible again VISIBILITY_TIMEOUT seconds after a worker received it. The user
+# lock must outlive a running invocation (lambda_timeout) but expire before that redelivery, or the
+# retry of a crashed worker's message finds the user still busy. The runtime ties the lock to the
+# invocation deadline + 15 s; LOCK_TTL_SECONDS is its fallback when no Lambda context is available.
 VISIBILITY_TIMEOUT=$((LAMBDA_TIMEOUT + 30))
+LOCK_TTL_SECONDS=$((LAMBDA_TIMEOUT + 15))
 
 BUSY_POLICY=$(jq -r '.busy_policy // "drop"' "${CONF}")
 PERSIST_FILES_S3=$(jq -r '.persist_files_s3 // false' "${CONF}")
@@ -70,7 +75,6 @@ MAX_ALLOWED_MESSAGE_DELAY=$(jq -r '.runtime.max_allowed_message_delay // empty' 
 
 TELEGRAM_SECRET_ENV_KEY=$(jq -r '.webhook_security.telegram_secret_token_env_key // empty' "${CONF}")
 [[ -z "${TELEGRAM_SECRET_ENV_KEY}" || "${TELEGRAM_SECRET_ENV_KEY}" == "null" ]] && TELEGRAM_SECRET_ENV_KEY="TELEGRAM_WEBHOOK_SECRET_TOKEN"
-WHATSAPP_VERIFY_SIGNATURE=$(jq -r '.webhook_security.whatsapp_verify_signature // false' "${CONF}")
 WHATSAPP_APP_SECRET_ENV_KEY=$(jq -r '.webhook_security.whatsapp_app_secret_env_key // empty' "${CONF}")
 [[ -z "${WHATSAPP_APP_SECRET_ENV_KEY}" || "${WHATSAPP_APP_SECRET_ENV_KEY}" == "null" ]] && WHATSAPP_APP_SECRET_ENV_KEY="WHATSAPP_APP_SECRET"
 
@@ -81,7 +85,7 @@ WORKER_DLQ=$(jq -r '.failure_handling.worker_dlq // false' "${CONF}")
 HISTORY_APPEND_ENABLED=$(jq -r '.history_append.enabled // false' "${CONF}")
 HISTORY_APPEND_ROLE=$(jq -r '.history_append.role // empty' "${CONF}")
 
-LAMBDA_RUNTIME=$(jq -r '.infra.runtime // "python3.9"' "${CONF}")
+LAMBDA_RUNTIME=$(jq -r '.infra.runtime // "python3.12"' "${CONF}")
 ARCHITECTURE=$(jq -r '.infra.architecture // "x86_64"' "${CONF}")
 MEMORY_SIZE=$(jq -r '.infra.memory_size // 256' "${CONF}")
 LOG_RETENTION_DAYS=$(jq -r '.infra.log_retention_days // empty' "${CONF}")
@@ -107,6 +111,119 @@ SPECIAL_JSON=$(jq -c '.special_token_files // []' "${CONF}")
 TOKEN_ENV_MAP=$(jq -c '.token_env_map // {}' "${CONF}")
 mapfile -t EXTRA_REQ < <(jq -r '.extra_requirements[]?' "${CONF}" 2>/dev/null || true)
 
+die() { printf '%s\n' "$@" >&2; exit 1; }
+
+# Read KEY from .env.prod the way the Lambda runtime does (maws/runtime.py,
+# _load_env_from_ssm_if_needed): the first KEY=value line wins, surrounding whitespace (including a
+# Windows CR) is stripped, and quotes are kept. Checking that value is what proves the deployed bot
+# will authenticate webhooks.
+env_file_value() {
+  local wanted="$1" line key value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]] && continue
+    key="${line%%=*}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${line#*=}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    if [[ "${key}" == "${wanted}" ]]; then
+      printf '%s' "${value}"
+      return 0
+    fi
+  done < .env.prod
+  return 0
+}
+
+# Like the runtime: the configured key first, then the default key.
+env_secret_value() {
+  local value
+  value="$(env_file_value "$1")"
+  if [[ -z "${value}" && "$1" != "$2" ]]; then
+    value="$(env_file_value "$2")"
+  fi
+  printf '%s' "${value}"
+}
+
+unauthenticated_warning() {
+  echo ""
+  echo "##############################################################################"
+  echo "# [WARN] DEPLOYING AN UNAUTHENTICATED WEBHOOK: $1"
+  echo "# webhook_security.allow_unauthenticated=true. Anyone who finds the webhook URL"
+  echo "# can send fake updates as any user of this bot. Do not use this in production."
+  echo "##############################################################################"
+  echo ""
+}
+
+# --- Webhook authentication (checked before anything is uploaded or deployed) ---
+# Booleans use has(): `.x // default` would turn an explicit false into the default.
+WEBHOOK_ALLOW_UNAUTHENTICATED=$(jq -r 'if (.webhook_security | type) == "object" and (.webhook_security | has("allow_unauthenticated")) then .webhook_security.allow_unauthenticated else false end' "${CONF}")
+[[ "${WEBHOOK_ALLOW_UNAUTHENTICATED}" == "true" ]] || WEBHOOK_ALLOW_UNAUTHENTICATED="false"
+WEBHOOK_WHATSAPP_VERIFY=$(jq -r 'if (.webhook_security | type) == "object" and (.webhook_security | has("whatsapp_verify_signature")) then .webhook_security.whatsapp_verify_signature else true end' "${CONF}")
+[[ "${WEBHOOK_WHATSAPP_VERIFY}" == "false" ]] || WEBHOOK_WHATSAPP_VERIFY="true"
+
+# Telegram accepts secret_token values of 1-256 characters from A-Z, a-z, 0-9, _ and -.
+# The class is spelled out so it does not depend on the locale's collation, and the length is
+# checked separately because {1,256} exceeds RE_DUP_MAX (255) and would not compile.
+TELEGRAM_SECRET_RE='^[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]+$'
+ENV_FORMAT_HINT="Use plain KEY=value lines in .env.prod (no quotes, no 'export'): Lambda reads the file that way."
+GENERATE_SECRET_HINT="Generate one with:  python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
+
+echo ">> Checking webhook authentication"
+TELEGRAM_TOKEN_VALUE=""
+TELEGRAM_SECRET_VALUE=""
+if [[ "${BOT}" == "telegram" ]]; then
+  TELEGRAM_TOKEN_VALUE="$(env_file_value "${TELEGRAM_ENV_KEY}")"
+  [[ -n "${TELEGRAM_TOKEN_VALUE}" ]] || die \
+    "[ERR] .env.prod has no ${TELEGRAM_ENV_KEY}; the bot token is needed to run the bot and set its webhook." \
+    "      ${ENV_FORMAT_HINT}"
+  TELEGRAM_SECRET_VALUE="$(env_secret_value "${TELEGRAM_SECRET_ENV_KEY}" "TELEGRAM_WEBHOOK_SECRET_TOKEN")"
+  if [[ -n "${TELEGRAM_SECRET_VALUE}" ]]; then
+    [[ "${TELEGRAM_SECRET_VALUE}" =~ ${TELEGRAM_SECRET_RE} && ${#TELEGRAM_SECRET_VALUE} -le 256 ]] || die \
+      "[ERR] ${TELEGRAM_SECRET_ENV_KEY} in .env.prod is not a valid Telegram secret token." \
+      "      Telegram only accepts 1-256 characters from A-Z, a-z, 0-9, _ and -." \
+      "      ${ENV_FORMAT_HINT}" \
+      "      ${GENERATE_SECRET_HINT}"
+  elif [[ "${WEBHOOK_ALLOW_UNAUTHENTICATED}" == "true" ]]; then
+    unauthenticated_warning "Telegram webhook without ${TELEGRAM_SECRET_ENV_KEY}."
+  else
+    die \
+      "[ERR] .env.prod has no ${TELEGRAM_SECRET_ENV_KEY}. Without it anyone can post fake Telegram updates to the webhook." \
+      "      Add a line ${TELEGRAM_SECRET_ENV_KEY}=<secret> to .env.prod and re-run maws update." \
+      "      ${GENERATE_SECRET_HINT}" \
+      "      To deploy without webhook authentication (NOT recommended), set" \
+      "      \"webhook_security\": {\"allow_unauthenticated\": true} in params.json."
+  fi
+else
+  WHATSAPP_APP_SECRET_VALUE="$(env_secret_value "${WHATSAPP_APP_SECRET_ENV_KEY}" "WHATSAPP_APP_SECRET")"
+  if [[ "${WEBHOOK_WHATSAPP_VERIFY}" == "true" && -n "${WHATSAPP_APP_SECRET_VALUE}" ]]; then
+    :
+  elif [[ "${WEBHOOK_ALLOW_UNAUTHENTICATED}" == "true" ]]; then
+    WEBHOOK_WHATSAPP_VERIFY="false"
+    unauthenticated_warning "WhatsApp webhook POSTs are not signature-verified."
+  elif [[ "${WEBHOOK_WHATSAPP_VERIFY}" != "true" ]]; then
+    die \
+      "[ERR] webhook_security.whatsapp_verify_signature=false turns off WhatsApp webhook authentication." \
+      "      Remove it from params.json (verification is on by default) and set ${WHATSAPP_APP_SECRET_ENV_KEY} in .env.prod." \
+      "      To deploy without webhook authentication (NOT recommended), set" \
+      "      \"webhook_security\": {\"allow_unauthenticated\": true} in params.json."
+  else
+    die \
+      "[ERR] .env.prod has no ${WHATSAPP_APP_SECRET_ENV_KEY}. Without it anyone can post fake WhatsApp messages to the webhook." \
+      "      Copy the App secret from Meta App Dashboard > App settings > Basic and add" \
+      "      ${WHATSAPP_APP_SECRET_ENV_KEY}=<app secret> to .env.prod, then re-run maws update." \
+      "      To deploy without webhook authentication (NOT recommended), set" \
+      "      \"webhook_security\": {\"allow_unauthenticated\": true} in params.json."
+  fi
+fi
+
+# --- Load .env.prod into the environment (aws/sam see it too) ---
+# After the checks above, which read the file without executing it, so a malformed secret gets a
+# clear error. Trailing CRs are stripped so a .env.prod saved on Windows does not break bash.
+set -a
+source <(sed 's/\r$//' ./.env.prod)
+set +a
+
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 echo ">> AWS account: ${ACCOUNT_ID}  Region: ${REGION}"
 
@@ -127,11 +244,6 @@ logical_id() {
 PROJECT_LOGICAL="$(logical_id "$PROJECT")"
 FUNC_ID="${PROJECT_LOGICAL}Function"
 BUCKET_ID="${PROJECT_LOGICAL}HistoryBucket"
-
-# --- Load .env.prod into the environment (for setWebhook, etc.) ---
-set -a
-source ./.env.prod
-set +a
 
 # --- requirements.txt ---
 echo ">> Generating requirements.txt"
@@ -377,10 +489,11 @@ cat >> template.yaml <<EOF
           SPECIAL_TOKEN_FILES_JSON: '${SPECIAL_JSON}'
           TOKEN_ENV_MAP_JSON: '${TOKEN_ENV_MAP}'
 
-          # Provider-supported webhook security
+          # Provider-supported webhook security (mandatory unless explicitly allowed)
           TELEGRAM_WEBHOOK_SECRET_TOKEN_ENV_KEY: "${TELEGRAM_SECRET_ENV_KEY}"
-          WHATSAPP_VERIFY_SIGNATURE: "${WHATSAPP_VERIFY_SIGNATURE}"
+          WHATSAPP_VERIFY_SIGNATURE: "${WEBHOOK_WHATSAPP_VERIFY}"
           WHATSAPP_APP_SECRET_ENV_KEY: "${WHATSAPP_APP_SECRET_ENV_KEY}"
+          MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS: "${WEBHOOK_ALLOW_UNAUTHENTICATED}"
 
           # Failure capture
           CAPTURE_FAILED_EVENTS: "${CAPTURE_FAILED_EVENTS}"
@@ -407,7 +520,7 @@ cat >> template.yaml <<EOF
 
           # Locks
           LOCKS_TABLE_NAME: !Ref ProcessingLocksTable
-          LOCK_TTL_SECONDS: "180"
+          LOCK_TTL_SECONDS: "${LOCK_TTL_SECONDS}"
       Events:
 EOF
 
@@ -473,9 +586,23 @@ if ! aws s3api head-bucket --bucket "${DEPLOY_BUCKET}" 2>/dev/null; then
   aws s3 mb "s3://${DEPLOY_BUCKET}" --region "${REGION}"
 fi
 
-# --- Ensure modern build toolchain before sam build ---
-echo ">> Upgrading pip / setuptools / wheel"
-python3 -m pip install --quiet --upgrade pip "setuptools>=77" wheel
+# --- Ensure modern build toolchain before sam build (best effort) ---
+# An externally managed system Python (PEP 668, e.g. Debian/Ubuntu) refuses this; that must not
+# abort the deploy under set -e.
+echo ">> Upgrading pip / setuptools / wheel (best effort)"
+if ! python3 -m pip install --quiet --upgrade pip "setuptools>=77" wheel; then
+  echo "[WARN] Could not upgrade pip/setuptools/wheel (for example an externally managed system Python, PEP 668)."
+  echo "       Continuing with the installed versions. If sam build then fails building packages, run maws update from a virtualenv."
+fi
+
+# sam build needs a local interpreter matching the Lambda runtime (unless it builds in a container).
+if [[ "${LAMBDA_RUNTIME}" == python3.* ]] && ! command -v "${LAMBDA_RUNTIME}" >/dev/null 2>&1; then
+  LOCAL_PYTHON=$(python3 -c 'import sys; print("python%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")
+  if [[ "${LOCAL_PYTHON}" != "${LAMBDA_RUNTIME}" ]]; then
+    echo "[WARN] The Lambda runtime is ${LAMBDA_RUNTIME} but ${LAMBDA_RUNTIME} is not on PATH (python3 is ${LOCAL_PYTHON})."
+    echo "       sam build will likely fail: install ${LAMBDA_RUNTIME}, or set \"infra\": {\"runtime\": \"${LOCAL_PYTHON}\"} in params.json."
+  fi
+fi
 
 # --- Stage the Lambda package ---
 # SAM CLI does not read .samignore: everything under CodeUri ships in the zip and stays in the
@@ -545,33 +672,29 @@ WEBHOOK_URL="${API_URL}$(printf "%s" "${API_PATH}")"
 echo ">> API URL: ${API_URL}"
 echo ">> Webhook full URL: ${WEBHOOK_URL}"
 
-# --- Local state to avoid repeating setWebhook ---
-STATE_FILE=".bootstrap_state.json"
-touch "${STATE_FILE}"
-
 if [[ "${BOT}" == "telegram" ]]; then
-  KEY="${TELEGRAM_ENV_KEY:-TELEGRAM_TOKEN}"
-  TOKEN="${!KEY:-}"
-  SECRET_KEY="${TELEGRAM_SECRET_ENV_KEY:-TELEGRAM_WEBHOOK_SECRET_TOKEN}"
-  SECRET_TOKEN="${!SECRET_KEY:-}"
-  if [[ -z "${TOKEN}" ]]; then
-    echo "[WARN] Could not find ${KEY} in .env.prod; cannot set the Telegram webhook."
+  # setWebhook is idempotent and always called, so a changed URL or secret always reaches Telegram.
+  # secret_token is only omitted on allow_unauthenticated deploys without a configured secret.
+  echo ">> Setting Telegram webhook..."
+  CURL_ARGS=(--data-urlencode "url=${WEBHOOK_URL}")
+  if [[ -n "${TELEGRAM_SECRET_VALUE}" ]]; then
+    CURL_ARGS+=(--data-urlencode "secret_token=${TELEGRAM_SECRET_VALUE}")
+  fi
+  if ! TG_RESPONSE=$(curl -sS --max-time 30 "https://api.telegram.org/bot${TELEGRAM_TOKEN_VALUE}/setWebhook" "${CURL_ARGS[@]}"); then
+    die "[ERR] Could not reach the Telegram API to set the webhook." \
+      "      The stack is deployed, but Telegram will not deliver updates to it. Re-run maws update to retry."
+  fi
+  TG_OK=$(printf '%s' "${TG_RESPONSE}" | jq -r 'if type == "object" then (.ok == true) else false end' 2>/dev/null || echo "false")
+  if [[ "${TG_OK}" != "true" ]]; then
+    TG_DESCRIPTION=$(printf '%s' "${TG_RESPONSE}" | jq -r 'if type == "object" then (.description // "no description") else "unexpected response" end' 2>/dev/null || echo "unexpected (non-JSON) response")
+    die "[ERR] Telegram rejected setWebhook: ${TG_DESCRIPTION}" \
+      "      The stack is deployed, but Telegram will not deliver updates to it." \
+      "      Check ${TELEGRAM_ENV_KEY} and ${TELEGRAM_SECRET_ENV_KEY} in .env.prod, then re-run maws update."
+  fi
+  if [[ -n "${TELEGRAM_SECRET_VALUE}" ]]; then
+    echo "[OK] Telegram webhook set to: ${WEBHOOK_URL} (secret token enabled)"
   else
-    PREV=$(jq -r '."telegram_webhook" // empty' "${STATE_FILE}" 2>/dev/null || true)
-    if [[ "${PREV}" != "${WEBHOOK_URL}" ]]; then
-      echo ">> Setting Telegram webhook..."
-      CURL_ARGS=(-d "url=${WEBHOOK_URL}")
-      if [[ -n "${SECRET_TOKEN}" ]]; then
-        CURL_ARGS+=(-d "secret_token=${SECRET_TOKEN}")
-      fi
-      curl -s "https://api.telegram.org/bot${TOKEN}/setWebhook" "${CURL_ARGS[@]}" >/dev/null
-      tmp=$(mktemp)
-      jq --arg url "${WEBHOOK_URL}" '.telegram_webhook=$url' "${STATE_FILE}" 2>/dev/null > "$tmp" || echo "{\"telegram_webhook\":\"${WEBHOOK_URL}\"}" > "$tmp"
-      mv "$tmp" "${STATE_FILE}"
-      echo "[OK] Telegram webhook set to: ${WEBHOOK_URL}"
-    else
-      echo "Telegram webhook was already set; skipping."
-    fi
+    echo "[OK] Telegram webhook set to: ${WEBHOOK_URL} (UNAUTHENTICATED: no secret token)"
   fi
 else
   echo "[INFO] WhatsApp webhooks:"
@@ -579,10 +702,10 @@ else
   echo "      ${WEBHOOK_URL}"
   echo "    - Verify token (from .env.prod) => key: ${WHATSAPP_VERIFY_ENV_KEY:-WHATSAPP_VERIFY_TOKEN}"
   echo "    - Remember to add the same verify token in your Meta app."
-  if [[ "${WHATSAPP_VERIFY_SIGNATURE}" == "true" ]]; then
-    echo "    - POST signature verification is enabled; .env.prod must contain ${WHATSAPP_APP_SECRET_ENV_KEY}."
+  if [[ "${WEBHOOK_WHATSAPP_VERIFY}" == "true" ]]; then
+    echo "    - POST signature verification (X-Hub-Signature-256) is enabled with ${WHATSAPP_APP_SECRET_ENV_KEY}."
   else
-    echo "    - For production, consider setting webhook_security.whatsapp_verify_signature=true and ${WHATSAPP_APP_SECRET_ENV_KEY}."
+    echo "    - [WARN] POST signature verification is OFF (webhook_security.allow_unauthenticated=true)."
   fi
 fi
 

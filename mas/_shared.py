@@ -34,6 +34,11 @@ try:
 except ImportError:
     def load_dotenv(*args, **kwargs):
         raise ImportError("python-dotenv is required to load .env files. Install mas[env].")
+try:
+    from dotenv import dotenv_values
+except ImportError:
+    def dotenv_values(*args, **kwargs):
+        raise ImportError("python-dotenv is required to load .env files. Install mas[env].")
 import inspect
 from datetime import datetime, timezone, timedelta
 import mimetypes, shutil

@@ -23,18 +23,21 @@ def read_google_doc(manager, messages):
     else:
         return {"doc_text": f"Error: {response.status_code}, {response.text}"}
 
-def weather_query(manager, location: str, unit: str = "metric") -> tuple:
+def weather_query(manager, location: str, unit: str = "metric") -> dict:
     import requests
 
     API_KEY = manager.get_key("WEATHER_API_KEY")
     BASE_URL = "http://api.weatherapi.com/v1/current.json"
 
-    if unit == "metric":
-        temp_unit = "C"
-    elif unit == "imperial":
-        temp_unit = "F"
-    else:
+    # Models often answer "celsius" or "F" instead of the documented values.
+    unit_aliases = {
+        "metric": "metric", "celsius": "metric", "c": "metric",
+        "imperial": "imperial", "fahrenheit": "imperial", "f": "imperial",
+    }
+    unit = unit_aliases.get(str(unit or "metric").strip().lower())
+    if unit is None:
         raise ValueError("Invalid unit. Use 'metric' or 'imperial'.")
+    temp_unit = "C" if unit == "metric" else "F"
 
     params = {
         "key": API_KEY,
@@ -52,10 +55,15 @@ def weather_query(manager, location: str, unit: str = "metric") -> tuple:
         wind_speed = data["current"]["wind_kph" if unit == "metric" else "wind_mph"]
         location_name = f"{data['location']['name']}, {data['location']['country']}"
 
-        return (temperature, condition, wind_speed, location_name)
+        return {
+            "temperature": temperature,
+            "condition": condition,
+            "wind_speed": wind_speed,
+            "location_name": location_name,
+        }
 
     except requests.RequestException as e:
-        return (None, "Unavailable", None, location)
+        return {"temperature": None, "condition": "Unavailable", "wind_speed": None, "location_name": location}
 
 def markdown_to_pdf(manager, messages):
     import markdown
@@ -252,18 +260,21 @@ def find_food_places(manager, radius, keyword, location):
     food_places = api_formatting(response)
 
     results_list = []
+    max_results = 5
 
-    # Retrieve place details
+    # Retrieve place details (a billable call per place) only for the places that are returned.
     for place in food_places:
+        if len(results_list) >= max_results:
+            break
         try:
             details = get_place_details(google_api_key, place["place_id"])
             results_list.append(details)
         except Exception as e:
             continue
 
-    results = api_formatting_2(results_list)
+    results = api_formatting_2(results_list, max_results=max_results)
 
-    return {"search_results": results}
+    return {"search_response": results}
 
 def get_lat_lng(api_key, address):
     import requests

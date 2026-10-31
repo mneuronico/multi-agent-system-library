@@ -484,7 +484,8 @@ def test_tool_rejects_non_dict_and_missing_output_returns(workspace_tmp_path):
 
 def test_process_accepts_manager_and_messages_in_any_order(workspace_tmp_path):
     manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
-    manager.add_blocks({"response": "hello"}, user_id="user-1")
+    manager.set_current_user("user-1")
+    manager.add_blocks({"response": "hello"})
 
     def summarize(messages, manager):
         return {"count": len(messages), "base": bool(manager.base_directory)}

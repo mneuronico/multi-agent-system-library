@@ -16,8 +16,44 @@ def _ask(prompt: str, default: str = None) -> str:
     if not _is_tty():
         return default or ""
     suffix = f" [{default}]" if default else ""
-    response = input(f"{prompt}{suffix}: ").strip()
+    try:
+        response = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        return default or ""
     return response or default or ""
+
+def _ask_required(prompt: str, missing_msg: str, attempts: int = 3) -> str:
+    """Prompt for a value that cannot be empty. Returns "" if none could be obtained.
+
+    Without a TTY nothing can be typed, so this gives up at once instead of looping forever.
+    """
+    if not _is_tty():
+        return ""
+    for _ in range(attempts):
+        value = _ask(prompt)
+        if value:
+            return value
+        print(missing_msg)
+    return ""
+
+def _write_new_file(path: Path, content: str) -> bool:
+    """Create ``path`` with ``content`` unless it already exists. Never overwrites."""
+    try:
+        with open(path, "x", encoding="utf-8") as fh:
+            fh.write(content)
+    except FileExistsError:
+        return False
+    return True
+
+def _print_file_report(created: list, kept: list) -> None:
+    if created:
+        print("Created files:")
+        for path in created:
+            print(f"- {path}")
+    if kept:
+        print("Kept existing files (not overwritten):")
+        for path in kept:
+            print(f"- {path}")
 
 def _ask_choice(prompt: str, choices: list[str], default: str) -> str:
     """Prompt the user to choose an option from a list."""
@@ -39,7 +75,13 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
         if config_str.endswith(".json") and os.path.exists(config_str):
             # Case 1: existing JSON file
             target_json_path = project_dir / "config.json"
-            shutil.copy(config_str, target_json_path)
+            try:
+                with open(config_str, "rb") as src, open(target_json_path, "xb") as dst:
+                    shutil.copyfileobj(src, dst)
+            except FileExistsError:
+                print(f"\n'{target_json_path}' already exists and was kept (not overwritten).")
+                print(f"Move or delete it first if you want to replace it with '{config_str}'.")
+                return 1
             print(f"\nMAS project created successfully from '{config_str}'!")
             print(f"- Configuration copied to: {target_json_path}")
             print("- Remember to create your .env file with the required API keys.")
@@ -47,9 +89,19 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
         elif not os.path.exists(config_str) and AgentSystemManager._looks_like_config_path(config_str):
             print(f"\nConfig file not found: '{config_str}'. Nothing was generated.")
             print("To generate a system from a description, pass a sentence describing it.")
+            return 1
 
         else:
             # Case 2: natural language description (bootstrap)
+            existing = [project_dir / name for name in ("config.json", "fns.py") if (project_dir / name).exists()]
+            if existing:
+                # Generating would replace these files, so stop before asking for anything.
+                print("\nA MAS project already exists here. These files were kept (not overwritten):")
+                for path in existing:
+                    print(f"- {path}")
+                print("Move or delete them first, or choose another directory with --directory.")
+                return 1
+
             print("\nWelcome to the MAS system creation wizard.")
             print("An LLM will be used to generate the project configuration.")
 
@@ -66,11 +118,19 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
 
             # 2. Ask for the bootstrap API key (required)
             bootstrap_key_name = f"{bootstrap_provider.upper()}_API_KEY"
-            bootstrap_api_key = ""
-            while not bootstrap_api_key:
-                bootstrap_api_key = _ask(f"Enter your {bootstrap_key_name} (required for this process)")
-                if not bootstrap_api_key:
-                    print("An API key is required so the LLM can generate the system.")
+            bootstrap_api_key = _ask_required(
+                f"Enter your {bootstrap_key_name} (required for this process)",
+                "An API key is required so the LLM can generate the system.",
+            )
+            if not bootstrap_api_key:
+                if not _is_tty():
+                    print(
+                        f"\nAborted: generating a system needs your {bootstrap_key_name}, and it can only "
+                        "be typed in an interactive terminal (stdin is not a TTY). Nothing was generated."
+                    )
+                else:
+                    print(f"\nAborted: no {bootstrap_key_name} was provided. Nothing was generated.")
+                return 1
 
             os.environ[bootstrap_key_name] = bootstrap_api_key
 
@@ -102,36 +162,56 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
                     verbose=verbose
                 )
 
-                # 6. Create the .env file for the final system
+                # 6. Create the .env file for the final system (an existing one is kept)
                 target_api_key_name = f"{target_provider.upper()}_API_KEY"
                 target_api_key_value = ""
+                env_path = project_dir / ".env"
+                env_created = False
 
-                if target_provider == bootstrap_provider:
-                    target_api_key_value = bootstrap_api_key
-                else:
-                    target_api_key_value = _ask(f"Enter your {target_api_key_name} for the final system (optional)")
+                if not env_path.exists():
+                    if target_provider == bootstrap_provider:
+                        target_api_key_value = bootstrap_api_key
+                    else:
+                        target_api_key_value = _ask(f"Enter your {target_api_key_name} for the final system (optional)")
 
-                env_content = f"{target_api_key_name}={target_api_key_value}\n" if target_api_key_value else f"# {target_api_key_name}=\n"
-                (project_dir / ".env").write_text(env_content)
+                    env_content = f"{target_api_key_name}={target_api_key_value}\n" if target_api_key_value else f"# {target_api_key_name}=\n"
+                    env_created = _write_new_file(env_path, env_content)
 
                 print("\nMAS project generated successfully!")
-                print("Generated files:")
-                print(f"- {project_dir / 'config.json'}")
-                print(f"- {project_dir / 'fns.py'}")
-                print(f"- {project_dir / '.env'}")
+                _print_file_report(
+                    created=[project_dir / "config.json", project_dir / "fns.py"] + ([env_path] if env_created else []),
+                    kept=[] if env_created else [env_path],
+                )
                 print("\nNext steps:")
-                if not target_api_key_value:
+                if env_created and not target_api_key_value:
                     print(f"1. Edit the `.env` file and add your {target_api_key_name}.")
+                elif not env_created:
+                    print(f"1. Make sure your existing `.env` file has a {target_api_key_name}.")
                 print("2. Review `config.json` and `fns.py` to inspect the generated system.")
                 print("3. Run `mas start` again to create a `main.py` for testing, or craft your own!")
 
             except Exception as e:
                 print(f"\nAn error occurred while generating the system: {e}")
                 print("Please make sure your bootstrap API key is correct and that the model is accessible.")
+                return 1
+
+        return 0
 
     else:
         print("Welcome to the MAS configuration assistant.")
         print(f"The project files will be created at: {project_dir.resolve()}")
+
+        paths = {name: project_dir / name for name in ("config.json", ".env", "fns.py", "main.py")}
+        existing = [name for name, path in paths.items() if path.exists()]
+        if existing:
+            print(f"Existing files will be kept (not overwritten): {', '.join(existing)}")
+        if len(existing) == len(paths):
+            print("\nNothing to create: this directory already has a MAS project.")
+            _print_file_report(created=[], kept=list(paths.values()))
+            return 0
+
+        need_config = "config.json" not in existing
+        need_env = ".env" not in existing
 
         default_models = {
             "google": "gemini-2.5-flash",
@@ -139,14 +219,19 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
             "openrouter": "openai/gpt-5-nano",
             "groq": "openai/gpt-oss-120b",
         }
-        provider = _ask_choice("Choose an LLM provider", list(default_models.keys()), "google")
-        model = _ask("Enter the model name", default_models[provider])
+        provider = model = None
+        if need_config or need_env:
+            provider = _ask_choice("Choose an LLM provider", list(default_models.keys()), "google")
+        if need_config:
+            model = _ask("Enter the model name", default_models[provider])
 
-        # 2. Ask for the API key (optional)
-        api_key_name = f"{provider.upper()}_API_KEY"
-        api_key_value = _ask(f"Enter your {api_key_name} (optional, you may leave it blank)")
+        # 2. Ask for the API key (optional), only when a new .env will be written
+        api_key_name = f"{provider.upper()}_API_KEY" if provider else None
+        api_key_value = ""
+        if need_env:
+            api_key_value = _ask(f"Enter your {api_key_name} (optional, you may leave it blank)")
 
-        # 3. Create the files
+        # 3. Create the files that do not exist yet
         config_content = {
             "general_parameters": {
                 "api_keys_path": ".env",
@@ -165,17 +250,19 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
                 }
             ]
         }
-        (project_dir / "config.json").write_text(json.dumps(config_content, indent=4))
+        contents = {}
+        if need_config:
+            contents["config.json"] = json.dumps(config_content, indent=4)
 
         # .env
-        env_content = f"{api_key_name}={api_key_value}\n" if api_key_value else f"# {api_key_name}=\n"
-        (project_dir / ".env").write_text(env_content)
+        if need_env:
+            contents[".env"] = f"{api_key_name}={api_key_value}\n" if api_key_value else f"# {api_key_name}=\n"
 
         # fns.py
-        (project_dir / "fns.py").write_text("# Define the functions for your Tools and Processes here.\n")
+        contents["fns.py"] = "# Define the functions for your Tools and Processes here.\n"
 
         # main.py
-        main_py_content = (
+        contents["main.py"] = (
             'from mas import AgentSystemManager\n\n'
             '# Initialize the manager from the configuration file\n'
             'try:\n'
@@ -191,19 +278,22 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
             '    print(f"An error occurred: {e}")\n'
             '    print("Please make sure the API key in your .env file is correct.")\n'
         )
-        (project_dir / "main.py").write_text(main_py_content)
+
+        created, kept = [], []
+        for name, path in paths.items():
+            if name in contents and _write_new_file(path, contents[name]):
+                created.append(path)
+            else:
+                kept.append(path)
 
         # 4. Confirmation message
         print("\nMAS project created successfully!")
-        print("Generated files:")
-        print(f"- {project_dir / 'config.json'}")
-        print(f"- {project_dir / '.env'}")
-        print(f"- {project_dir / 'fns.py'}")
-        print(f"- {project_dir / 'main.py'}")
+        _print_file_report(created, kept)
         print("\nNext steps:")
-        if not api_key_value:
+        if paths[".env"] in created and not api_key_value:
             print(f"1. Edit the `.env` file and add your {api_key_name}.")
         print("2. Run `python main.py` to test your agent.")
+        return 0
 
 # >> ADD THIS FUNCTION BEFORE THE `main` FUNCTION <<
 

@@ -406,8 +406,7 @@ class Agent(Component):
                 )
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.warning(f"[Agent:{self.name}] No API key for '{provider}'. Skipping.")
+                logger.warning(f"[Agent:{self.name}] No API key for provider '{provider}'; skipping model {model_name}.")
                 continue
             
             formatted_conversation = self._provider_format_messages(provider, conversation)
@@ -511,15 +510,11 @@ class Agent(Component):
                 self._record_manager_model_success(provider, model_name, model_info, provider_metadata)
 
                 response_dict = self._extract_and_parse_json(response_str)
-
                 if response_dict is None:
-                    response_dict = {"response": response_str}
+                    response_dict = response_str
 
-                response_blocks = self.manager._to_blocks(
-                    response_dict, self.manager._active_user_id()
-                )
+                response_blocks = self._model_output_blocks(response_dict)
 
-                self._last_used_model = {"provider": provider, "model": model_name}
                 if verbose:
                     logger.debug(f"[Agent:{self.name}] => success from provider={provider}\n{response_dict}")
                 
@@ -538,38 +533,55 @@ class Agent(Component):
                 failure_metadata = self._provider_exception_metadata(provider, model_name, req_err)
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.error(f"[Agent:{self.name}] HTTP error with provider={provider}, model={model_name}: {req_err}")
+                logger.warning(f"[Agent:{self.name}] HTTP error with provider={provider}, model={model_name}: {req_err}")
             except json.JSONDecodeError as json_err:
                 failure_metadata = self._provider_exception_metadata(provider, model_name, json_err)
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.error(f"[Agent:{self.name}] JSON decoding error with provider={provider}, model={model_name}: {json_err}")
+                logger.warning(f"[Agent:{self.name}] JSON decoding error with provider={provider}, model={model_name}: {json_err}")
             except ValueError as val_err:
                 failure_metadata = self._provider_exception_metadata(provider, model_name, val_err)
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.error(f"[Agent:{self.name}] Value error with provider={provider}, model={model_name}: {val_err}")
+                logger.warning(f"[Agent:{self.name}] Value error with provider={provider}, model={model_name}: {val_err}")
             except (KeyError, IndexError, TypeError) as parse_err:
                 failure_metadata = self._provider_exception_metadata(provider, model_name, parse_err)
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.error(
-                        f"[Agent:{self.name}] Invalid response shape with provider={provider}, "
-                        f"model={model_name}: {parse_err}"
-                    )
+                logger.warning(
+                    f"[Agent:{self.name}] Invalid response shape with provider={provider}, "
+                    f"model={model_name}: {parse_err}"
+                )
 
-        if verbose:
-            logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self._runtime_default_output()}")
+        logger.error(
+            f"[Agent:{self.name}] All configured models failed or were skipped; returning default_output. "
+            "Errors are in the message metadata under 'provider_errors'."
+        )
         default_blocks = self.manager._to_blocks(
             self._runtime_default_output(),
             self.manager._active_user_id()
         )
         self._attach_provider_metadata(default_blocks, None, provider_attempts)
         return default_blocks
+
+    def _model_output_blocks(self, parsed: Any) -> List[Dict[str, Any]]:
+        # Model output is untrusted data. The only blocks it may produce are variable blocks for
+        # variables declared in general_parameters.variables. Anything else (component overrides
+        # such as "agent:system_prompt" or "agent:base_url", image/document blocks pointing at
+        # local paths, unknown block types) is stored as plain text content.
+        candidates = parsed if isinstance(parsed, list) else [parsed]
+        if candidates and all(self._is_declared_variable_block(item) for item in candidates):
+            return self.manager._to_blocks(candidates, self.manager._active_user_id())
+        if not isinstance(parsed, dict):
+            parsed = {"response": parsed}
+        return [{"type": "text", "content": parsed}]
+
+    def _is_declared_variable_block(self, value: Any) -> bool:
+        if not (isinstance(value, dict) and value.get("type") == "variable" and "value" in value):
+            return False
+        key = value.get("key")
+        declared = getattr(self.manager, "variable_definitions", None) or {}
+        return isinstance(key, str) and key.strip() in declared
 
     def _as_blocks(self, value):
         is_block = getattr(self.manager, "_is_block", None)
@@ -747,6 +759,24 @@ class Agent(Component):
 
     def _remember_provider_response(self, metadata: Dict[str, Any]) -> None:
         self._last_provider_response_metadata = metadata
+
+    _call_state_lock = threading.Lock()
+
+    def _call_state(self):
+        # One Agent instance serves every user concurrently, so per-call data must be per thread.
+        state = self.__dict__.get("_thread_call_state")
+        if state is None:
+            with Agent._call_state_lock:
+                state = self.__dict__.setdefault("_thread_call_state", threading.local())
+        return state
+
+    @property
+    def _last_provider_response_metadata(self) -> Optional[Dict[str, Any]]:
+        return getattr(self._call_state(), "provider_response", None)
+
+    @_last_provider_response_metadata.setter
+    def _last_provider_response_metadata(self, metadata: Optional[Dict[str, Any]]) -> None:
+        self._call_state().provider_response = metadata
 
     def _record_manager_model_failure(
         self,
@@ -2473,8 +2503,7 @@ class Tool(Component):
             missing += [p.name for p in pos_or_kw if p.default is inspect._empty and p.name not in input_dict]
             missing += [p.name for p in kw_only   if p.default is inspect._empty and p.name not in input_dict]
             if missing:
-                if verbose:
-                    logger.error(f"[Tool:{self.name}] Required arguments are missing: {missing}")
+                logger.error(f"[Tool:{self.name}] Required arguments are missing: {missing}; returning default_output.")
                 return self._runtime_default_output()
 
             pos_args = []
@@ -2823,9 +2852,8 @@ class Process(Component):
                 logger.debug(f"[Process:{self.name}] => {output}")
 
             return output
-        except (TypeError, ValueError) as e:
-            if verbose:
-                logger.exception(f"[Process:{self.name}] => error: {e}")
+        except Exception as e:
+            logger.exception(f"[Process:{self.name}] => error: {e}")
             return {}
 
 
@@ -3417,12 +3445,10 @@ class Automation(Component):
             self.manager.set_current_user(active_user_id)
         comp = node["component"]
         if comp is None:
-            if verbose:
-                logger.warning(
-                    f"[Automation:{self.name}] => no such component "
-                    f"'{node['component_name']}'. Skipping."
-                )
-            return {"node": node, "component": None, "output": None, "skipped": True}
+            raise ValueError(
+                f"[Automation:{self.name}] Step '{node['step']}' refers to unknown component "
+                f"'{node['component_name']}'."
+            )
 
         output = self._run_component_step(
             comp,
@@ -3506,9 +3532,7 @@ class Automation(Component):
 
             comp = self.manager._get_component(comp_name)
             if not comp:
-                if verbose:
-                    logger.warning(f"[Automation:{self.name}] => no such component '{comp_name}'. Skipping.")
-                return current_output
+                raise ValueError(f"[Automation:{self.name}] Step '{step}' refers to unknown component '{comp_name}'.")
 
             if verbose:
                 logger.debug(f"[Automation:{self.name}] => running component '{comp_name}'")

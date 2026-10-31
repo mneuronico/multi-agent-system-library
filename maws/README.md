@@ -4,10 +4,11 @@
 
 * lazy initialization of `AgentSystemManager`
 * webhook handling for **WhatsApp** and **Telegram**
-* webhook verification (WhatsApp)
+* mandatory webhook authentication (Telegram secret token, WhatsApp `X-Hub-Signature-256`) with an explicit opt-out
+* webhook verification (WhatsApp GET)
 * **self-invocation** to process work in the background (avoids API Gateway timeouts)
 * optional **SQS FIFO** processing for production bots that must not drop messages
-* per-user **locking** with **DynamoDB TTL** to avoid concurrent processing
+* per-user **locking** with **DynamoDB** conditional writes to avoid concurrent processing
 * optional S3-backed user media/file persistence
 * synchronization of **tokens/keys** between **S3** and the ephemeral `/tmp` filesystem
 * configuration loading from **SSM Parameter Store** (SecureString)
@@ -86,10 +87,11 @@ That's it. `maws` wires everything to MAS, handles webhook GET/POST, background 
 | `SPECIAL_TOKEN_FILES_JSON` | No       | `"[]"`       | JSON list of token file names to sync into `/tmp`.                   |
 | `TOKEN_ENV_MAP_JSON`       | No       | `"{}"`       | JSON `{ "file": "ENV_VAR" }` to expose file paths via env vars.      |
 | `LOCKS_TABLE_NAME`         | No       | none         | DynamoDB table name for per-user **locking**.                        |
-| `LOCK_TTL_SECONDS`         | No       | `"180"`      | Lock TTL (seconds).                                                  |
-| `TELEGRAM_WEBHOOK_SECRET_TOKEN` | No  | none         | Provider-supported Telegram webhook secret token.                    |
-| `WHATSAPP_VERIFY_SIGNATURE` | No      | `"false"`   | When `true`, verify WhatsApp `X-Hub-Signature-256`.                  |
-| `WHATSAPP_APP_SECRET`      | If verifying | none    | Meta app secret used for WhatsApp signature verification.            |
+| `LOCK_TTL_SECONDS`         | No       | `"180"` (deploys: `lambda_timeout + 15`) | Lock lifetime when no Lambda context is available. Inside Lambda a lock expires 15 s after the invocation's deadline. |
+| `TELEGRAM_WEBHOOK_SECRET_TOKEN` | Telegram | none    | Telegram webhook secret token. Without it Telegram POSTs are refused (500) unless unauthenticated webhooks are allowed. |
+| `WHATSAPP_VERIFY_SIGNATURE` | No      | `"true"`     | Verify WhatsApp `X-Hub-Signature-256`. `false` is only honored with `MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS=true`. |
+| `WHATSAPP_APP_SECRET`      | WhatsApp | none        | Meta app secret used for WhatsApp signature verification.            |
+| `MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS` | No | `"false"` | Explicit opt-out: accept webhook POSTs when no provider secret is configured. Not for production. |
 | `MAWS_HISTORY_APPEND_ENABLED` | No    | `"false"`    | Enables the `/history/outgoing` endpoint. When `false`, MAWS behaves exactly as before. |
 | `MAWS_HISTORY_WRITE_SECRET` | For history writes | none | Shared secret used to authenticate external history append requests. |
 | `MAWS_HISTORY_APPEND_ROLE` | No       | inferred     | Agent name that appended messages are attributed to.                 |
@@ -129,12 +131,12 @@ Returns a **Lambda handler** already configured for the chosen bot.
 * Optional FIFO mode: enqueues normalized jobs to SQS FIFO instead of self-invoking.
 * In the "second hop":
 
-  * Takes a **lock** per `user_id` (or one global lock in shared-history mode) if `LOCKS_TABLE_NAME` is set; if the lock exists in default `"drop"` mode, it **ignores** the update.
+  * Takes a **lock** per `user_id` (or one global lock in shared-history mode) if `LOCKS_TABLE_NAME` is set; if the lock is held in default `"drop"` mode, it **ignores** the update. In `"fifo"` mode the SQS invocation fails instead, so SQS redelivers the message after the visibility timeout.
   * **Imports** history from S3 if present.
   * Optionally syncs per-user files/media from S3.
   * Executes `process_webhook_update`.
   * **Exports** history and optionally files/media to S3.
-  * **Releases** the lock (or TTL cleans it up).
+  * **Releases** the lock, also when saving fails (a crashed worker's lock simply expires).
 
 You do not need to change anything inside your MAS bot/base class.
 
@@ -159,7 +161,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: lambda_function.lambda_handler
-      Runtime: python3.9
+      Runtime: python3.12
+      Timeout: 120
       CodeUri: package/   # only your code: never .env files, histories or other secrets
       Policies:
         - AWSLambdaBasicExecutionRole
@@ -194,7 +197,8 @@ Resources:
           SPECIAL_TOKEN_FILES_JSON: '[]'
           TOKEN_ENV_MAP_JSON: '{}'
           LOCKS_TABLE_NAME: !Ref ProcessingLocksTable
-          LOCK_TTL_SECONDS: "180"
+          LOCK_TTL_SECONDS: "135"   # Timeout + 15
+          # .env (via SSM) must contain WHATSAPP_APP_SECRET (or TELEGRAM_WEBHOOK_SECRET_TOKEN for Telegram)
       Events:
         WebhookGET:
           Type: Api
@@ -214,15 +218,17 @@ To avoid API Gateway timeouts, maws:
 
 1. Responds **quickly** to the POST (200 OK).
 2. **Self-invokes** with the actual payload to process in the background.
-3. Uses DynamoDB TTL as a per-user lock (`user_id`) to avoid duplicates when messages arrive in rapid succession.
+3. Uses a DynamoDB item as a per-user lock (`user_id`) to avoid duplicates when messages arrive in rapid succession.
 
 If you do not configure `LOCKS_TABLE_NAME`, locking is **disabled** (best-effort behavior).
+
+Lock expiry is enforced by the conditional write (`expiresAt < now`), not by DynamoDB TTL, which only cleans up old items and can lag for days. Inside Lambda a lock expires 15 seconds after the invocation's deadline: it outlives any running worker, and a crashed worker's lock is gone before SQS redelivers its message (the queue's visibility timeout is `lambda_timeout + 30`). Each lock carries a random token, so a worker only deletes its own lock.
 
 ### Busy-message policy
 
 The default `MAWS_BUSY_POLICY=drop` preserves the original MAWS behavior: if a user's lock is already held, the new update is acknowledged and ignored. This can be desirable when processing messages sent while the bot was still thinking would make the conversation order confusing.
 
-Set `busy_policy` to `"fifo"` in `params.json` to generate an SQS FIFO queue. In FIFO mode MAWS enqueues one normalized job per provider message, uses the chat id as the FIFO message group in per-user history mode, and uses one global group in shared-history mode to avoid SQLite history races. Failed SQS jobs can retry and, when configured, move to a DLQ.
+Set `busy_policy` to `"fifo"` in `params.json` to generate an SQS FIFO queue. In FIFO mode MAWS enqueues one normalized job per provider message, uses the chat id as the FIFO message group in per-user history mode, and uses one global group in shared-history mode to avoid SQLite history races. Failed SQS jobs can retry and, when configured, move to a DLQ. A job whose user lock is still held (for example by a crashed worker) fails its invocation instead of being acknowledged, so SQS redelivers it after the visibility timeout and the group keeps its order; each such retry counts toward the DLQ's `maxReceiveCount` (3).
 
 ```json
 {
@@ -236,12 +242,26 @@ Set `busy_policy` to `"fifo"` in `params.json` to generate an SQS FIFO queue. In
 
 ### Webhook security
 
-MAWS only uses provider-supported webhook security mechanisms:
+MAWS only uses provider-supported webhook security mechanisms, and webhook authentication is **mandatory**:
 
-* **Telegram**: set `TELEGRAM_WEBHOOK_SECRET_TOKEN` in `.env.prod`. During deploy, MAWS passes it to Telegram `setWebhook` as `secret_token`. At runtime, MAWS requires incoming POSTs to include the matching `X-Telegram-Bot-Api-Secret-Token` header.
-* **WhatsApp**: keep the existing GET verify-token flow. For POST authenticity, set `webhook_security.whatsapp_verify_signature=true` in `params.json` and set `WHATSAPP_APP_SECRET` in `.env.prod`. MAWS verifies `X-Hub-Signature-256` against the raw request body.
+* **Telegram**: `TELEGRAM_WEBHOOK_SECRET_TOKEN` in `.env.prod` (`maws start` generates one). During deploy, MAWS passes it to Telegram `setWebhook` as `secret_token`. At runtime, MAWS requires incoming POSTs to include the matching `X-Telegram-Bot-Api-Secret-Token` header. Telegram only accepts 1-256 characters from `A-Z a-z 0-9 _ -`; generate one with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`.
+* **WhatsApp**: keep the existing GET verify-token flow. For POST authenticity, set `WHATSAPP_APP_SECRET` in `.env.prod` (Meta App Dashboard > App settings > Basic > App secret). MAWS verifies `X-Hub-Signature-256` against the raw request body; `webhook_security.whatsapp_verify_signature` defaults to `true`.
 
-Both checks are opt-in so existing bots do not break. Production deployments should enable the matching provider mechanism.
+`maws update` fails before uploading anything when the secret is missing (or, for Telegram, has invalid characters). Write `.env.prod` as plain `KEY=value` lines without quotes or `export`: Lambda reads the file that way. At runtime a POST without a configured secret is refused with `500`, so the provider retries once the configuration is fixed.
+
+Telegram `setWebhook` runs on every deploy; if Telegram rejects it, `maws update` exits non-zero and prints Telegram's `description` (the stack is already deployed at that point; fix `.env.prod` and re-run).
+
+To deploy without webhook authentication (local experiments only), opt out explicitly:
+
+```json
+{
+  "webhook_security": {
+    "allow_unauthenticated": true
+  }
+}
+```
+
+The deploy then prints a loud warning and sets `MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS=true`. A secret that is configured is still enforced (for WhatsApp, unless `whatsapp_verify_signature` is `false`). `whatsapp_verify_signature: false` is only accepted together with this opt-out.
 
 ### Appending externally sent messages
 
@@ -335,7 +355,8 @@ ANOTHER=VAL
 
 ## Requirements
 
-* Python 3.9+ (compatible with the Lambda `python3.9` runtime).
+* Python 3.9+ for the library. Deploys default to the Lambda `python3.12` runtime (`infra.runtime` in `params.json`); `sam build` needs that Python version installed locally, so set `infra.runtime` to match your local `python3` if needed.
+* The deploy tries to upgrade pip/setuptools/wheel and only warns if it cannot (for example an externally managed system Python, PEP 668).
 * AWS: S3, API Gateway, (optional) DynamoDB, (optional) SSM Parameter Store.
 * Libraries: `mas`, `boto3`, `requests` (plus their transitive dependencies).
 
