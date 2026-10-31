@@ -63,12 +63,14 @@ class AgentSystemManager:
         self.api_keys_path = None
 
         self.timeout = timeout
-        
-        description_mode = (
-            isinstance(config, str)
-            and not config.lower().endswith(".json")
-            and not os.path.exists(config)
-        )
+
+        if isinstance(config, str) and not os.path.exists(config) and self._looks_like_config_path(config):
+            raise FileNotFoundError(
+                f"MAS config file not found: '{config}'. Plain-text descriptions are only used to "
+                "bootstrap a new system when they contain spaces and do not look like a file path."
+            )
+
+        description_mode = isinstance(config, str) and not os.path.exists(config)
 
         if description_mode:
             self._resolve_api_keys_path(api_keys_path)
@@ -130,7 +132,9 @@ class AgentSystemManager:
         else:
             self.functions = self.functions
         
-        if config and config.endswith(".json"):
+        if config:
+            if not os.path.isfile(config):
+                raise ValueError(f"MAS config must be a path to a JSON file; '{config}' is not a file.")
             try:
                 self.build_from_json(config)
             except (FileNotFoundError, json.JSONDecodeError) as e:
@@ -209,11 +213,32 @@ class AgentSystemManager:
         return data
 
 
+    @staticmethod
+    def _looks_like_config_path(text: str) -> bool:
+        # A missing path (or a typo in one) must never be mistaken for a plain-text system description.
+        s = text.strip()
+        if not s or s.lower().endswith(".json"):
+            return True
+        if not any(ch.isspace() for ch in s):
+            return True
+        return bool(re.match(r"^(~|\.{1,2}[\\/]|[\\/]|[A-Za-z]:[\\/])", s))
+
     def _bootstrap_from_description(self, *, description: str,
                                     base_directory: str,
                                     default_models: Optional[List[Dict[str, str]]],
                                     verbose: bool = False,
                                     api_keys_path: Optional[str] = None) -> str:
+
+        base_directory = os.path.abspath(base_directory)
+        final_cfg_path = os.path.join(base_directory, "config.json")
+        final_fns_path = os.path.join(base_directory, "fns.py")
+        existing = [p for p in (final_cfg_path, final_fns_path) if os.path.exists(p)]
+        if existing:
+            raise FileExistsError(
+                "Bootstrapping a system from a description would overwrite "
+                f"{', '.join(existing)}. To load the existing system pass config='{final_cfg_path}'; "
+                "to regenerate it, move or delete those files first."
+            )
 
         readme_text = get_readme("mneuronico", "multi-agent-system-library")
 
@@ -265,7 +290,7 @@ class AgentSystemManager:
             - groq: {recommended_models['groq']}
             - wavespeed: {recommended_models['wavespeed']}
             - nvidia: {recommended_models['nvidia']}
-        3.  **Functions File:** If your configuration requires custom functions, include them in the `fns` list as full Python source code strings. Ensure that any function you reference in the components is defined here. If those functions rely on external libraries, you must include the necessary import statements at the top of the `fns.py` file, and attempt to install them via pip if the import fails.
+        3.  **Functions File:** If your configuration requires custom functions, include them in the `fns` list as full Python source code strings. Ensure that any function you reference in the components is defined here. If those functions rely on external libraries, include the necessary import statements at the top of the `fns.py` file and list the required pip packages in a comment. Never install packages or run shell commands from the generated code.
         4.  **Processes and Tools:** Remember that ALL Tool components require that a previous component's outputs have keys that match the inputs required by that tool. Sometimes this means requiring outputs for an agent that produces those tool inputs. Sometimes that means building a Process that converts something (for example, the user message) into the correct tool input format. Inside process or tool functions, you can use the manager passed as an argument, and in particular manager.read() might be useful to get info out of messages and blocks (check the docs).
         """)
 
@@ -299,16 +324,20 @@ class AgentSystemManager:
         }
 
         sub_mgr = None
-        bootstrap_cfg_path = os.path.join(base_directory,
-                                          "_bootstrap_config.json")
-        
+        # The bootstrap agent keeps its config, history and files in a private temp dir so it
+        # never touches (or deletes) anything that already lives under base_directory.
+        bootstrap_dir = tempfile.mkdtemp(prefix="mas_bootstrap_")
+        bootstrap_cfg_path = os.path.join(bootstrap_dir, "_bootstrap_config.json")
 
         try:
             with open(bootstrap_cfg_path, "w", encoding="utf-8") as fp:
                 json.dump(bootstrap_cfg, fp, indent=2)
 
             sub_mgr = AgentSystemManager(config=bootstrap_cfg_path,
-                                        base_directory=base_directory)
+                                        base_directory=base_directory,
+                                        api_keys_path=self.api_keys_path,
+                                        history_folder=os.path.join(bootstrap_dir, "history"),
+                                        files_folder=os.path.join(bootstrap_dir, "files"))
 
             blocks = sub_mgr.run(
                 input=combined_input,
@@ -357,15 +386,21 @@ class AgentSystemManager:
             comps    = cleaned_payload["components"]
             fns_list = cleaned_payload["fns"]
 
-            final_cfg_path = os.path.join(base_directory, "config.json")
-            with open(final_cfg_path, "w", encoding="utf-8") as fp:
+            if isinstance(gp, dict):
+                # Generated files must stay where the user asked for them.
+                gp.pop("base_directory", None)
+
+            with open(final_cfg_path, "x", encoding="utf-8") as fp:
                 json.dump({"general_parameters": gp, "components": comps}, fp, indent=2)
 
-            final_fns_path = os.path.join(base_directory, "fns.py")
             if isinstance(fns_list, list):
-                with open(final_fns_path, "w", encoding="utf-8") as fp:
+                with open(final_fns_path, "x", encoding="utf-8") as fp:
                     fp.write("\n\n".join(map(str, fns_list)))
 
+            logger.warning(
+                f"[Manager] Generated {final_cfg_path} and {final_fns_path} from a description. "
+                "Review them: fns.py is LLM-written code and runs when the system loads."
+            )
             return final_cfg_path
 
         finally:
@@ -374,19 +409,7 @@ class AgentSystemManager:
                     sub_mgr._close_all_db_conns()
                 except Exception:
                     pass
-
-            # Borrar las carpetas temporales creadas por el sub_mgr
-            for folder in ("history", "files"):
-                path = os.path.join(base_directory, folder)
-                if os.path.isdir(path):
-                    shutil.rmtree(path, ignore_errors=True)
-
-            # Borrar el archivo de config temporal
-            if os.path.exists(bootstrap_cfg_path):
-                try:
-                    os.remove(bootstrap_cfg_path)
-                except OSError:
-                    pass
+            shutil.rmtree(bootstrap_dir, ignore_errors=True)
 
     def _resolve_api_keys_path(self, api_keys_path):
         if api_keys_path is None:
@@ -2164,6 +2187,9 @@ class AgentSystemManager:
 
         if isinstance(obj, str) and os.path.isfile(obj):
             ext = os.path.splitext(obj)[1] or ".bin"
+            if ext.lower() == ".pkl":
+                # Only objects pickled by MAS itself may be unpickled later; copied files never are.
+                ext = ".bin"
             new_path = os.path.join(files_dir, f"{uuid.uuid4()}{ext}")
             shutil.copy2(obj, new_path)
             self._file_cache[new_path] = obj
@@ -2197,11 +2223,27 @@ class AgentSystemManager:
             return [self._load_files_in_dict(item) for item in value]
 
         if isinstance(value, str) and value.startswith("file:"):
-            return self._load_file(value[5:])
+            file_path = value[5:]
+            if self._is_managed_file_path(file_path):
+                return self._load_file(file_path)
+            # Any other "file:" string is untrusted text (user input, LLM output), never a path to read.
+            logger.warning(f"[Manager] Ignoring 'file:' reference outside files_folder: {file_path}")
+            return value
 
         return value
-       
+
+    def _is_managed_file_path(self, file_path: str) -> bool:
+        try:
+            root = os.path.normcase(os.path.realpath(self.files_folder))
+            target = os.path.normcase(os.path.realpath(file_path))
+            return target != root and os.path.commonpath([root, target]) == root
+        except (TypeError, ValueError, OSError):
+            return False
+
     def _load_file(self, file_path: str) -> Any:
+        if not self._is_managed_file_path(file_path):
+            raise ValueError(f"Refusing to load a file outside files_folder: {file_path}")
+
         if file_path in self._file_cache:
             return self._file_cache[file_path]
 

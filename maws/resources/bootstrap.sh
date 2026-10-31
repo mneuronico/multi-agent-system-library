@@ -38,6 +38,9 @@ HISTORY_BUCKET=$(jq -r '.history_bucket // empty' "${CONF}")
 DEPLOY_BUCKET=$(jq -r '.deployment_bucket // empty' "${CONF}")
 [[ -z "${DEPLOY_BUCKET}" || "${DEPLOY_BUCKET}" == "null" ]] && DEPLOY_BUCKET="${PROJECT}-deployment-bucket"
 
+# Lambda code is staged here so only project code ends up in the deployment zip.
+PACKAGE_DIR=".maws_package"
+
 ENV_PARAM=$(jq -r '.env_param_name // empty' "${CONF}")
 [[ -z "${ENV_PARAM}" || "${ENV_PARAM}" == "null" ]] && ENV_PARAM="/${PROJECT}/prod/env"
 
@@ -161,24 +164,6 @@ esac
   echo "${MAS_REQUIREMENT}"
   for r in "${EXTRA_REQ[@]}"; do echo "$r"; done
 } | awk 'NF' | sort -u > requirements.txt
-
-# --- .samignore ---
-echo ">> Generating .samignore"
-cat > .samignore <<'EOF'
-.aws-sam/
-__pycache__/
-tmp/
-local_s3_bucket/
-history/
-files/
-.gitignore
-samconfig.toml
-README.md
-.env.prod
-deploy.sh
-bootstrap.sh
-params.json
-EOF
 
 # --- samconfig.toml ---
 echo ">> Generating samconfig.toml"
@@ -314,7 +299,7 @@ cat >> template.yaml <<EOF
   ${FUNC_ID}:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: .
+      CodeUri: ${PACKAGE_DIR}
       Handler: lambda_function.lambda_handler
       Runtime: ${LAMBDA_RUNTIME}
       Description: "MAS Bot Lambda"
@@ -491,6 +476,42 @@ fi
 # --- Ensure modern build toolchain before sam build ---
 echo ">> Upgrading pip / setuptools / wheel"
 python3 -m pip install --quiet --upgrade pip "setuptools>=77" wheel
+
+# --- Stage the Lambda package ---
+# SAM CLI does not read .samignore: everything under CodeUri ships in the zip and stays in the
+# deployment bucket. Copy only the project code, never secrets (.env*, api_keys.json), user
+# histories or deploy files. Secrets reach Lambda through SSM instead.
+echo ">> Staging Lambda package in ${PACKAGE_DIR}/"
+rm -rf "${PACKAGE_DIR}"
+python3 - "${PACKAGE_DIR}" <<'PY'
+import fnmatch
+import os
+import shutil
+import sys
+
+dest = sys.argv[1]
+top_level = {
+    dest, ".aws-sam", ".git", "history", "files", "logs", "tmp", "local_s3_bucket", ".venv", "venv",
+    "params.json", "samconfig.toml", "template.yaml", ".samignore", ".bootstrap_state.json",
+    ".gitignore", "bootstrap.sh", "deploy.sh", "pull_history.sh", "README.md",
+}
+anywhere = [
+    ".env", ".env.*", "*.env", "api_keys.json",
+    "*.sqlite", "*.sqlite-wal", "*.sqlite-shm", "__pycache__", "*.pyc",
+]
+root = os.path.abspath(".")
+
+def ignore(directory, names):
+    skipped = {n for n in names if any(fnmatch.fnmatch(n, p) for p in anywhere)}
+    if os.path.abspath(directory) == root:
+        skipped |= top_level & set(names)
+    return skipped
+
+shutil.copytree(".", dest, ignore=ignore)
+PY
+if [[ -f "api_keys.json" ]]; then
+  echo "[WARN] api_keys.json is not packaged. Move those keys to .env.prod so they reach Lambda via SSM."
+fi
 
 # --- sam build ---
 echo ">> sam build"

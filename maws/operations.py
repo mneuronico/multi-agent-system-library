@@ -395,7 +395,7 @@ def start(
     config_path = workdir / "config.json"
     fns_path = workdir / "fns.py"
     env_path = workdir / ".env.prod"
-    gi_path = workdir / ".samignore"
+    gi_path = workdir / ".gitignore"
 
     def _write(p: Path, content: str):
         if p.exists() and not overwrite:
@@ -523,7 +523,7 @@ def start(
     _write(env_path, "\n".join(env_lines) + "\n")
 
     # 5) .gitignore
-    _write(gi_path, ".aws-sam/\n__pycache__/\nhistory/\nfiles/\n.env.prod\n.bootstrap_state.json\n")
+    _write(gi_path, ".aws-sam/\n.maws_package/\n__pycache__/\nhistory/\nfiles/\n.env\n.env.*\n.bootstrap_state.json\n")
 
     # Copy scripts if they are missing
     #_ensure_script_in_cwd("bootstrap.sh", workdir, force=False)
@@ -534,7 +534,7 @@ def start(
     print("  - config.json")
     print("  - fns.py")
     print("  - .env.prod")
-    print("  - .samignore")
+    print("  - .gitignore")
 
     if install_deps:
         print("\n[INFO] Installing system dependencies (best effort)...")

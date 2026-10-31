@@ -44,6 +44,10 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
             print(f"- Configuration copied to: {target_json_path}")
             print("- Remember to create your .env file with the required API keys.")
 
+        elif not os.path.exists(config_str) and AgentSystemManager._looks_like_config_path(config_str):
+            print(f"\nConfig file not found: '{config_str}'. Nothing was generated.")
+            print("To generate a system from a description, pass a sentence describing it.")
+
         else:
             # Case 2: natural language description (bootstrap)
             print("\nWelcome to the MAS system creation wizard.")

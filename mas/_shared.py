@@ -40,6 +40,8 @@ import mimetypes, shutil
 from importlib import resources
 import logging
 import base64
+import hashlib
+import hmac
 import collections
 import textwrap
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait

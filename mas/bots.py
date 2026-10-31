@@ -973,6 +973,8 @@ class WhatsappBot(Bot):
         whatsapp_token: str = None,
         phone_number_id: str = None,
         webhook_verify_token: str = None,
+        app_secret: str = None,
+        verify_signature: bool = True,
         **kwargs
     ):
         super().__init__(manager=manager, **kwargs)
@@ -980,6 +982,8 @@ class WhatsappBot(Bot):
         self.whatsapp_token = whatsapp_token or self.manager.get_key("whatsapp_token")
         self.phone_number_id = phone_number_id or self.manager.get_key("whatsapp_phone_number_id")
         self.webhook_verify_token = webhook_verify_token or self.manager.get_key("webhook_verify_token") or self.manager.get_key("whatsapp_verify_token")
+        self.app_secret = app_secret or self.manager.get_key("whatsapp_app_secret")
+        self.verify_signature = verify_signature
 
         if not all([self.whatsapp_token, self.phone_number_id, self.webhook_verify_token]):
             raise ValueError(
@@ -1001,7 +1005,16 @@ class WhatsappBot(Bot):
             challenge = query_params.get("hub.challenge", "")
             return challenge, 200
         return "Forbidden", 403
-    
+
+    def verify_webhook_signature(self, raw_body: bytes, signature_header: Optional[str]) -> bool:
+        """Check Meta's X-Hub-Signature-256 header against the raw POST body."""
+        if not self.app_secret or not signature_header:
+            return False
+        expected = "sha256=" + hmac.new(
+            self.app_secret.encode("utf-8"), raw_body or b"", hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(signature_header.strip().encode("utf-8"), expected.encode("utf-8"))
+
     async def process_webhook_update(self, update_data: dict):
         try:
             for entry in update_data.get("entry", []):
@@ -1293,18 +1306,15 @@ class WhatsappBot(Bot):
             return None
         return await asyncio.to_thread(do_upload)
         
-    def run_server(self, host: str = "0.0.0.0", port: int = 5000, base_path: str = "/webhook"):
+    def create_flask_app(self, base_path: str = "/webhook"):
         if Flask is None:
             raise ImportError("Flask is required to run the WhatsApp webhook server. Install mas[whatsapp].")
-
-        self.persistent_loop = asyncio.new_event_loop()
-
-        def run_asyncio_loop():
-            asyncio.set_event_loop(self.persistent_loop)
-            self.persistent_loop.run_forever()
-        
-        loop_thread = threading.Thread(target=run_asyncio_loop, daemon=True)
-        loop_thread.start()
+        if self.verify_signature and not self.app_secret:
+            raise ValueError(
+                "WhatsApp webhook POSTs must be authenticated with your Meta app secret. "
+                "Pass app_secret=... (or set WHATSAPP_APP_SECRET). To accept unsigned POSTs, "
+                "which lets anyone impersonate any user, pass verify_signature=False."
+            )
 
         app = Flask(__name__)
         @app.route(base_path, methods=["GET", "POST"])
@@ -1313,11 +1323,30 @@ class WhatsappBot(Bot):
                 body, status = self.handle_webhook_verification(request.args)
                 return body, status
             elif request.method == "POST":
+                if self.verify_signature and not self.verify_webhook_signature(
+                    request.get_data(cache=True), request.headers.get("X-Hub-Signature-256")
+                ):
+                    self.logger.warning("[WhatsappBot] Rejected webhook POST with a missing or invalid X-Hub-Signature-256.")
+                    return "Forbidden", 403
                 data = request.get_json(force=True, silent=True) or {}
                 asyncio.run_coroutine_threadsafe(
                     self.process_webhook_update(data), self.persistent_loop
                 )
                 return "OK", 200
+        return app
+
+    def run_server(self, host: str = "0.0.0.0", port: int = 5000, base_path: str = "/webhook"):
+        app = self.create_flask_app(base_path)
+
+        self.persistent_loop = asyncio.new_event_loop()
+
+        def run_asyncio_loop():
+            asyncio.set_event_loop(self.persistent_loop)
+            self.persistent_loop.run_forever()
+
+        loop_thread = threading.Thread(target=run_asyncio_loop, daemon=True)
+        loop_thread.start()
+
         if self.verbose: self.logger.info(f"[WhatsappBot] Flask server running at http://{host}:{port}{base_path}")
         try:
             app.run(host=host, port=port)

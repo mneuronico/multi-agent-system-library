@@ -435,8 +435,15 @@ The manager will:
     * a full **components** list
     * any helper python functions (`fns.py`)
 4.  Persist everything under your `base_directory`.
-5.  Delete the temporary bootstrap file and continue as if you had written the
+5.  Delete its temporary files and continue as if you had written the
     JSON yourself.
+
+Safety rules:
+
+* The text is only treated as a description when it contains spaces and does not look like a file path. A missing path such as `"configs/prod"` or `"config.json"` raises `FileNotFoundError` instead of generating a new system.
+* Bootstrapping never overwrites anything: if `config.json` or `fns.py` already exist in `base_directory`, it raises `FileExistsError` before calling any model. Load the generated system with `config="config.json"` from then on.
+* The bootstrap agent keeps its own history in a temporary folder, so existing `history/` and `files/` folders are never touched.
+* `fns.py` is code written by a model and it runs when the system loads. Review it before using the system with real users.
 
 ```python
 from mas import AgentSystemManager
@@ -462,6 +469,8 @@ from mas import AgentSystemManager as ASM
 
 ASM("I want a system that gets a youtube video from a link sent by user, gets the transcript from that video, and summarizes it. Use google's gemini-2.0-flash model.").run("www.youtube.com/watch?v=some-video")
 ```
+
+This one-liner only works the first time: later runs raise `FileExistsError` because `config.json` already exists. Use `ASM("config.json")` after that.
 
 
 After the first run you’ll find:
@@ -596,6 +605,8 @@ You don't need to worry about creating these structures yourself. When you call 
 4.  **Image `bytes` or `bytearray`**: If the byte header is recognized as an image, the bytes are saved to a file in the `files/` directory and wrapped in an `image` block. Unknown byte payloads are not guessed as media; put them inside a dictionary or an explicit block if you want MAS to persist them as file references.
 5.  **A `dict`**: The dictionary is placed inside a `text` block as structured content. If it contains non-JSON values such as bytes or custom class instances, those values are saved under `files/` and replaced with `file:/...` references.
 
+When tools and processes read their inputs, `file:` references are loaded back only if they point inside `files_folder`. Any other string that starts with `file:` (for example, text typed by a user or written by a model) is passed through unchanged and never read from disk.
+
 #### Consuming Data from Blocks
 
 Different components access data from the block system in different ways, tailored to their function:
@@ -674,7 +685,7 @@ manager = AgentSystemManager(
 
 The `AgentSystemManager` manages your system’s components, user histories, and general settings.
 
--   **`config`**: Path to a JSON file or a plain-English description (triggers automatic bootstrap of system).
+-   **`config`**: Path to a JSON file or a plain-English description (triggers automatic bootstrap of system, see "Fast Track" for the safety rules). A missing path raises `FileNotFoundError`.
 -   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
 -   **`history_folder`**: Path for storing per-user SQLite databases. Defaults to `<base_directory>/history`.
 -   **`history_mode`**: History storage mode. Defaults to `per_user`, which creates one SQLite database per `user_id`. Set to `shared` (aliases: `global`, `all_users`) to store all users together in `shared_history_000001.sqlite`, `shared_history_000002.sqlite`, etc., with a `user_id` column on each message row.
@@ -2006,6 +2017,8 @@ manager.start_whatsapp_bot(
     whatsapp_token=None,
     phone_number_id=None,
     webhook_verify_token=None,
+    app_secret=None,
+    verify_signature=True,
     component_name=None,
     verbose=False,
     on_update=None,
@@ -2029,14 +2042,21 @@ WhatsApp credentials can be passed directly or stored in the manager API keys as
 
 If `run_server=True`, MAS starts a Flask server. Meta webhook verification is handled on `GET base_path`, and message webhooks are handled on `POST base_path`.
 
+Every `POST` must carry a valid `X-Hub-Signature-256` header, computed by Meta with your app secret (App Dashboard -> App settings -> Basic). Pass it as `app_secret` or store it as `whatsapp_app_secret` / `WHATSAPP_APP_SECRET`; unsigned or wrongly signed requests get a `403`. Without this check anyone who finds the webhook URL can send messages as any user, including your `admin_user_id`, so the server refuses to start when `verify_signature=True` (the default) and no app secret is available. Pass `verify_signature=False` only for local testing.
+
 If `run_server=False`, the method returns a `WhatsappBot` object:
 
 ```python
 bot = manager.start_whatsapp_bot(run_server=False)
 
 challenge, status = bot.handle_webhook_verification(request.args)
+
+if not bot.verify_webhook_signature(request.get_data(), request.headers.get("X-Hub-Signature-256")):
+    return "Forbidden", 403
 await bot.process_webhook_update(request_json)
 ```
+
+When you run your own server, checking the signature is your responsibility: `verify_webhook_signature` needs the raw request body, before any JSON parsing.
 
 `process_webhook_update` expects the normal WhatsApp webhook body containing `entry -> changes -> value -> messages`.
 
@@ -2901,8 +2921,10 @@ params.json     # AWS deploy settings (project, region, stack & buckets, etc.)
 config.json     # Minimal MAS config with a simple agent (edit as you like)
 fns.py          # Where your tools/processes live
 .env.prod       # Provider keys & bot tokens (stored in AWS SSM at deploy time)
-.samignore      # SAM build ignores
+.gitignore      # Keeps .env*, history/ and build output out of git
 ```
+
+At deploy time MAWS copies only your project code into `.maws_package/` and deploys that folder. `.env*`, `api_keys.json`, `history/`, `files/`, SQLite files and deploy files are never packaged into the Lambda zip; secrets reach Lambda only through SSM.
 
 On AWS, the stack includes:
 
@@ -2961,7 +2983,7 @@ maws start \
   [--allow-windows]
 ```
 
-* Creates `params.json`, `config.json`, `fns.py`, `.env.prod`, `.samignore`.
+* Creates `params.json`, `config.json`, `fns.py`, `.env.prod`, `.gitignore`.
 * Asks for default **LLM provider/model** and **bot type**.
 * Optionally installs system deps (AWS CLI, SAM) and runs `aws configure`.
 

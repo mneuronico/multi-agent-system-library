@@ -160,7 +160,7 @@ Resources:
     Properties:
       Handler: lambda_function.lambda_handler
       Runtime: python3.9
-      CodeUri: .
+      CodeUri: package/   # only your code: never .env files, histories or other secrets
       Policies:
         - AWSLambdaBasicExecutionRole
         - AWSXRayDaemonWriteAccess
