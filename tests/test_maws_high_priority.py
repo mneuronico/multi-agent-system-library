@@ -110,6 +110,7 @@ def _worker_runtime(workspace_tmp_path, dynamo, *, fail_put=False):
     runtime.special_files = []
     runtime.persist_files_s3 = False
     runtime.capture_failed_events = False
+    runtime.busy_wait_seconds = 0  # busy_policy=drop jobs drop without waiting in these tests
     runtime._loop = None
     runtime.s3 = _FakeS3({("history-bucket", "history/123.sqlite"): b"old"}, fail_put=fail_put)
     calls = []
@@ -377,8 +378,17 @@ def test_lock_is_released_when_saving_history_fails_on_the_sqs_path(workspace_tm
 # 4. maws remove --project
 # -------------------------
 class _FakeCloudFormation:
-    def __init__(self):
+    def __init__(self, buckets=()):
         self.deleted = []
+        self.buckets = list(buckets)
+
+    def describe_stacks(self, StackName):
+        return {"Stacks": [{"StackName": StackName, "StackStatus": "UPDATE_COMPLETE"}]}
+
+    def describe_stack_resources(self, StackName):
+        return {"StackResources": [
+            {"ResourceType": "AWS::S3::Bucket", "PhysicalResourceId": bucket} for bucket in self.buckets
+        ]}
 
     def delete_stack(self, StackName):
         self.deleted.append(StackName)
@@ -394,16 +404,22 @@ class _FakeBucketS3:
         s3 = self
 
         class _Paginator:
-            def paginate(self, Bucket):
+            def paginate(self, Bucket, **kwargs):
                 s3.listed.append(Bucket)
                 return [{}]
 
         return _Paginator()
 
-    def delete_objects(self, Bucket, Delete):
+    def list_object_versions(self, Bucket, **kwargs):
+        return {}
+
+    def list_objects_v2(self, Bucket, **kwargs):
+        return {}
+
+    def delete_objects(self, Bucket, Delete, **kwargs):
         raise AssertionError("no objects expected")
 
-    def delete_bucket(self, Bucket):
+    def delete_bucket(self, Bucket, **kwargs):
         self.deleted_buckets.append(Bucket)
 
 
@@ -415,9 +431,11 @@ def _run_remove(workspace_tmp_path, monkeypatch, capsys, **kwargs):
         "history_bucket": "alpha-history",
         "deployment_bucket": "alpha-deploy",
     }), encoding="utf-8")
-    cf, s3 = _FakeCloudFormation(), _FakeBucketS3()
+    cf, s3 = _FakeCloudFormation(buckets=["alpha-history", "beta-history-bucket"]), _FakeBucketS3()
     regions = []
     monkeypatch.setattr(operations, "_boto", lambda region=None: regions.append(region) or (cf, s3, None))
+    monkeypatch.setattr(operations, "_ssm_client", lambda region=None: types.SimpleNamespace(delete_parameter=lambda Name: None))
+    monkeypatch.setattr(operations, "_account_id", lambda region=None: "123456789012")
 
     code = operations.remove_project(yes=True, project_dir=workspace_tmp_path, **kwargs)
 
@@ -433,7 +451,7 @@ def test_remove_other_project_ignores_local_params_resource_names(workspace_tmp_
     assert s3.deleted_buckets == ["beta-deployment-bucket"]
     assert not [name for name in cf.deleted + s3.listed + s3.deleted_buckets if "alpha" in name]
     assert "--project beta differs from params.json (project 'alpha')" in out
-    assert "ignoring its stack/bucket names" in out
+    assert "ignoring its stack/bucket/SSM names" in out
     assert regions == ["sa-east-1"]
     assert "pass --region" in out
 

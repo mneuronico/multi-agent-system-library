@@ -4,11 +4,12 @@ from .maws import (
     update as _update,
     start as _start,
     pull_history as _pull,
-    setup as _setup,           # <- NEW
-    describe as _describe,     # <- NEW
-    list_projects as _list,    # <- NEW
-    remove_project as _remove  # <- NEW
+    setup as _setup,
+    describe as _describe,
+    list_projects as _list,
+    remove_project as _remove,
 )
+from .operations import MawsConfigError
 
 def _add_common_update_args(p: argparse.ArgumentParser):
     p.add_argument("-c", "--config", dest="config_path", default=None, help="Path to params.json (default: params.json)")
@@ -22,10 +23,20 @@ def _add_common_update_args(p: argparse.ArgumentParser):
     p.add_argument("--region", default=None)
     p.add_argument("--bot", choices=["whatsapp","telegram"], default=None)
     p.add_argument("--set", dest="set_kv", action="append", default=[],
-                   help="Override top-level keys (key=value). Repeatable, e.g. --set verbose=true --set tokens_s3_prefix=secrets")
+                   help="Override params (key=value; dotted keys for nested params). Repeatable, e.g. "
+                        "--set verbose=true --set infra.tracing=false --set requirements_ref=v0.3.4. "
+                        "Values stay text unless they are exact JSON literals (true, 120, null, {...}).")
 
 
 def main(argv=None):
+    try:
+        return _main(argv)
+    except MawsConfigError as e:
+        print(f"[ERR] {e}", file=sys.stderr)
+        return 2
+
+
+def _main(argv=None):
     argv = argv or sys.argv[1:]
     ap = argparse.ArgumentParser(prog="maws", description="AWS helpers for MAS bots")
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -36,20 +47,23 @@ def main(argv=None):
     sp_start.add_argument("--bot", choices=["whatsapp", "telegram"], default=None)
     sp_start.add_argument("--dir", dest="project_dir", default=None)
     
-    sp_start.add_argument("--overwrite", action="store_true")
+    sp_start.add_argument("--overwrite", action="store_true",
+                          help="Rewrite config.json, fns.py, .env.prod and .gitignore, and let --project/--region/--bot "
+                               "replace the values in an existing params.json (other params.json keys are kept)")
 
 
-    # install-deps: ON by default, with an option to disable
-    sp_start.add_argument("--install-deps", dest="install_deps", action="store_true", default=True,
-                        help="Attempt to install awscli/sam/jq automatically (default: ON)")
+    # install-deps: opt-in (uses sudo and unverified downloads), like the Python API
+    sp_start.add_argument("--install-deps", dest="install_deps", action="store_true", default=False,
+                        help="Install curl/unzip/jq (apt-get) and the latest AWS CLI / SAM CLI with sudo "
+                             "(downloads are not checksum-verified; default: off)")
     sp_start.add_argument("--no-install-deps", dest="install_deps", action="store_false",
-                        help="Do not install system dependencies")
+                        help="Do not install system dependencies (default)")
 
-    # run-config: ON by default, with an option to disable
-    sp_start.add_argument("--run-config", dest="run_config", action="store_true", default=True,
-                        help="Run 'aws configure' at the end (default: ON)")
+    # run-config: opt-in, and skipped when AWS credentials already work
+    sp_start.add_argument("--run-config", dest="run_config", action="store_true", default=False,
+                        help="Run 'aws configure' at the end if AWS credentials do not work yet (default: off)")
     sp_start.add_argument("--no-run-config", dest="run_config", action="store_false",
-                        help="Do not run 'aws configure' automatically")
+                        help="Do not run 'aws configure' (default)")
 
 
     sp_start.add_argument("--allow-windows", action="store_true",
@@ -85,7 +99,9 @@ def main(argv=None):
     sp_rm.add_argument("--project", default=None, help="If omitted, it is read from params.json")
     sp_rm.add_argument("--region", default=None)
     sp_rm.add_argument("-y", "--yes", action="store_true", help="Do not ask for confirmation")
-    sp_rm.add_argument("--keep-deploy-bucket", action="store_true", help="Keep the deployment bucket")
+    sp_rm.add_argument("--keep-deploy-bucket", action="store_true",
+                       help="Keep the deployment artifacts (by default s3://<deployment_bucket>/<stack>/ is deleted, "
+                            "and the bucket too if nothing else is left in it)")
     sp_rm.add_argument("--wait", action="store_true", help="Wait until delete-stack completes")
     sp_rm.add_argument("-c", "--config", dest="config_path", default=None)
     sp_rm.add_argument("--dir", dest="project_dir", default=None)

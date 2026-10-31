@@ -22,6 +22,39 @@ def _scoped_to_user_id(method):
     return wrapper
 
 
+class _BoundedFileCache(collections.OrderedDict):
+    # Loaded history files are cached to avoid re-reading them, but a long-running bot sees an
+    # unbounded number of files: keep the most recent ones within an entry and byte budget.
+    max_items = 256
+    max_bytes = 64 * 1024 * 1024
+
+    def __init__(self):
+        super().__init__()
+        self._sizes = {}
+        self._total = 0
+        self._lock = threading.Lock()
+
+    def __setitem__(self, key, value):
+        size = len(value) if isinstance(value, (bytes, bytearray)) else 0
+        if size > self.max_bytes // 4:
+            return  # too big to be worth keeping in memory; it is read from disk when needed
+        with self._lock:
+            if key in self:
+                super().__delitem__(key)
+                self._total -= self._sizes.pop(key, 0)
+            super().__setitem__(key, value)
+            self._sizes[key] = size
+            self._total += size
+            while len(self) > self.max_items or self._total > self.max_bytes:
+                oldest, _ = self.popitem(last=False)
+                self._total -= self._sizes.pop(oldest, 0)
+
+    def pop(self, key, *default):
+        with self._lock:
+            self._total -= self._sizes.pop(key, 0)
+            return super().pop(key, *default)
+
+
 _PACKAGED_LIB_COPIES: Dict[str, str] = {}
 
 
@@ -65,6 +98,7 @@ class AgentSystemManager:
         on_update: Optional[Callable] = None,
         on_complete: Optional[Callable] = None,
         include_timestamp: Optional[bool] = None,
+        max_context_messages: Optional[int] = None,
         timezone: Optional[str] = None,
         log_level=None,
         admin_user_id: Optional[str] = None,
@@ -90,6 +124,7 @@ class AgentSystemManager:
                 "on_update": on_update,
                 "on_complete": on_complete,
                 "include_timestamp": include_timestamp,
+                "max_context_messages": max_context_messages,
                 "timezone": timezone,
                 "admin_user_id": admin_user_id,
                 "usage_logging": usage_logging,
@@ -106,7 +141,11 @@ class AgentSystemManager:
         self._tls = threading.local()
         self._db_pool = {}
         self._db_locks = {}
+        # Bumped whenever pooled connections are closed (import_history, reset_system,
+        # clear_global_history) so every thread reconnects instead of using a closed handle.
+        self._db_generation = 0
         self._db_write_lock = threading.RLock()
+        self._usage_log_lock = threading.Lock()
         self._shared_history_lock = threading.RLock()
         self._variable_lock = threading.RLock()
         self._model_health_lock = threading.RLock()
@@ -155,7 +194,7 @@ class AgentSystemManager:
         if log_level is not None:
             logger.setLevel(log_level)
 
-        self._file_cache = {}
+        self._file_cache = _BoundedFileCache()
         self._component_order: List[str] = []
         self._imported_component_names = set()
 
@@ -180,6 +219,7 @@ class AgentSystemManager:
         self.admin_user_id = str(admin_user_id) if admin_user_id is not None else None
 
         self.include_timestamp = bool(include_timestamp)
+        self.max_context_messages = self._validate_max_context_messages(max_context_messages)
         self.timezone = timezone or "UTC"
 
         self._function_cache = {}
@@ -617,6 +657,8 @@ class AgentSystemManager:
             agent.timeout = self.timeout
         if "include_timestamp" in inherited and "include_timestamp" not in imported_general:
             agent.include_timestamp = self.include_timestamp
+        if "max_context_messages" in inherited and "max_context_messages" not in imported_general:
+            agent.max_context_messages = self.max_context_messages
         if "general_system_description" not in imported_general:
             suffix = other_mgr._agent_prompt_suffix(agent)
             agent.general_system_description = self.general_system_description
@@ -679,7 +721,7 @@ class AgentSystemManager:
         return callback()
         
     def clear_file_cache(self):
-        self._file_cache = {}
+        self._file_cache = _BoundedFileCache()
         
     def to_string(self) -> str:
         components_details = []
@@ -1303,15 +1345,18 @@ class AgentSystemManager:
 
     def _write_usage_entry(self, entry: dict, force_summary: bool = False):
         entry["ts"] = self._now_iso()
-        with open(self._usage_log_path, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with self._usage_log_lock:
+            with open(self._usage_log_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-        lines_since = getattr(self, "_lines_since_refresh", 0) + 1
-        self._lines_since_refresh = lines_since
+            lines_since = getattr(self, "_lines_since_refresh", 0) + 1
+            self._lines_since_refresh = lines_since
+            refresh = force_summary or lines_since >= 100
+            if refresh:
+                self._lines_since_refresh = 0
 
-        if force_summary or lines_since >= 100:
+        if refresh:
             self._refresh_cost_summary()
-            self._lines_since_refresh = 0
 
     def _iter_usage_rows(self):
         if not os.path.isfile(self._usage_log_path):
@@ -1374,8 +1419,9 @@ class AgentSystemManager:
             self._write_usage_entry(entry)
 
     def get_cost_report(self, span="lifetime", user=None, model_or_tool=None):
-        if not os.path.isfile(self._summary_log_path):
-            self._refresh_cost_summary()
+        if not self._usage_logging_enabled or not hasattr(self, "_summary_log_path"):
+            raise RuntimeError("Cost reports need usage logging: create the manager with usage_logging=True.")
+        self._refresh_cost_summary()
         with open(self._summary_log_path, encoding="utf-8") as fp:
             data = json.load(fp)
         span_data = data.get(span, {})
@@ -1604,8 +1650,19 @@ class AgentSystemManager:
         except Exception:
             pass
         self._db_pool[pool_key] = conn
-        self._db_locks.setdefault(pool_key, threading.RLock())
+        lock = self._db_locks.setdefault(pool_key, threading.RLock())
+        if not hasattr(self, "_conn_locks"):
+            self._conn_locks = {}
+        self._conn_locks[conn] = lock
         return conn
+
+    def _conn_lock(self, conn):
+        # Pooled connections are shared by every thread serving that user (concurrent requests,
+        # parallel automation steps). sqlite3 shares prepared statements between cursors of one
+        # connection, so concurrent queries can cut each other's results short: every use of a
+        # pooled connection holds its lock. Private read connections need none.
+        lock = getattr(self, "_conn_locks", {}).get(conn)
+        return lock if lock is not None else contextlib.nullcontext()
 
     def _get_latest_shared_history_db_path(self) -> str:
         paths = self._list_shared_history_db_paths()
@@ -1721,9 +1778,10 @@ class AgentSystemManager:
             conn = current_conn
             if conn is None:
                 conn = self._ensure_user_db(user_id)
-            cur = conn.cursor()
-            cur.execute("SELECT COALESCE(MAX(msg_number), 0) FROM message_history")
-            return int(cur.fetchone()[0] or 0)
+            with self._conn_lock(conn):
+                cur = conn.cursor()
+                cur.execute("SELECT COALESCE(MAX(msg_number), 0) FROM message_history")
+                return int(cur.fetchone()[0] or 0)
 
         max_num = 0
         for db_path in self._list_shared_history_db_paths():
@@ -1808,7 +1866,9 @@ class AgentSystemManager:
                 self._db_pool[user_id].close()
             except Exception as e:
                 logger.warning(f"Error closing existing connection for user {user_id} before import: {e}")
+            getattr(self, "_conn_locks", {}).pop(self._db_pool[user_id], None)
             del self._db_pool[user_id]
+            self._db_generation = getattr(self, "_db_generation", 0) + 1
 
         if hasattr(self, "_tls") and getattr(self._tls, "current_user_id", None) == user_id:
             if hasattr(self._tls, "db_conn") and self._tls.db_conn is not None:
@@ -1818,8 +1878,11 @@ class AgentSystemManager:
             self._tls.db_conn = None
                     
         db_path = self._get_db_path_for_user(user_id)
-        #if os.path.exists(db_path):
-        #    logger.warning(f"Overwriting existing history for user {user_id}")
+        # A leftover write-ahead log belongs to the old database; SQLite would replay it onto
+        # the imported one.
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(db_path + suffix):
+                os.remove(db_path + suffix)
         with open(db_path, "wb") as f:
             f.write(sqlite_bytes)
 
@@ -2091,6 +2154,7 @@ class AgentSystemManager:
 
         self._tls.current_user_id = user_id
         self._tls.db_conn         = self._ensure_user_db(user_id)
+        self._tls.db_generation   = getattr(self, "_db_generation", 0)
 
 
     @contextlib.contextmanager
@@ -2108,8 +2172,11 @@ class AgentSystemManager:
         try:
             yield
         finally:
-            self._tls.current_user_id = previous_user
-            self._tls.db_conn = self._ensure_user_db(previous_user) if previous_user is not None else None
+            if previous_user is not None:
+                self.set_current_user(previous_user)
+            else:
+                self._tls.current_user_id = None
+                self._tls.db_conn = None
 
     def ensure_user(self, user_id: Optional[str] = None) -> None:
         if user_id:
@@ -2126,8 +2193,13 @@ class AgentSystemManager:
         if not hasattr(self, "_tls"):
             self._tls = threading.local()
         conn = getattr(self._tls, "db_conn", None)
-        if conn is not None:
+        if conn is not None and getattr(self._tls, "db_generation", None) == getattr(self, "_db_generation", 0):
             return conn
+        current_user = getattr(self._tls, "current_user_id", None)
+        if current_user is not None:
+            # The pool was reset by another thread since this thread connected.
+            self.set_current_user(current_user)
+            return self._tls.db_conn
 
         self.ensure_user()
         return self._tls.db_conn
@@ -2191,24 +2263,32 @@ class AgentSystemManager:
                     VALUES (?, ?, ?, ?, ?, ?)
                 """
 
-            cur = conn.cursor()
-            try:
-                cur.execute("BEGIN IMMEDIATE")
-                if not self._history_mode_is_shared():
-                    cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
-                    next_num = cur.fetchone()[0]
-                    insert_params = (next_num, role, content_str, type, model, timestamp)
-                cur.execute(insert_sql, insert_params)
-                conn.commit()
-                return next_num
-            except Exception:
-                conn.rollback()
-                raise
+            with self._conn_lock(conn):
+                cur = conn.cursor()
+                try:
+                    cur.execute("BEGIN IMMEDIATE")
+                    if not self._history_mode_is_shared():
+                        cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
+                        next_num = cur.fetchone()[0]
+                        insert_params = (next_num, role, content_str, type, model, timestamp)
+                    cur.execute(insert_sql, insert_params)
+                    conn.commit()
+                    return next_num
+                except Exception:
+                    conn.rollback()
+                    raise
 
 
-    def add_message(self, role: str, content: Union[str, dict], msg_type: str = "developer") -> None:
+    @_scoped_to_user_id
+    def add_message(
+        self,
+        role: str,
+        content: Union[str, dict],
+        msg_type: str = "developer",
+        user_id: Optional[str] = None
+    ) -> int:
         db_conn = self._get_user_db()
-        self._save_message(db_conn, role, content, msg_type)
+        return self._save_message(db_conn, role, content, msg_type)
 
     def _save_component_output(
         self,
@@ -2253,14 +2333,15 @@ class AgentSystemManager:
             return
 
         try:
+            in_toks, out_toks, cost = self._usage_from_metadata(meta)
             entry = {
                 "user":   self._active_user_id(),
                 "type":   component_type,
                 "id":     model_str or save_role,
-                "in_toks":  meta.get("input_tokens", 0),
-                "out_toks": meta.get("output_tokens", 0),
+                "in_toks":  in_toks,
+                "out_toks": out_toks,
                 "seconds": meta.get("seconds", 0),
-                "cost":    meta.get("usd_cost", 0.0)
+                "cost":    cost
             }
             self._log_if_enabled(entry)
         except Exception as e:
@@ -2309,7 +2390,7 @@ class AgentSystemManager:
                 ext = ".bin"
             new_path = os.path.join(files_dir, f"{uuid.uuid4()}{ext}")
             shutil.copy2(obj, new_path)
-            self._file_cache[new_path] = obj
+            # Not cached: loading the reference reads the copy's bytes, not the source path.
             return f"file:{new_path}"
 
         if isinstance(obj, (bytes, bytearray)):
@@ -2375,9 +2456,9 @@ class AgentSystemManager:
 
             self._file_cache[file_path] = obj
             return obj
-        except:
-            #logger.warning(f"[Manager] File not found while loading from history: {file_path}")
-            return f"Error: Archivo '{os.path.basename(file_path)}' no encontrado en el historial."
+        except Exception as e:
+            logger.warning(f"[Manager] Could not load file referenced in history: {file_path} ({e})")
+            return f"Error: file '{os.path.basename(file_path)}' referenced in the history could not be loaded."
         
 
     @_scoped_to_user_id
@@ -2433,61 +2514,62 @@ class AgentSystemManager:
                 sequence = self._shared_history_sequence(db_path) or 0
                 read_conn, should_close = self._open_history_db_for_read(db_path)
                 try:
-                    cur = read_conn.cursor()
-                    where = ""
-                    params = ()
-                    if uid is not None:
-                        where = "WHERE user_id = ?"
-                        params = (str(uid),)
+                    with self._conn_lock(read_conn):
+                        cur = read_conn.cursor()
+                        where = ""
+                        params = ()
+                        if uid is not None:
+                            where = "WHERE user_id = ?"
+                            params = (str(uid),)
 
-                    try:
-                        if include_model:
-                            cur.execute(
-                                "SELECT id, role, content, msg_number, type, model, timestamp, user_id "
-                                f"FROM message_history {where}",
-                                params,
-                            )
+                        try:
+                            if include_model:
+                                cur.execute(
+                                    "SELECT id, role, content, msg_number, type, model, timestamp, user_id "
+                                    f"FROM message_history {where}",
+                                    params,
+                                )
+                            else:
+                                cur.execute(
+                                    "SELECT id, role, content, msg_number, type, timestamp, user_id "
+                                    f"FROM message_history {where}",
+                                    params,
+                                )
+                        except sqlite3.OperationalError:
+                            if include_model:
+                                cur.execute(
+                                    "SELECT id, role, content, msg_number, type, model, timestamp "
+                                    "FROM message_history"
+                                )
+                                fetched = [
+                                    (row_id, role, content, msg_number, msg_type, model, timestamp, uid)
+                                    for row_id, role, content, msg_number, msg_type, model, timestamp
+                                    in cur.fetchall()
+                                ]
+                            else:
+                                cur.execute(
+                                    "SELECT id, role, content, msg_number, type, timestamp "
+                                    "FROM message_history"
+                                )
+                                fetched = [
+                                    (row_id, role, content, msg_number, msg_type, timestamp, uid)
+                                    for row_id, role, content, msg_number, msg_type, timestamp
+                                    in cur.fetchall()
+                                ]
                         else:
-                            cur.execute(
-                                "SELECT id, role, content, msg_number, type, timestamp, user_id "
-                                f"FROM message_history {where}",
-                                params,
-                            )
-                    except sqlite3.OperationalError:
-                        if include_model:
-                            cur.execute(
-                                "SELECT id, role, content, msg_number, type, model, timestamp "
-                                "FROM message_history"
-                            )
-                            fetched = [
-                                (row_id, role, content, msg_number, msg_type, model, timestamp, uid)
-                                for row_id, role, content, msg_number, msg_type, model, timestamp
-                                in cur.fetchall()
-                            ]
-                        else:
-                            cur.execute(
-                                "SELECT id, role, content, msg_number, type, timestamp "
-                                "FROM message_history"
-                            )
-                            fetched = [
-                                (row_id, role, content, msg_number, msg_type, timestamp, uid)
-                                for row_id, role, content, msg_number, msg_type, timestamp
-                                in cur.fetchall()
-                            ]
-                    else:
-                        fetched = cur.fetchall()
+                            fetched = cur.fetchall()
 
-                    for row in fetched:
-                        row_id = row[0]
-                        if include_model:
-                            _, role, content, msg_number, msg_type, model, timestamp, row_user_id = row
-                            payload = (role, content, msg_number, msg_type, model, timestamp)
-                        else:
-                            _, role, content, msg_number, msg_type, timestamp, row_user_id = row
-                            payload = (role, content, msg_number, msg_type, timestamp)
-                        if include_user_id:
-                            payload = payload + (row_user_id,)
-                        rows_with_order.append((int(msg_number or 0), sequence, int(row_id or 0), payload))
+                        for row in fetched:
+                            row_id = row[0]
+                            if include_model:
+                                _, role, content, msg_number, msg_type, model, timestamp, row_user_id = row
+                                payload = (role, content, msg_number, msg_type, model, timestamp)
+                            else:
+                                _, role, content, msg_number, msg_type, timestamp, row_user_id = row
+                                payload = (role, content, msg_number, msg_type, timestamp)
+                            if include_user_id:
+                                payload = payload + (row_user_id,)
+                            rows_with_order.append((int(msg_number or 0), sequence, int(row_id or 0), payload))
                 finally:
                     if should_close:
                         read_conn.close()
@@ -2495,13 +2577,13 @@ class AgentSystemManager:
             rows_with_order.sort(key=lambda item: (item[0], item[1], item[2]))
             return [payload for _, _, _, payload in rows_with_order]
 
-        cur = conn.cursor()
-
-        if include_model:
-            cur.execute("SELECT role, content, msg_number, type, model, timestamp FROM message_history ORDER BY msg_number ASC")
-        else:
-            cur.execute("SELECT role, content, msg_number, type, timestamp FROM message_history ORDER BY msg_number ASC")
-        return cur.fetchall()
+        with self._conn_lock(conn):
+            cur = conn.cursor()
+            if include_model:
+                cur.execute("SELECT role, content, msg_number, type, model, timestamp FROM message_history ORDER BY msg_number ASC")
+            else:
+                cur.execute("SELECT role, content, msg_number, type, timestamp FROM message_history ORDER BY msg_number ASC")
+            return cur.fetchall()
 
     @_scoped_to_user_id
     def show_history(self, user_id: Optional[str] = None, message_char_limit: int = 2000):
@@ -2577,9 +2659,10 @@ class AgentSystemManager:
             return rows[-1][1] if rows else None
 
         conn = self._get_user_db()
-        cur = conn.cursor()
-        cur.execute("SELECT content FROM message_history ORDER BY id DESC LIMIT 1")
-        row = cur.fetchone()
+        with self._conn_lock(conn):
+            cur = conn.cursor()
+            cur.execute("SELECT content FROM message_history ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
         return row[0] if row else None
     
     def _extract_metadata_from_blocks(self, content):
@@ -2606,6 +2689,22 @@ class AgentSystemManager:
                             pass
         return {}
     
+    def _usage_from_metadata(self, metadata: Dict[str, Any]):
+        # Token counts are copied into the block metadata only with return_token_count=True, but
+        # every agent message keeps the provider's usage report: fall back to it so usage logs and
+        # stats are right either way.
+        in_toks = metadata.get("input_tokens")
+        out_toks = metadata.get("output_tokens")
+        cost = metadata.get("usd_cost")
+        provider_response = metadata.get("provider_response") or {}
+        usage = provider_response.get("usage") or {}
+        if in_toks is None and out_toks is None and usage:
+            in_toks = usage.get("input_tokens", 0) or 0
+            out_toks = usage.get("output_tokens", 0) or 0
+            if cost is None and provider_response.get("provider") and provider_response.get("model"):
+                cost = self.cost_model_call(provider_response["provider"], provider_response["model"], in_toks, out_toks)
+        return in_toks or 0, out_toks or 0, cost or 0.0
+
     def get_usage_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
         messages = self.get_messages(user_id)
         models = {}
@@ -2616,13 +2715,13 @@ class AgentSystemManager:
             src   = msg["source"]
             content = msg["message"]
             metadata = self._extract_metadata_from_blocks(content)
-            cost     = metadata.get("usd_cost", 0.0)
+            in_toks, out_toks, cost = self._usage_from_metadata(metadata)
 
             if mtype == "agent":
                 key = msg.get("model") or "unknown"
                 m = models.setdefault(key, {"input_tokens": 0, "output_tokens": 0, "usd_cost": 0.0})
-                m["input_tokens"]  += metadata.get("input_tokens", 0)
-                m["output_tokens"] += metadata.get("output_tokens", 0)
+                m["input_tokens"]  += in_toks
+                m["output_tokens"] += out_toks
                 m["usd_cost"]      += cost
 
             elif mtype == "tool":
@@ -2710,7 +2809,8 @@ class AgentSystemManager:
         model_params: Optional[Dict[str, Any]] = None,
         include_timestamp: Optional[bool] = None,
         description: str = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        max_context_messages: Optional[int] = None
     ):
         if name is None:
             name = self._generate_agent_name()
@@ -2720,7 +2820,8 @@ class AgentSystemManager:
 
         inherited_settings = {
             setting for setting, value in (
-                ("models", models), ("timeout", timeout), ("include_timestamp", include_timestamp)
+                ("models", models), ("timeout", timeout), ("include_timestamp", include_timestamp),
+                ("max_context_messages", max_context_messages),
             )
             if value is None
         }
@@ -2766,7 +2867,10 @@ class AgentSystemManager:
             model_params=model_params,
             include_timestamp=include_timestamp if include_timestamp is not None else self.include_timestamp,
             description=description,
-            timeout=final_timeout
+            timeout=final_timeout,
+            max_context_messages=self._validate_max_context_messages(
+                max_context_messages if max_context_messages is not None else getattr(self, "max_context_messages", None)
+            ),
         )
 
         agent.manager = self
@@ -3021,13 +3125,13 @@ class AgentSystemManager:
                     target_index=target_index,
                     target_custom=target_custom
                 )
-            if on_update:
-                self._invoke_callback(on_update, self.get_messages(user_id), self, on_update_params)
 
         self._save_component_output(db_conn, comp, output_dict, verbose=verbose)
 
-        if self._usage_logging_enabled:
-            self._refresh_cost_summary()
+        # Automations call on_update after each step; a single component calls it once its own
+        # output is in the history, so the callback sees what the component produced.
+        if on_update and not isinstance(comp, Automation):
+            self._invoke_callback(on_update, self.get_messages(user_id), self, on_update_params)
 
         return output_dict
 
@@ -3169,6 +3273,7 @@ class AgentSystemManager:
         self.on_update = self._resolve_callable(setting("on_update", None))
         self.on_complete = self._resolve_callable(setting("on_complete", None))
         self.include_timestamp = bool(setting("include_timestamp", False))
+        self.max_context_messages = self._validate_max_context_messages(setting("max_context_messages", None))
         self._usage_logging_enabled = bool(setting("usage_logging", self._usage_logging_enabled))
         self.timezone = setting("timezone", "UTC")
 
@@ -3247,6 +3352,14 @@ class AgentSystemManager:
                 self.link(input_component, output_component)
             except ValueError as e:
                 logger.error(f"Warning: Could not create link from '{input_component}' to '{output_component}'. Error: {e}")
+
+    @staticmethod
+    def _validate_max_context_messages(value) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("max_context_messages must be a positive integer or None (no limit).")
+        return value
 
     @staticmethod
     def _normalize_imports(imports) -> List[str]:
@@ -3558,7 +3671,7 @@ class AgentSystemManager:
             reserved = {
                 "system", "system_prompt", "required_outputs", "models",
                 "provider", "model", "default_output", "timeout",
-                "positive_filter", "negative_filter", "include_timestamp"
+                "positive_filter", "negative_filter", "include_timestamp", "max_context_messages"
             }
             for param_name, param_value in overrides.items():
                 if param_name in reserved:
@@ -3589,6 +3702,10 @@ class AgentSystemManager:
                 "include_timestamp": copy.deepcopy(overrides.get(
                     "include_timestamp",
                     self.resolve_runtime_value(component.include_timestamp, uid, name)
+                )),
+                "max_context_messages": copy.deepcopy(overrides.get(
+                    "max_context_messages",
+                    self.resolve_runtime_value(getattr(component, "max_context_messages", None), uid, name)
                 )),
             })
         else:
@@ -3654,6 +3771,7 @@ class AgentSystemManager:
                 positive_filter=component.get("positive_filter"),
                 negative_filter=component.get("negative_filter"),
                 include_timestamp=component.get("include_timestamp"),
+                max_context_messages=component.get("max_context_messages"),
                 model_params=component.get("model_params"),
                 description=description,
                 timeout=component.get("timeout")
@@ -3808,11 +3926,9 @@ class AgentSystemManager:
                     if "condition" not in step and "end_condition" not in step:
                         raise ValueError("While must have either 'condition' or 'end_condition'.")
 
-                    if "condition" in step:
-                        step["condition"] = self._resolve_condition(step["condition"])
-                    step["run_first_pass"] = step.get("run_first_pass", True)
-                    step["start_condition"] = self._resolve_condition(step.get("start_condition", step.get("condition", step["run_first_pass"])))
-                    step["end_condition"] = self._resolve_condition(step.get("end_condition", step.get("condition")))
+                    for key in ("condition", "start_condition", "end_condition"):
+                        if key in step:
+                            step[key] = self._resolve_condition(step[key])
                     step["body"] = self._resolve_automation_sequence(step.get("body", []))
                     
                 elif control_flow_type == "for":
@@ -3872,8 +3988,11 @@ class AgentSystemManager:
         if isinstance(condition, bool):
             return condition
         elif isinstance(condition, str):
-            if ":" in condition and condition[0] != ":":
-                return self._get_function_from_string(condition)
+            # Conditions are evaluated from their string form when the step runs; a referenced
+            # function is looked up now only so a missing one fails when the system loads.
+            parsed = self.parser.parse_input_string(condition)
+            if parsed["is_function"] and parsed["function_name"]:
+                self._get_function_from_string(parsed["function_name"])
             return condition
         elif isinstance(condition, dict):
             return condition
@@ -3903,12 +4022,23 @@ class AgentSystemManager:
                             (self._history_now_iso(),),
                         )
                     conn.commit()
+            self._delete_user_files(uid)
             return
 
         conn = self._get_user_db()
         cur = conn.cursor()
         cur.execute("DELETE FROM message_history")
         conn.commit()
+        self._delete_user_files(self._uid())
+
+    def _delete_user_files(self, user_id: str) -> None:
+        # Files a user sent or produced are part of their history: clearing it must not leave them on disk.
+        files_dir = os.path.join(self.files_folder, self._safe_user_id(user_id))
+        shutil.rmtree(files_dir, ignore_errors=True)
+        prefix = os.path.normcase(os.path.abspath(files_dir)) + os.sep
+        for cached_path in list(self._file_cache):
+            if os.path.normcase(os.path.abspath(cached_path)).startswith(prefix):
+                self._file_cache.pop(cached_path, None)
 
     def clear_global_history(self) -> int:
         self._close_all_db_conns()
@@ -3934,7 +4064,11 @@ class AgentSystemManager:
                 cleared += 1
             except Exception:
                 logger.exception(f"Error clearing history for DB: {db_path}")
-        #logger.info(f"[Manager] Cleared history in {cleared} sqlite DB(s).")
+
+        # Every user's history is gone, so are the files it referenced.
+        shutil.rmtree(self.files_folder, ignore_errors=True)
+        os.makedirs(self.files_folder, exist_ok=True)
+        self._file_cache = _BoundedFileCache()
         return cleared
 
     def reset_system(self) -> None:
@@ -3963,7 +4097,7 @@ class AgentSystemManager:
                 self._lines_since_refresh = 0
         if hasattr(self, "_db_pool"):
             self._db_pool.clear()
-        self._file_cache = {}
+        self._file_cache = _BoundedFileCache()
         logger.info("[Manager] System reset completed (history/, files/, logs/ wiped).")
 
 
@@ -4570,11 +4704,11 @@ class AgentSystemManager:
         return self._save_tts_file(audio_bytes)
 
     def _save_tts_file(self, audio_bytes: bytes) -> str:
-        tts_folder = os.path.join(self.files_folder, "tts")
-        os.makedirs(tts_folder, exist_ok=True)
+        # Kept with the user's other files, so clearing that user's history removes them too.
         uid = str(self._active_user_id() or self._uid() or "unknown")
-        filename = f"{uid}_{uuid.uuid4().hex}.mp3"
-        file_path = os.path.join(tts_folder, filename)
+        tts_folder = os.path.join(self.files_folder, self._safe_user_id(uid), "tts")
+        os.makedirs(tts_folder, exist_ok=True)
+        file_path = os.path.join(tts_folder, f"{uuid.uuid4().hex}.mp3")
         with open(file_path, "wb") as f:
             f.write(audio_bytes)
         return file_path
@@ -4587,5 +4721,8 @@ class AgentSystemManager:
                 except Exception:
                     pass
             self._db_pool.clear()
+        if hasattr(self, "_conn_locks"):
+            self._conn_locks.clear()
+        self._db_generation = getattr(self, "_db_generation", 0) + 1
         if hasattr(self, "_tls") and getattr(self._tls, "db_conn", None) is not None:
             self._tls.db_conn = None

@@ -6,9 +6,10 @@
 * webhook handling for **WhatsApp** and **Telegram**
 * mandatory webhook authentication (Telegram secret token, WhatsApp `X-Hub-Signature-256`) with an explicit opt-out
 * webhook verification (WhatsApp GET)
-* **self-invocation** to process work in the background (avoids API Gateway timeouts)
-* optional **SQS FIFO** processing for production bots that must not drop messages
+* **self-invocation** to process work in the background (avoids API Gateway timeouts), one worker per chat and webhook
+* optional **SQS FIFO** processing for production bots that must not drop messages, with a dead-letter queue by default
 * per-user **locking** with **DynamoDB** conditional writes to avoid concurrent processing
+* dropped and failed updates logged at WARNING and counted as CloudWatch metrics (`MAWS/DroppedMessages`, `MAWS/FailedMessages`)
 * optional S3-backed user media/file persistence
 * synchronization of **tokens/keys** between **S3** and the ephemeral `/tmp` filesystem
 * configuration loading from **SSM Parameter Store** (SecureString)
@@ -27,12 +28,18 @@ pip install \
 ```
 
 The repository root package includes both **MAS** and **maws**.
-* You can also **pin to a commit/tag**:
+* You can also **pin to a commit/tag** (recommended for deploys, so every deploy ships the same code):
 
 ```bash
 pip install \
   "mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git@<commit>"
 ```
+
+`maws update` builds the Lambda requirement from `params.json`:
+
+* `requirements_source: "git"` (default) installs from this GitHub repository. Without `requirements_ref` it installs **whatever is on the default branch at deploy time**, so two deploys of the same project can ship different code; the deploy prints a warning. Set `requirements_ref` to a commit SHA (most reproducible) or a release tag. Check which tags exist (`git ls-remote --tags https://github.com/mneuronico/multi-agent-system-library`) before pinning one: not every released version is tagged.
+* `requirements_source: "pypi"` installs the PyPI project named `mas` (`mas[...]` or `mas[...]==<requirements_ref>`). This library is documented and installed from GitHub, and nothing in this repository says that the PyPI name `mas` belongs to it. If that name is taken by an unrelated project (or registered later by someone else), the deploy installs that package into your Lambda, where it runs with access to your secrets. This was not checked against PyPI (no network access while writing this); verify the PyPI project yourself before using `pypi`. The deploy prints a warning.
+* `requirements_source: "local"` uses `requirements_ref` as a local path or requirement line.
 
 ### `requirements.txt` example
 
@@ -64,6 +71,8 @@ lambda_handler = build_lambda_handler(BOT_TYPE)
 
 That's it. `maws` wires everything to MAS, handles webhook GET/POST, background processing via self-invocation, history import/export, locks, and more.
 
+With `maws update` you do not need this file: the deploy writes it (and `requirements.txt`) into the staged package `.maws_package/` only. If your project folder has its own `lambda_function.py` or `requirements.txt`, it is deployed unchanged; files that older maws versions generated in the project folder are recognised and replaced in the package (never in your folder). `template.yaml` is generated in `.maws_build/` on every deploy; no `samconfig.toml` is written. Project-folder `template.yaml` / `samconfig.toml` files are never read or overwritten by maws.
+
 ---
 
 ## Environment variables (contract)
@@ -74,7 +83,9 @@ That's it. `maws` wires everything to MAS, handles webhook GET/POST, background 
 | `VERBOSE`                  | No       | `"false"`    | `true/false` for detailed logging in MAS and the bots.               |
 | `BUCKET_NAME`              | **Yes**  | none         | S3 bucket with histories and (optionally) tokens/keys.               |
 | `ENV_PARAMETER_NAME`       | No       | none         | **SSM** (SecureString) parameter containing the `.env` to inject.    |
+| `MAWS_ENV_PARAMETER_VERSION` | No     | none (latest) | SSM parameter version to read. `maws update` sets it to the version it uploaded. |
 | `MAWS_BUSY_POLICY`         | No       | `"drop"`     | `"drop"` keeps current behavior; `"fifo"` queues work in SQS FIFO.   |
+| `MAWS_BUSY_WAIT_SECONDS`   | No       | `"30"`       | `drop` mode: max seconds a worker waits for a busy user lock before dropping (never more than half of the remaining invocation time; `0` = drop at once). |
 | `MAWS_QUEUE_URL`           | FIFO     | none         | SQS FIFO queue URL used when `MAWS_BUSY_POLICY=fifo`.                |
 | `HISTORY_MODE`             | No       | `"per_user"` | `"per_user"` or `"shared"`; mirrors MAS history storage.             |
 | `HISTORY_ROTATION`         | No       | `"message_count"` | Shared history rotation: `message_count`, `time_period`, or `both`. |
@@ -98,7 +109,7 @@ That's it. `maws` wires everything to MAS, handles webhook GET/POST, background 
 | `MAWS_HISTORY_APPEND_LOCK_WAIT_SECONDS` | No | `"60"` | How long an append waits for a busy user lock before retrying.       |
 | `MAWS_MANAGER_KWARGS_JSON` | No       | `"{}"`       | Extra kwargs for `AgentSystemManager`; MAWS-managed paths still win. |
 | `MAWS_BOT_KWARGS_JSON`     | No       | `"{}"`       | Extra kwargs for the selected MAS bot constructor.                   |
-| `CAPTURE_FAILED_EVENTS`    | No       | `"false"`    | Write failed jobs/events to S3 under `failed-events/`.               |
+| `CAPTURE_FAILED_EVENTS`    | No       | `"false"`    | Write failed jobs/events to S3 under `failed-events/`. Secrets are redacted first (see Failure handling). |
 
 ### How do tokens work?
 
@@ -116,6 +127,8 @@ That's it. `maws` wires everything to MAS, handles webhook GET/POST, background 
 
   This lets your code read `os.environ["FACEBOOK_CREDENTIALS_PATH"]` and open the file.
 
+* **Writing tokens back**: after a job, a token file is uploaded to S3 only if its content changed (SHA-256 compared with what the container read or last wrote), using an S3 conditional write: `If-Match` the ETag the container read, or `If-None-Match: *` when S3 had no copy. If another container changed the token in the meantime, the write is refused, a WARNING is logged, this container's copy is discarded and the S3 version is fetched again before the next job. A file that only came from the package is not copied to S3 unless your code changes it. (boto3 versions older than S3 conditional writes, late 2024, fall back to a plain write with a warning.)
+
 ---
 
 ## maws API
@@ -127,14 +140,15 @@ Returns a **Lambda handler** already configured for the chosen bot.
 * Lazily initializes `AgentSystemManager`.
 * Instantiates the MAS bot (`WhatsappBot` / `TelegramBot`) with `verbose` coming from `VERBOSE`.
 * GET (WhatsApp): calls `handle_webhook_verification` on the bot.
-* POST: by default **self-invokes** the same Lambda with a normalized "worker" payload (background mode).
+* POST: by default **self-invokes** the same Lambda asynchronously with normalized "worker" jobs (background mode): one invocation per chat (per lock) and webhook, carrying that chat's messages in provider order.
 * Optional FIFO mode: enqueues normalized jobs to SQS FIFO instead of self-invoking.
+* If the jobs cannot be handed off (SQS `SendMessage` or the async invoke fails), the POST answers `5xx` so Telegram/WhatsApp deliver the update again.
 * In the "second hop":
 
-  * Takes a **lock** per `user_id` (or one global lock in shared-history mode) if `LOCKS_TABLE_NAME` is set; if the lock is held in default `"drop"` mode, it **ignores** the update. In `"fifo"` mode the SQS invocation fails instead, so SQS redelivers the message after the visibility timeout.
-  * **Imports** history from S3 if present.
+  * Takes a **lock** per `user_id` (or one global lock in shared-history mode) if `LOCKS_TABLE_NAME` is set, once for all the jobs of the invocation. If the lock is held in default `"drop"` mode, it **waits** up to `MAWS_BUSY_WAIT_SECONDS` (default 30, at most half of the remaining invocation time) and then **drops** the update (WARNING log + `MAWS/DroppedMessages` metric). In `"fifo"` mode the SQS invocation fails instead, so SQS redelivers the message after the visibility timeout.
+  * **Imports** history from S3 if present. The container's local copy is deleted first, so a history deleted in S3 is never brought back from a warm container.
   * Optionally syncs per-user files/media from S3.
-  * Executes `process_webhook_update`.
+  * Executes `process_webhook_update` for each job, in order.
   * **Exports** history and optionally files/media to S3.
   * **Releases** the lock, also when saving fails (a crashed worker's lock simply expires).
 
@@ -180,10 +194,6 @@ Resources:
               Resource: "arn:aws:s3:::<BUCKET_NAME>/*"
         - Statement:
             - Effect: Allow
-              Action: [ "lambda:InvokeFunction" ]
-              Resource: "*"
-        - Statement:
-            - Effect: Allow
               Action: [ "dynamodb:PutItem", "dynamodb:DeleteItem" ]
               Resource: !GetAtt ProcessingLocksTable.Arn
       Environment:
@@ -206,9 +216,26 @@ Resources:
         WebhookPOST:
           Type: Api
           Properties: { Path: "/webhook", Method: post }
+
+  # The self-invocation permission, scoped to this function. It is a separate policy attached to
+  # the role SAM generates (<FunctionLogicalId>Role): putting !GetAtt MyFunction.Arn in the
+  # function's own Policies would be a circular dependency.
+  MyFunctionSelfInvokePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: maws-self-invoke
+      Roles: [ !Ref MyFunctionRole ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: [ !GetAtt MyFunction.Arn, !Sub "${MyFunction.Arn}:*" ]
 ```
 
 > Switch GET/POST according to **WhatsApp** (GET+POST) or **Telegram** (POST only).
+>
+> `maws update` generates a complete template (in `.maws_build/template.yaml`) with all of this plus the log group, the dead-letter / failure queues and the S3 lifecycle described below.
 
 ---
 
@@ -216,9 +243,11 @@ Resources:
 
 To avoid API Gateway timeouts, maws:
 
-1. Responds **quickly** to the POST (200 OK).
-2. **Self-invokes** with the actual payload to process in the background.
+1. Responds **quickly** to the POST (200 OK once the work is handed off; `502` if the asynchronous self-invocation fails, so the provider retries).
+2. **Self-invokes** asynchronously with the actual payload to process in the background: one invocation per chat (all of that chat's messages from the webhook, in order).
 3. Uses a DynamoDB item as a per-user lock (`user_id`) to avoid duplicates when messages arrive in rapid succession.
+
+If one chat's hand-off fails after another chat's succeeded, the provider's retry hands off the successful one again (at-least-once). Asynchronous invocations that fail are retried twice by Lambda and then sent to the `<stack>-async-failures` SQS queue (see Failure handling).
 
 If you do not configure `LOCKS_TABLE_NAME`, locking is **disabled** (best-effort behavior).
 
@@ -226,19 +255,77 @@ Lock expiry is enforced by the conditional write (`expiresAt < now`), not by Dyn
 
 ### Busy-message policy
 
-The default `MAWS_BUSY_POLICY=drop` preserves the original MAWS behavior: if a user's lock is already held, the new update is acknowledged and ignored. This can be desirable when processing messages sent while the bot was still thinking would make the conversation order confusing.
+With the default `MAWS_BUSY_POLICY=drop`, a worker that finds the user's lock held **waits** for it, then processes the update. Messages that belong together are not lost:
 
-Set `busy_policy` to `"fifo"` in `params.json` to generate an SQS FIFO queue. In FIFO mode MAWS enqueues one normalized job per provider message, uses the chat id as the FIFO message group in per-user history mode, and uses one global group in shared-history mode to avoid SQLite history races. Failed SQS jobs can retry and, when configured, move to a DLQ. A job whose user lock is still held (for example by a crashed worker) fails its invocation instead of being acknowledged, so SQS redelivers it after the visibility timeout and the group keeps its order; each such retry counts toward the DLQ's `maxReceiveCount` (3).
+* a WhatsApp webhook that carries several messages of one chat is processed by **one** worker, in order, under one lock;
+* Telegram albums and long texts split into several messages arrive as separate webhooks; each worker waits for the previous one to finish.
+
+The wait is bounded: at most `runtime.busy_wait_seconds` in `params.json` (`MAWS_BUSY_WAIT_SECONDS`, default 30 s) and never more than half of the invocation's remaining time (so with `lambda_timeout: 30` at most about 15 s), leaving time to process the update afterwards. The worker polls the lock every 0.5 s and is billed while it waits.
+
+**When drop mode still drops** an update (it is acknowledged to the provider and not processed):
+
+* the user's lock is still held when the wait ends: a long model run, several updates queued behind each other, or a worker that crashed or timed out (its lock only expires 15 s after that invocation's deadline);
+* with `history_mode: "shared"` the lock is global, so any other chat's work can make an update wait and be dropped;
+* `busy_wait_seconds: 0` drops as soon as the lock is held (the behaviour before this wait existed).
+
+Every drop is logged at WARNING (`[maws][drop] Dropped ... update <event id> for chat <chat id>`) and counted in the CloudWatch metric `MAWS/DroppedMessages` (dimension `FunctionName`), emitted as an Embedded Metric Format log line (no extra IAM permission). Updates that fail while being processed are not retried in drop mode either; they are logged with a traceback and counted in `MAWS/FailedMessages`. Set an alarm on these metrics, e.g. `Sum > 0` over 5 minutes.
+
+Without `LOCKS_TABLE_NAME` there is no lock: nothing is dropped, but concurrent workers of one chat overwrite each other's history (last writer wins). Order between separate webhooks is not guaranteed in drop mode. Use FIFO when every message must be processed, in order.
+
+Set `busy_policy` to `"fifo"` in `params.json` to generate an SQS FIFO queue. In FIFO mode MAWS enqueues one normalized job per provider message, uses the chat id as the FIFO message group in per-user history mode, and uses one global group in shared-history mode to avoid SQLite history races. If enqueueing fails, the webhook answers `503` so the provider retries; jobs that were already enqueued are deduplicated by SQS (content-based `MessageDeduplicationId`, 5-minute window). A job whose user lock is still held (for example by a crashed worker) fails its invocation instead of being acknowledged, so SQS redelivers it after the visibility timeout and the group keeps its order; each such retry counts toward the DLQ's `maxReceiveCount`. A worker without `BUCKET_NAME` or whose MAS initialization fails also fails the invocation, so the job is retried and ends in the DLQ instead of being deleted.
+
+The worker DLQ is **on by default** for FIFO (`<stack>-worker-dlq.fifo`, `maxReceiveCount` 3, 14-day retention). Without it, SQS retries a failing message until it expires (4 days) and every later message of that chat waits behind it.
 
 ```json
 {
   "busy_policy": "fifo",
   "failure_handling": {
     "worker_dlq": true,
+    "max_receive_count": 3,
     "capture_failed_events": true
   }
 }
 ```
+
+### Failure handling
+
+| Where failed work goes | Mode | Default |
+| --- | --- | --- |
+| `<stack>-worker-dlq.fifo` (SQS FIFO DLQ of the worker queue) | `fifo` | on (`failure_handling.worker_dlq`, `failure_handling.max_receive_count`) |
+| `<stack>-async-failures` (SQS on-failure destination of async self-invocations, after Lambda's 2 retries) | `drop` | on (`failure_handling.async_failure_queue`) |
+| `failed-events/` in the history bucket (diagnostic copies, secrets redacted) | both | off (`failure_handling.capture_failed_events`) |
+
+The queue URLs are stack outputs (`WorkerDeadLetterQueueUrl`, `AsyncFailureQueueUrl`). Messages stay 14 days.
+
+Inspect (without removing them; they become visible again after the visibility timeout):
+
+```bash
+aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names ApproximateNumberOfMessages
+aws sqs receive-message --queue-url "$DLQ_URL" --max-number-of-messages 10 --visibility-timeout 30 \
+  --attribute-names All --message-attribute-names All
+```
+
+An async-failures message is an invocation record: `requestPayload` is the worker event (`{"maws_job": ...}` or `{"maws_jobs": [...]}`) and `responsePayload` / `requestContext.condition` say why it failed.
+
+Redrive, once the cause is fixed:
+
+* Worker DLQ (FIFO): use "Start DLQ redrive" on the DLQ in the SQS console (or `aws sqs start-message-move-task --source-arn <dlq arn>` where your CLI/region supports it for FIFO queues). The messages go back to `<stack>-worker.fifo` in their groups.
+* Async failures: invoke the function again with each record's `requestPayload`, then delete the message:
+
+  ```bash
+  aws sqs receive-message --queue-url "$ASYNC_URL" --max-number-of-messages 10 --output json > batch.json
+  jq -c '.Messages[]' batch.json | while read -r msg; do
+    printf '%s' "$msg" | jq -c '.Body | fromjson | .requestPayload' > payload.json
+    aws lambda invoke --function-name "$FUNCTION" --invocation-type Event \
+      --cli-binary-format raw-in-base64-out --payload file://payload.json /dev/null &&
+    aws sqs delete-message --queue-url "$ASYNC_URL" \
+      --receipt-handle "$(printf '%s' "$msg" | jq -r .ReceiptHandle)"
+  done
+  ```
+
+Redriving a job that was partly processed can process it again (at-least-once).
+
+Failed-event captures never store webhook secrets: header, query and field values whose names look secret (`X-Telegram-Bot-Api-Secret-Token`, `X-Hub-Signature-256`, `Authorization`, cookies, API keys, `hub.verify_token`, ...) are replaced by `[REDACTED]`, and so are Telegram bot tokens and the values of secret-looking keys loaded from SSM wherever they appear (for example in an error message).
 
 ### Webhook security
 
@@ -333,6 +420,10 @@ KEY=VALUE
 ANOTHER=VAL
 ```
 
+`maws update` uploads `.env.prod` before `sam deploy` and passes the new parameter version to the stack, which sets `MAWS_ENV_PARAMETER_VERSION`; the function reads exactly that version (`<name>:<version>`). If the deploy fails, CloudFormation rolls back and the running function keeps reading the version it was deployed with, so it never runs with secrets meant for another deploy. Uploading after the deploy instead would let the new function cold-start with the old secrets. Every deploy therefore creates a new parameter version (Parameter Store keeps up to 100) and, because the environment changes, replaces the function's warm containers so new secrets take effect at once. Functions deployed by older maws versions read the latest version until their first deploy with this version. If the pinned version no longer exists, the runtime logs a warning and reads the latest one.
+
+`maws update` itself never runs `.env.prod` as shell code: it reads the few values it needs (bot token, webhook secret) like the runtime does, and exports only deploy-tool settings found there (`AWS_*`, `SAM_CLI_*`, `PIP_*`, proxy variables) to `aws`/`sam`/`pip`.
+
 ---
 
 ## User histories and files
@@ -343,13 +434,18 @@ ANOTHER=VAL
 * `maws pull-history` syncs all history files by default. Use `--user-id <id>` repeatedly or `--user-ids <id,id>` to download only selected user histories.
 * By default, user media and generated files remain in Lambda `/tmp/files` only. Set `persist_files_s3=true` to sync per-user files under `files/<chat_id>/` in the history bucket.
 * For **tokens** defined in `SPECIAL_TOKEN_FILES_JSON`, it syncs S3 to `/tmp` (or package to `/tmp` if missing in S3) and can optionally expose paths via `TOKEN_ENV_MAP_JSON`.
+* `infra.s3_lifecycle_days` expires objects under `history/`, `<files_s3_prefix>/` and `failed-events/` that were not written for that many days (an inactive user's history is deleted). Token files under `tokens_s3_prefix` (`secrets/`) never expire.
+* With `infra.s3_versioning: true`, every history upload keeps the previous copy as a noncurrent version; they expire after `infra.s3_noncurrent_version_days` (default 30; `0` keeps them forever), and expired delete markers are removed.
+* New projects created with `maws start` / `maws setup` get unguessable bucket names in `params.json` (`<project>-history-<random>`, `<project>-deploy-<random>`). Projects without names in `params.json` keep the old defaults (`<project>-history-bucket`, `<project>-deployment-bucket`): never change the history bucket of a deployed project, or the bot starts with empty histories. `maws update` and `maws pull-history` refuse a bucket owned by another AWS account (`--expected-bucket-owner`).
 
 ---
 
 ## Logging
 
 * `VERBOSE=true` enables detailed traces in bots/MAS.
-* CloudWatch Logs centralizes Lambda logs (low cost; remember to rotate).
+* The function logs (JSON format) go to the stack's log group `/aws/lambda/<stack>-maws` with a retention of `infra.log_retention_days` days, **30 by default**: long enough to investigate a problem reported a few weeks later, short enough that chat ids and (with `VERBOSE`) message contents are not kept forever. `0` keeps logs forever; other values must be a CloudWatch retention (1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, ...).
+* The log group has its own name (set through Lambda's `LoggingConfig`) because Lambda already created `/aws/lambda/<function>` for every deployed function, and CloudFormation cannot create a log group that exists; that is why setting `log_retention_days` on an existing stack used to fail. Changing the retention later is a normal `maws update`. After upgrading, new logs go to the new group; the old `/aws/lambda/<function>` group keeps the older logs without retention (delete it or set a retention in CloudWatch). A stack that already manages `/aws/lambda/<function>` (deployed with `log_retention_days` on a fresh stack) keeps using it.
+* Drops and failures are also metrics: `MAWS/DroppedMessages` and `MAWS/FailedMessages`.
 
 ---
 
@@ -378,7 +474,7 @@ lambda_handler = build_lambda_handler(os.environ.get("BOT_TYPE", "whatsapp"))
 ```txt
 boto3
 requests
-mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git
+mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git@<commit>
 ```
 
 **template.yaml**: see the IAM / CloudFormation section above.

@@ -10,6 +10,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+die() { printf '%s\n' "$@" >&2; exit 1; }
+
 [[ -f "${CONF}" ]] || { echo "${CONF} not found"; exit 1; }
 
 # --- Checks ---
@@ -25,10 +27,35 @@ need sed
 # --- Read config ---
 echo ">> Reading config: ${CONF}"
 
-PROJECT=$(jq -r '.project' "${CONF}")
-REGION=$(jq -r '.region' "${CONF}")
-BOT=$(jq -r '.bot' "${CONF}") # "telegram" | "whatsapp"
+# Booleans use has(): `.x // default` would turn an explicit false into the default.
+# Usage: param_bool <parent object path, "." for top level> <key> <default: true|false>
+param_bool() {
+  local parent="$1" key="$2" default="$3" value label
+  label="${key}"
+  [[ "${parent}" != "." ]] && label="${parent#.}.${key}"
+  value=$(jq -r --arg k "${key}" \
+    "if ((${parent}) | type) == \"object\" and ((${parent}) | has(\$k)) and ((${parent})[\$k] != null) then (${parent})[\$k] else ${default} end" \
+    "${CONF}")
+  case "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes|on) printf 'true' ;;
+    false|0|no|off) printf 'false' ;;
+    *) die "[ERR] ${label} in ${CONF} must be true or false (got: ${value})." ;;
+  esac
+}
 
+PROJECT=$(jq -r '.project // empty' "${CONF}")
+REGION=$(jq -r '.region // empty' "${CONF}")
+BOT=$(jq -r '.bot // empty' "${CONF}" | tr '[:upper:]' '[:lower:]') # "telegram" | "whatsapp"
+[[ -n "${PROJECT}" ]] || die "[ERR] ${CONF} has no \"project\"."
+[[ -n "${REGION}" ]] || die "[ERR] ${CONF} has no \"region\"."
+if [[ -z "${BOT}" ]]; then
+  echo "[WARN] ${CONF} has no \"bot\"; deploying a WhatsApp bot (the runtime default). Set \"bot\" explicitly."
+  BOT="whatsapp"
+fi
+[[ "${BOT}" == "telegram" || "${BOT}" == "whatsapp" ]] || die "[ERR] \"bot\" in ${CONF} must be \"telegram\" or \"whatsapp\" (got: ${BOT})."
+
+# Default names below are used by existing deployments: never change them (a different history
+# bucket name means a new, empty history bucket). New projects get explicit names in params.json.
 STACK=$(jq -r '.stack_name // empty' "${CONF}")
 [[ -z "${STACK}" || "${STACK}" == "null" ]] && STACK="${PROJECT}-stack"
 
@@ -40,16 +67,22 @@ DEPLOY_BUCKET=$(jq -r '.deployment_bucket // empty' "${CONF}")
 
 # Lambda code is staged here so only project code ends up in the deployment zip.
 PACKAGE_DIR=".maws_package"
+# Generated deploy files (template.yaml) are build artifacts in BUILD_DIR. Files in the project
+# root (template.yaml, samconfig.toml, requirements.txt, lambda_function.py) are never written.
+BUILD_DIR=".maws_build"
+TEMPLATE_FILE="${BUILD_DIR}/template.yaml"
+SAM_BUILD_DIR=".aws-sam/build"
 
 ENV_PARAM=$(jq -r '.env_param_name // empty' "${CONF}")
 [[ -z "${ENV_PARAM}" || "${ENV_PARAM}" == "null" ]] && ENV_PARAM="/${PROJECT}/prod/env"
 
 API_PATH=$(jq -r '.api_path // "/webhook"' "${CONF}")
 
-SYNC_TOKENS_S3=$(jq -r '.sync_tokens_s3 // true' "${CONF}")
+SYNC_TOKENS_S3=$(param_bool . sync_tokens_s3 true)
 TOKENS_PREFIX=$(jq -r '.tokens_s3_prefix // "secrets"' "${CONF}")
-VERBOSE=$(jq -r '.verbose // false' "${CONF}")
+VERBOSE=$(param_bool . verbose false)
 LAMBDA_TIMEOUT=$(jq -r '.lambda_timeout // 120' "${CONF}")
+[[ "${LAMBDA_TIMEOUT}" =~ ^[0-9]+$ ]] || die "[ERR] lambda_timeout in ${CONF} must be a whole number of seconds (got: ${LAMBDA_TIMEOUT})."
 # SQS makes a message visible again VISIBILITY_TIMEOUT seconds after a worker received it. The user
 # lock must outlive a running invocation (lambda_timeout) but expire before that redelivery, or the
 # retry of a crashed worker's message finds the user still busy. The runtime ties the lock to the
@@ -57,8 +90,9 @@ LAMBDA_TIMEOUT=$(jq -r '.lambda_timeout // 120' "${CONF}")
 VISIBILITY_TIMEOUT=$((LAMBDA_TIMEOUT + 30))
 LOCK_TTL_SECONDS=$((LAMBDA_TIMEOUT + 15))
 
-BUSY_POLICY=$(jq -r '.busy_policy // "drop"' "${CONF}")
-PERSIST_FILES_S3=$(jq -r '.persist_files_s3 // false' "${CONF}")
+BUSY_POLICY=$(jq -r '.busy_policy // "drop"' "${CONF}" | tr '[:upper:]' '[:lower:]')
+[[ "${BUSY_POLICY}" == "drop" || "${BUSY_POLICY}" == "fifo" ]] || die "[ERR] busy_policy in ${CONF} must be \"drop\" or \"fifo\" (got: ${BUSY_POLICY})."
+PERSIST_FILES_S3=$(param_bool . persist_files_s3 false)
 FILES_PREFIX=$(jq -r '.files_s3_prefix // "files"' "${CONF}")
 
 HISTORY_MODE=$(jq -r '.history_mode // empty' "${CONF}")
@@ -69,31 +103,57 @@ HISTORY_PERIOD=$(jq -r '.history_period // "1w"' "${CONF}")
 
 MANAGER_KWARGS_JSON=$(jq -c '.runtime.manager_kwargs // {}' "${CONF}")
 BOT_KWARGS_JSON=$(jq -c '.runtime.bot_kwargs // {}' "${CONF}")
-ENSURE_DELIVERY=$(jq -r '.runtime.ensure_delivery // true' "${CONF}")
+ENSURE_DELIVERY=$(param_bool .runtime ensure_delivery true)
 DELIVERY_TIMEOUT=$(jq -r '.runtime.delivery_timeout // 60.0' "${CONF}")
 MAX_ALLOWED_MESSAGE_DELAY=$(jq -r '.runtime.max_allowed_message_delay // empty' "${CONF}")
+# busy_policy=drop: max seconds a worker waits for a busy user lock before dropping (runtime default 30).
+BUSY_WAIT_SECONDS=$(jq -r '.runtime.busy_wait_seconds // empty' "${CONF}")
+[[ -z "${BUSY_WAIT_SECONDS}" || "${BUSY_WAIT_SECONDS}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "[ERR] runtime.busy_wait_seconds in ${CONF} must be a number of seconds (got: ${BUSY_WAIT_SECONDS})."
 
 TELEGRAM_SECRET_ENV_KEY=$(jq -r '.webhook_security.telegram_secret_token_env_key // empty' "${CONF}")
 [[ -z "${TELEGRAM_SECRET_ENV_KEY}" || "${TELEGRAM_SECRET_ENV_KEY}" == "null" ]] && TELEGRAM_SECRET_ENV_KEY="TELEGRAM_WEBHOOK_SECRET_TOKEN"
 WHATSAPP_APP_SECRET_ENV_KEY=$(jq -r '.webhook_security.whatsapp_app_secret_env_key // empty' "${CONF}")
 [[ -z "${WHATSAPP_APP_SECRET_ENV_KEY}" || "${WHATSAPP_APP_SECRET_ENV_KEY}" == "null" ]] && WHATSAPP_APP_SECRET_ENV_KEY="WHATSAPP_APP_SECRET"
 
-CAPTURE_FAILED_EVENTS=$(jq -r '.failure_handling.capture_failed_events // false' "${CONF}")
-WORKER_DLQ=$(jq -r '.failure_handling.worker_dlq // false' "${CONF}")
+CAPTURE_FAILED_EVENTS=$(param_bool .failure_handling capture_failed_events false)
+# FIFO: a DLQ is the default. Without one, SQS retries a failing message until it expires (4 days)
+# and every later message of that chat waits behind it.
+WORKER_DLQ_DEFAULT="false"
+[[ "${BUSY_POLICY}" == "fifo" ]] && WORKER_DLQ_DEFAULT="true"
+WORKER_DLQ=$(param_bool .failure_handling worker_dlq "${WORKER_DLQ_DEFAULT}")
+MAX_RECEIVE_COUNT=$(jq -r '.failure_handling.max_receive_count // 3' "${CONF}")
+[[ "${MAX_RECEIVE_COUNT}" =~ ^[0-9]+$ && "${MAX_RECEIVE_COUNT}" -ge 1 && "${MAX_RECEIVE_COUNT}" -le 1000 ]] || die "[ERR] failure_handling.max_receive_count in ${CONF} must be 1-1000 (got: ${MAX_RECEIVE_COUNT})."
+# busy_policy=drop: async self-invocations that still fail after Lambda's 2 retries go to an SQS queue.
+ASYNC_FAILURE_QUEUE=$(param_bool .failure_handling async_failure_queue true)
+[[ "${BUSY_POLICY}" == "drop" ]] || ASYNC_FAILURE_QUEUE="false"
 
 # Optional external history append endpoint (/history/outgoing). Off by default.
-HISTORY_APPEND_ENABLED=$(jq -r '.history_append.enabled // false' "${CONF}")
+HISTORY_APPEND_ENABLED=$(param_bool .history_append enabled false)
 HISTORY_APPEND_ROLE=$(jq -r '.history_append.role // empty' "${CONF}")
 
 LAMBDA_RUNTIME=$(jq -r '.infra.runtime // "python3.12"' "${CONF}")
 ARCHITECTURE=$(jq -r '.infra.architecture // "x86_64"' "${CONF}")
 MEMORY_SIZE=$(jq -r '.infra.memory_size // 256' "${CONF}")
+# CloudWatch log retention. Default 30 days: enough to investigate problems reported weeks later,
+# while the logs (chat ids, and message content with verbose=true) are not kept forever.
+# 0 keeps logs forever.
 LOG_RETENTION_DAYS=$(jq -r '.infra.log_retention_days // empty' "${CONF}")
+[[ -z "${LOG_RETENTION_DAYS}" ]] && LOG_RETENTION_DAYS=30
+case " 0 1 3 5 7 14 30 60 90 120 150 180 365 400 545 731 1096 1827 2192 2557 2922 3288 3653 " in
+  *" ${LOG_RETENTION_DAYS} "*) ;;
+  *) die "[ERR] infra.log_retention_days in ${CONF} must be 0 (keep forever) or a CloudWatch Logs retention:" \
+       "      1 3 5 7 14 30 60 90 120 150 180 365 400 545 731 1096 1827 2192 2557 2922 3288 3653 (got: ${LOG_RETENTION_DAYS})." ;;
+esac
 RESERVED_CONCURRENCY=$(jq -r '.infra.reserved_concurrency // empty' "${CONF}")
-S3_VERSIONING=$(jq -r '.infra.s3_versioning // false' "${CONF}")
+S3_VERSIONING=$(param_bool .infra s3_versioning false)
 S3_LIFECYCLE_DAYS=$(jq -r '.infra.s3_lifecycle_days // empty' "${CONF}")
+[[ -z "${S3_LIFECYCLE_DAYS}" || "${S3_LIFECYCLE_DAYS}" =~ ^[1-9][0-9]*$ ]] || die "[ERR] infra.s3_lifecycle_days in ${CONF} must be a positive whole number of days (got: ${S3_LIFECYCLE_DAYS})."
+# With versioning on, every history upload keeps the previous copy as a noncurrent version.
+S3_NONCURRENT_DAYS=$(jq -r '.infra.s3_noncurrent_version_days // empty' "${CONF}")
+[[ -z "${S3_NONCURRENT_DAYS}" ]] && S3_NONCURRENT_DAYS=30
+[[ "${S3_NONCURRENT_DAYS}" =~ ^[0-9]+$ ]] || die "[ERR] infra.s3_noncurrent_version_days in ${CONF} must be a whole number of days, 0 to keep them (got: ${S3_NONCURRENT_DAYS})."
 S3_ENCRYPTION=$(jq -r '.infra.s3_encryption // empty' "${CONF}")
-TRACING_ENABLED=$(jq -r '.infra.tracing // true' "${CONF}")
+TRACING_ENABLED=$(param_bool .infra tracing true)
 FUNCTION_TRACING="Active"
 [[ "${TRACING_ENABLED}" == "false" ]] && FUNCTION_TRACING="PassThrough"
 
@@ -110,8 +170,6 @@ WHATSAPP_VERIFY_ENV_KEY=$(jq -r '.whatsapp.verify_env_key // empty' "${CONF}")
 SPECIAL_JSON=$(jq -c '.special_token_files // []' "${CONF}")
 TOKEN_ENV_MAP=$(jq -c '.token_env_map // {}' "${CONF}")
 mapfile -t EXTRA_REQ < <(jq -r '.extra_requirements[]?' "${CONF}" 2>/dev/null || true)
-
-die() { printf '%s\n' "$@" >&2; exit 1; }
 
 # Read KEY from .env.prod the way the Lambda runtime does (maws/runtime.py,
 # _load_env_from_ssm_if_needed): the first KEY=value line wins, surrounding whitespace (including a
@@ -131,6 +189,20 @@ env_file_value() {
       printf '%s' "${value}"
       return 0
     fi
+  done < .env.prod
+  return 0
+}
+
+# The keys of .env.prod, in the same format env_file_value reads.
+env_file_keys() {
+  local line key
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]] && continue
+    key="${line%%=*}"
+    key="${key%"${key##*[![:space:]]}"}"
+    printf '%s\n' "${key}"
   done < .env.prod
   return 0
 }
@@ -217,14 +289,29 @@ else
   fi
 fi
 
-# --- Load .env.prod into the environment (aws/sam see it too) ---
-# After the checks above, which read the file without executing it, so a malformed secret gets a
-# clear error. Trailing CRs are stripped so a .env.prod saved on Windows does not break bash.
-set -a
-source <(sed 's/\r$//' ./.env.prod)
-set +a
+# --- Deploy-tool settings from .env.prod ---
+# .env.prod is read, never sourced: its lines are not shell code (values with spaces, quotes, $ or
+# ; would break or run). Only settings for aws/sam/pip (AWS_*, SAM_CLI_*, PIP_*, proxies) are
+# exported to this deploy, as they were when the file used to be sourced; every value reaches Lambda
+# through SSM.
+strip_matching_quotes() {
+  local v="$1"
+  if [[ ${#v} -ge 2 ]]; then
+    if [[ "${v:0:1}" == '"' && "${v: -1}" == '"' ]] || [[ "${v:0:1}" == "'" && "${v: -1}" == "'" ]]; then
+      v="${v:1:${#v}-2}"
+    fi
+  fi
+  printf '%s' "${v}"
+}
+DEPLOY_ENV_KEY_RE='^(AWS_[A-Za-z0-9_]+|SAM_CLI_[A-Za-z0-9_]+|PIP_[A-Za-z0-9_]+|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy)$'
+while IFS= read -r env_key; do
+  [[ "${env_key}" =~ ${DEPLOY_ENV_KEY_RE} ]] || continue
+  export "${env_key}=$(strip_matching_quotes "$(env_file_value "${env_key}")")"
+  echo "[INFO] Using ${env_key} from .env.prod for this deploy."
+done < <(env_file_keys | sort -u)
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+[[ "${ACCOUNT_ID}" =~ ^[0-9]{12}$ ]] || die "[ERR] Could not determine the AWS account id (aws sts get-caller-identity returned '${ACCOUNT_ID}')."
 echo ">> AWS account: ${ACCOUNT_ID}  Region: ${REGION}"
 
 # --- Helpers for logical IDs (letters/numbers only and starting with a letter) ---
@@ -245,8 +332,7 @@ PROJECT_LOGICAL="$(logical_id "$PROJECT")"
 FUNC_ID="${PROJECT_LOGICAL}Function"
 BUCKET_ID="${PROJECT_LOGICAL}HistoryBucket"
 
-# --- requirements.txt ---
-echo ">> Generating requirements.txt"
+# --- MAS requirement ---
 MAS_EXTRA="maws,telegram,whatsapp,env"
 case "${REQUIREMENTS_SOURCE}" in
   pypi)
@@ -255,6 +341,9 @@ case "${REQUIREMENTS_SOURCE}" in
     else
       MAS_REQUIREMENT="mas[${MAS_EXTRA}]"
     fi
+    echo "[WARN] requirements_source=pypi installs the PyPI project named 'mas'. This library is documented and"
+    echo "       installed from GitHub; make sure the PyPI 'mas' project really is this library before using it."
+    echo "       Otherwise an unrelated package would run inside your Lambda, with access to your secrets."
     ;;
   local)
     if [[ -z "${REQUIREMENTS_REF}" || "${REQUIREMENTS_REF}" == "null" ]]; then
@@ -267,47 +356,34 @@ case "${REQUIREMENTS_SOURCE}" in
     MAS_REQUIREMENT="mas[${MAS_EXTRA}] @ git+https://github.com/mneuronico/multi-agent-system-library.git"
     if [[ -n "${REQUIREMENTS_REF}" && "${REQUIREMENTS_REF}" != "null" ]]; then
       MAS_REQUIREMENT="${MAS_REQUIREMENT}@${REQUIREMENTS_REF}"
+    else
+      echo "[WARN] requirements_ref is not set: Lambda gets whatever is on the default branch of"
+      echo "       github.com/mneuronico/multi-agent-system-library at deploy time, so two deploys of the"
+      echo "       same project can ship different MAS/MAWS code. Pin it in params.json to a commit SHA"
+      echo "       (most reproducible) or a release tag, e.g. \"requirements_ref\": \"<commit sha>\"."
     fi
     ;;
 esac
-{
-  echo "requests"
-  echo "boto3"
-  echo "${MAS_REQUIREMENT}"
-  for r in "${EXTRA_REQ[@]}"; do echo "$r"; done
-} | awk 'NF' | sort -u > requirements.txt
 
-# --- samconfig.toml ---
-echo ">> Generating samconfig.toml"
-cat > samconfig.toml <<EOF
-version = 0.1
-[default]
-[default.deploy]
-[default.deploy.parameters]
-stack_name = "${STACK}"
-s3_bucket = "${DEPLOY_BUCKET}"
-s3_prefix = "${STACK}"
-region = "${REGION}"
-confirm_changeset = true
-capabilities = "CAPABILITY_IAM"
-image_repositories = []
-EOF
+# --- Logs: an existing stack may already own the legacy log group (/aws/lambda/<function>) ---
+LEGACY_LOG_GROUP_ID="${PROJECT_LOGICAL}FunctionLogGroup"
+LEGACY_LOG_GROUP=$(aws cloudformation describe-stack-resource \
+  --stack-name "${STACK}" --logical-resource-id "${LEGACY_LOG_GROUP_ID}" --region "${REGION}" \
+  --query StackResourceDetail.PhysicalResourceId --output text 2>/dev/null || true)
+[[ "${LEGACY_LOG_GROUP}" == "None" ]] && LEGACY_LOG_GROUP=""
+LOG_GROUP_ID="${PROJECT_LOGICAL}Logs"
+LOG_GROUP_NAME="/aws/lambda/${STACK}-maws"
+if [[ -n "${LEGACY_LOG_GROUP}" ]]; then
+  LOG_GROUP_ID="${LEGACY_LOG_GROUP_ID}"
+  LOG_GROUP_NAME="${LEGACY_LOG_GROUP}"
+fi
 
-# --- Common Lambda (templates) ---
-
-# --- Write minimal lambda_function.py ---
-echo ">> Generating lambda_function.py (${BOT})"
-cat > lambda_function.py <<'PY'
-import os
-from maws import build_lambda_handler
-
-BOT_TYPE = os.environ.get("BOT_TYPE", "whatsapp")
-lambda_handler = build_lambda_handler(BOT_TYPE)
-PY
-
-# --- template.yaml ---
-echo ">> Generating template.yaml"
-cat > template.yaml <<EOF
+# --- template.yaml (build artifact) ---
+echo ">> Generating ${TEMPLATE_FILE}"
+rm -rf "${BUILD_DIR}"
+mkdir -p "${BUILD_DIR}"
+cat > "${TEMPLATE_FILE}" <<EOF
+# Generated by maws update (bootstrap.sh) from ${CONF} on every deploy: do not edit, change params.json.
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: ${PROJECT}
@@ -318,8 +394,6 @@ Globals:
     Runtime: ${LAMBDA_RUNTIME}
     MemorySize: ${MEMORY_SIZE}
     Tracing: ${FUNCTION_TRACING}
-    LoggingConfig:
-      LogFormat: JSON
   Api:
     TracingEnabled: ${TRACING_ENABLED}
 
@@ -327,6 +401,10 @@ Parameters:
   EnvParamName:
     Type: String
     Default: "${ENV_PARAM}"
+  EnvParamVersion:
+    Type: String
+    Default: ""
+    Description: SSM parameter version the function reads (set by maws update).
 
 Resources:
   ProcessingLocksTable:
@@ -350,14 +428,14 @@ Resources:
 EOF
 
 if [[ "${S3_VERSIONING}" == "true" ]]; then
-  cat >> template.yaml <<'EOF'
+  cat >> "${TEMPLATE_FILE}" <<'EOF'
       VersioningConfiguration:
         Status: Enabled
 EOF
 fi
 
 if [[ -n "${S3_ENCRYPTION}" && "${S3_ENCRYPTION}" != "null" ]]; then
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -365,18 +443,67 @@ if [[ -n "${S3_ENCRYPTION}" && "${S3_ENCRYPTION}" != "null" ]]; then
 EOF
 fi
 
-if [[ -n "${S3_LIFECYCLE_DAYS}" && "${S3_LIFECYCLE_DAYS}" != "null" ]]; then
-  cat >> template.yaml <<EOF
-      LifecycleConfiguration:
-        Rules:
-          - Id: ExpireMawsObjects
+# Lifecycle: expire user data (histories, files, failed-event captures) only, never the token
+# files under tokens_s3_prefix; with versioning, also expire noncurrent versions.
+LIFECYCLE_RULES=""
+if [[ -n "${S3_LIFECYCLE_DAYS}" ]]; then
+  for rule in "ExpireHistory:history" "ExpireFiles:${FILES_PREFIX%/}" "ExpireFailedEvents:failed-events"; do
+    rule_id="${rule%%:*}"
+    rule_prefix="${rule#*:}"
+    [[ -n "${rule_prefix}" ]] || continue
+    if [[ "${rule_prefix}" == "${TOKENS_PREFIX%/}" ]]; then
+      echo "[WARN] files_s3_prefix equals tokens_s3_prefix (${rule_prefix}); not expiring it so token files are kept."
+      continue
+    fi
+    LIFECYCLE_RULES+="          - Id: ${rule_id}
             Status: Enabled
+            Prefix: ${rule_prefix}/
             ExpirationInDays: ${S3_LIFECYCLE_DAYS}
+"
+  done
+fi
+if [[ "${S3_VERSIONING}" == "true" && "${S3_NONCURRENT_DAYS}" -gt 0 ]]; then
+  LIFECYCLE_RULES+="          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: ${S3_NONCURRENT_DAYS}
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+"
+elif [[ "${S3_VERSIONING}" == "true" ]]; then
+  echo "[WARN] infra.s3_noncurrent_version_days=0: every old version of every history upload is kept (and billed)."
+fi
+if [[ -n "${LIFECYCLE_RULES}" ]]; then
+  printf '      LifecycleConfiguration:\n        Rules:\n%s' "${LIFECYCLE_RULES}" >> "${TEMPLATE_FILE}"
+fi
+
+# Lambda writes to this stack-managed log group (LoggingConfig.LogGroup). A new name is used because
+# Lambda already created /aws/lambda/<function> for deployed functions, and CloudFormation cannot
+# create a log group that exists. Stacks that already own that group keep it.
+if [[ -n "${LEGACY_LOG_GROUP}" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+  ${LOG_GROUP_ID}:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/\${${FUNC_ID}}"
+EOF
+else
+  cat >> "${TEMPLATE_FILE}" <<EOF
+  ${LOG_GROUP_ID}:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/\${AWS::StackName}-maws"
+EOF
+fi
+if [[ "${LOG_RETENTION_DAYS}" -gt 0 ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+      RetentionInDays: ${LOG_RETENTION_DAYS}
 EOF
 fi
 
 if [[ "${BUSY_POLICY}" == "fifo" && "${WORKER_DLQ}" == "true" ]]; then
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
   ${PROJECT_LOGICAL}WorkerDlq:
     Type: AWS::SQS::Queue
     Properties:
@@ -388,7 +515,11 @@ EOF
 fi
 
 if [[ "${BUSY_POLICY}" == "fifo" ]]; then
-  cat >> template.yaml <<EOF
+  if [[ "${WORKER_DLQ}" != "true" ]]; then
+    echo "[WARN] failure_handling.worker_dlq=false: a job that keeps failing is retried until SQS drops it"
+    echo "       (4 days) and blocks every later message of that chat meanwhile. The DLQ is the default."
+  fi
+  cat >> "${TEMPLATE_FILE}" <<EOF
   ${PROJECT_LOGICAL}WorkerQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -398,16 +529,28 @@ if [[ "${BUSY_POLICY}" == "fifo" ]]; then
       VisibilityTimeout: ${VISIBILITY_TIMEOUT}
 EOF
   if [[ "${WORKER_DLQ}" == "true" ]]; then
-    cat >> template.yaml <<EOF
+    cat >> "${TEMPLATE_FILE}" <<EOF
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt ${PROJECT_LOGICAL}WorkerDlq.Arn
-        maxReceiveCount: 3
+        maxReceiveCount: ${MAX_RECEIVE_COUNT}
 EOF
   fi
-  echo "" >> template.yaml
+  echo "" >> "${TEMPLATE_FILE}"
 fi
 
-cat >> template.yaml <<EOF
+if [[ "${ASYNC_FAILURE_QUEUE}" == "true" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+  ${PROJECT_LOGICAL}AsyncFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "\${AWS::StackName}-async-failures"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+EOF
+fi
+
+cat >> "${TEMPLATE_FILE}" <<EOF
   ${FUNC_ID}:
     Type: AWS::Serverless::Function
     Properties:
@@ -416,15 +559,37 @@ cat >> template.yaml <<EOF
       Runtime: ${LAMBDA_RUNTIME}
       Description: "MAS Bot Lambda"
       Architectures: [ ${ARCHITECTURE} ]
+      LoggingConfig:
+        LogFormat: JSON
 EOF
 
+if [[ -z "${LEGACY_LOG_GROUP}" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+        LogGroup: !Ref ${LOG_GROUP_ID}
+EOF
+fi
+
 if [[ -n "${RESERVED_CONCURRENCY}" && "${RESERVED_CONCURRENCY}" != "null" ]]; then
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
       ReservedConcurrentExecutions: ${RESERVED_CONCURRENCY}
 EOF
 fi
 
-cat >> template.yaml <<EOF
+if [[ "${ASYNC_FAILURE_QUEUE}" == "true" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt ${PROJECT_LOGICAL}AsyncFailureQueue.Arn
+EOF
+fi
+
+# No lambda:InvokeFunction here: the self-invoke permission is a separate AWS::IAM::Policy scoped
+# to this function (see SelfInvokePolicy below). Referencing the function from its own role's
+# policies would be a circular dependency.
+cat >> "${TEMPLATE_FILE}" <<EOF
       Policies:
         - AWSLambdaBasicExecutionRole
         - AWSXRayDaemonWriteAccess
@@ -439,14 +604,10 @@ cat >> template.yaml <<EOF
             - Effect: Allow
               Action: [ "s3:GetObject", "s3:PutObject" ]
               Resource: "arn:aws:s3:::${HISTORY_BUCKET}/*"
-        - Statement:
-            - Effect: Allow
-              Action: [ "lambda:InvokeFunction" ]
-              Resource: "*"
 EOF
 
 if [[ "${BUSY_POLICY}" == "fifo" ]]; then
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
         - Statement:
             - Effect: Allow
               Action: [ "sqs:SendMessage" ]
@@ -454,7 +615,16 @@ if [[ "${BUSY_POLICY}" == "fifo" ]]; then
 EOF
 fi
 
-cat >> template.yaml <<EOF
+if [[ "${ASYNC_FAILURE_QUEUE}" == "true" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+        - Statement:
+            - Effect: Allow
+              Action: [ "sqs:SendMessage" ]
+              Resource: !GetAtt ${PROJECT_LOGICAL}AsyncFailureQueue.Arn
+EOF
+fi
+
+cat >> "${TEMPLATE_FILE}" <<EOF
         - Statement:
             - Effect: Allow
               Action:
@@ -468,6 +638,9 @@ cat >> template.yaml <<EOF
           VERBOSE: "${VERBOSE}"
           BUCKET_NAME: "${HISTORY_BUCKET}"
           ENV_PARAMETER_NAME: "${ENV_PARAM}"
+          # The function reads exactly this SSM version, so a failed deploy never leaves it
+          # running with secrets written for a different deploy.
+          MAWS_ENV_PARAMETER_VERSION: !Ref EnvParamVersion
 
           # Runtime behavior
           MAWS_BUSY_POLICY: "${BUSY_POLICY}"
@@ -499,24 +672,30 @@ cat >> template.yaml <<EOF
           CAPTURE_FAILED_EVENTS: "${CAPTURE_FAILED_EVENTS}"
 EOF
 
+if [[ -n "${BUSY_WAIT_SECONDS}" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+          MAWS_BUSY_WAIT_SECONDS: "${BUSY_WAIT_SECONDS}"
+EOF
+fi
+
 if [[ "${BUSY_POLICY}" == "fifo" ]]; then
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
           MAWS_QUEUE_URL: !Ref ${PROJECT_LOGICAL}WorkerQueue
 EOF
 fi
 
 if [[ "${HISTORY_APPEND_ENABLED}" == "true" ]]; then
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
           MAWS_HISTORY_APPEND_ENABLED: "true"
 EOF
   if [[ -n "${HISTORY_APPEND_ROLE}" ]]; then
-    cat >> template.yaml <<EOF
+    cat >> "${TEMPLATE_FILE}" <<EOF
           MAWS_HISTORY_APPEND_ROLE: "${HISTORY_APPEND_ROLE}"
 EOF
   fi
 fi
 
-cat >> template.yaml <<EOF
+cat >> "${TEMPLATE_FILE}" <<EOF
 
           # Locks
           LOCKS_TABLE_NAME: !Ref ProcessingLocksTable
@@ -525,7 +704,7 @@ cat >> template.yaml <<EOF
 EOF
 
 if [[ "${BOT}" == "telegram" ]]; then
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
         TelegramWebhook:
           Type: Api
           Properties:
@@ -533,7 +712,7 @@ if [[ "${BOT}" == "telegram" ]]; then
             Method: post
 EOF
 else
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
         WhatsAppWebhookGET:
           Type: Api
           Properties: { Path: "${API_PATH}", Method: get }
@@ -544,7 +723,7 @@ EOF
 fi
 
 if [[ "${HISTORY_APPEND_ENABLED}" == "true" ]]; then
-  cat >> template.yaml <<'EOF'
+  cat >> "${TEMPLATE_FILE}" <<'EOF'
         HistoryAppendPOST:
           Type: Api
           Properties: { Path: "/history/outgoing", Method: post }
@@ -552,7 +731,7 @@ EOF
 fi
 
 if [[ "${BUSY_POLICY}" == "fifo" ]]; then
-  cat >> template.yaml <<EOF
+  cat >> "${TEMPLATE_FILE}" <<EOF
         WorkerQueueEvent:
           Type: SQS
           Properties:
@@ -561,29 +740,82 @@ if [[ "${BUSY_POLICY}" == "fifo" ]]; then
 EOF
 fi
 
-if [[ -n "${LOG_RETENTION_DAYS}" && "${LOG_RETENTION_DAYS}" != "null" ]]; then
-  cat >> template.yaml <<EOF
+# busy_policy=drop self-invokes the function: allow exactly this function (and its versions/aliases).
+if [[ "${BUSY_POLICY}" == "drop" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
 
-  ${PROJECT_LOGICAL}FunctionLogGroup:
-    Type: AWS::Logs::LogGroup
+  ${PROJECT_LOGICAL}SelfInvokePolicy:
+    Type: AWS::IAM::Policy
     Properties:
-      LogGroupName: !Sub "/aws/lambda/\${${FUNC_ID}}"
-      RetentionInDays: ${LOG_RETENTION_DAYS}
+      PolicyName: maws-self-invoke
+      Roles:
+        - !Ref ${FUNC_ID}Role
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              - !GetAtt ${FUNC_ID}.Arn
+              - !Sub "\${${FUNC_ID}.Arn}:*"
 EOF
 fi
 
-cat >> template.yaml <<'EOF'
+cat >> "${TEMPLATE_FILE}" <<EOF
 
 Outputs:
   ApiUrl:
     Description: Base URL for the API
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+    Value: !Sub "https://\${ServerlessRestApi}.execute-api.\${AWS::Region}.amazonaws.com/Prod"
+  FunctionLogGroup:
+    Description: CloudWatch log group of the bot function
+    Value: !Ref ${LOG_GROUP_ID}
 EOF
+if [[ "${BUSY_POLICY}" == "fifo" && "${WORKER_DLQ}" == "true" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+  WorkerDeadLetterQueueUrl:
+    Description: SQS FIFO dead-letter queue of failed worker jobs
+    Value: !Ref ${PROJECT_LOGICAL}WorkerDlq
+EOF
+fi
+if [[ "${ASYNC_FAILURE_QUEUE}" == "true" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+  AsyncFailureQueueUrl:
+    Description: SQS queue receiving async worker invocations that failed after Lambda's retries
+    Value: !Ref ${PROJECT_LOGICAL}AsyncFailureQueue
+EOF
+fi
 
-# --- Create deployment bucket if it doesn't exist ---
+# --- Buckets: never use a bucket owned by another account ---
+# Bucket names are global; a predictable name may have been created by someone else first.
+head_bucket_owned() {
+  aws s3api head-bucket --bucket "$1" --expected-bucket-owner "${ACCOUNT_ID}" 2>&1
+}
+is_not_found() { [[ "$1" == *"(404)"* || "$1" == *"Not Found"* || "$1" == *"NoSuchBucket"* ]]; }
+
 echo ">> Ensuring deployment bucket: ${DEPLOY_BUCKET}"
-if ! aws s3api head-bucket --bucket "${DEPLOY_BUCKET}" 2>/dev/null; then
-  aws s3 mb "s3://${DEPLOY_BUCKET}" --region "${REGION}"
+if ! HEAD_OUT=$(head_bucket_owned "${DEPLOY_BUCKET}"); then
+  if is_not_found "${HEAD_OUT}"; then
+    aws s3 mb "s3://${DEPLOY_BUCKET}" --region "${REGION}" || die \
+      "[ERR] Could not create deployment bucket ${DEPLOY_BUCKET} (the name may be taken by another account)." \
+      "      Set \"deployment_bucket\" in params.json to a unique name."
+    HEAD_OUT=$(head_bucket_owned "${DEPLOY_BUCKET}") || die \
+      "[ERR] Deployment bucket ${DEPLOY_BUCKET} is not owned by account ${ACCOUNT_ID}: ${HEAD_OUT}"
+  else
+    die "[ERR] Deployment bucket ${DEPLOY_BUCKET} exists but is not owned by account ${ACCOUNT_ID} (or is not accessible):" \
+      "      ${HEAD_OUT}" \
+      "      Set \"deployment_bucket\" in params.json to a bucket name your account owns, or a new unique name."
+  fi
+fi
+
+echo ">> Checking history bucket: ${HISTORY_BUCKET}"
+if ! HEAD_OUT=$(head_bucket_owned "${HISTORY_BUCKET}"); then
+  is_not_found "${HEAD_OUT}" || die \
+    "[ERR] History bucket ${HISTORY_BUCKET} exists but is not owned by account ${ACCOUNT_ID} (or is not accessible):" \
+    "      ${HEAD_OUT}" \
+    "      If this is a new project, set \"history_bucket\" in params.json to a new unique name." \
+    "      Never change it for a deployed project: a new bucket means starting with empty histories."
+  echo "   (does not exist yet; the stack creates it)"
 fi
 
 # --- Ensure modern build toolchain before sam build (best effort) ---
@@ -600,7 +832,7 @@ if [[ "${LAMBDA_RUNTIME}" == python3.* ]] && ! command -v "${LAMBDA_RUNTIME}" >/
   LOCAL_PYTHON=$(python3 -c 'import sys; print("python%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")
   if [[ "${LOCAL_PYTHON}" != "${LAMBDA_RUNTIME}" ]]; then
     echo "[WARN] The Lambda runtime is ${LAMBDA_RUNTIME} but ${LAMBDA_RUNTIME} is not on PATH (python3 is ${LOCAL_PYTHON})."
-    echo "       sam build will likely fail: install ${LAMBDA_RUNTIME}, or set \"infra\": {\"runtime\": \"${LOCAL_PYTHON}\"} in params.json."
+    echo "       The build will likely fail: install ${LAMBDA_RUNTIME}, or set \"infra\": {\"runtime\": \"${LOCAL_PYTHON}\"} in params.json."
   fi
 fi
 
@@ -618,8 +850,8 @@ import sys
 
 dest = sys.argv[1]
 top_level = {
-    dest, ".aws-sam", ".git", "history", "files", "logs", "tmp", "local_s3_bucket", ".venv", "venv",
-    "params.json", "samconfig.toml", "template.yaml", ".samignore", ".bootstrap_state.json",
+    dest, ".maws_build", ".aws-sam", ".git", "history", "files", "logs", "tmp", "local_s3_bucket", ".venv", "venv",
+    "params.json", "params.tmp.json", "samconfig.toml", "template.yaml", ".samignore", ".bootstrap_state.json",
     ".gitignore", "bootstrap.sh", "deploy.sh", "pull_history.sh", "README.md",
 }
 anywhere = [
@@ -640,22 +872,122 @@ if [[ -f "api_keys.json" ]]; then
   echo "[WARN] api_keys.json is not packaged. Move those keys to .env.prod so they reach Lambda via SSM."
 fi
 
-# --- sam build ---
+# --- lambda_function.py and requirements.txt (generated into the package only) ---
+# A project file is used as is when you wrote it. MAWS writes its own version into the package
+# (never into the project) when the project has none, or when the project file was generated by
+# maws: it starts with GENERATED_MARKER, or it is exactly what older maws versions wrote there.
+GENERATED_MARKER="# Generated by maws update"
+LEGACY_HANDLER=$'import os\nfrom maws import build_lambda_handler\n\nBOT_TYPE = os.environ.get("BOT_TYPE", "whatsapp")\nlambda_handler = build_lambda_handler(BOT_TYPE)'
+LEGACY_MAS_RE='^mas(\[[A-Za-z0-9_,]*\])?( @ git[+]https://github[.]com/mneuronico/multi-agent-system-library[.]git(@[^[:space:]]+)?|==[^[:space:]]+)?$'
+
+handler_is_generated() {
+  [[ -f lambda_function.py ]] || return 0
+  local content
+  content="$(sed 's/\r$//' lambda_function.py)"
+  [[ "${content}" == "${GENERATED_MARKER}"* || "${content}" == "${LEGACY_HANDLER}" ]]
+}
+
+is_extra_requirement() {
+  local wanted="$1" r
+  for r in "${EXTRA_REQ[@]}"; do
+    [[ "${r}" == "${wanted}" ]] && return 0
+  done
+  return 1
+}
+
+requirements_are_generated() {
+  [[ -f requirements.txt ]] || return 0
+  local line first=1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    if [[ ${first} -eq 1 && "${line}" == "${GENERATED_MARKER}"* ]]; then
+      return 0
+    fi
+    first=0
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" ]] && continue
+    [[ "${line}" == "requests" || "${line}" == "boto3" || "${line}" == "${MAS_REQUIREMENT}" ]] && continue
+    [[ "${line}" =~ ${LEGACY_MAS_RE} ]] && continue
+    is_extra_requirement "${line}" && continue
+    return 1
+  done < requirements.txt
+  return 0
+}
+
+if handler_is_generated; then
+  echo ">> Generating ${PACKAGE_DIR}/lambda_function.py (${BOT})"
+  cat > "${PACKAGE_DIR}/lambda_function.py" <<'PY'
+# Generated by maws update into the Lambda package. To customise the handler, create your own
+# lambda_function.py in the project folder: maws then deploys yours unchanged.
+import os
+from maws import build_lambda_handler
+
+BOT_TYPE = os.environ.get("BOT_TYPE", "whatsapp")
+lambda_handler = build_lambda_handler(BOT_TYPE)
+PY
+else
+  echo "[INFO] Using your lambda_function.py (it was not generated by maws)."
+fi
+
+if requirements_are_generated; then
+  echo ">> Generating ${PACKAGE_DIR}/requirements.txt"
+  {
+    echo "${GENERATED_MARKER} from params.json (requirements_source/requirements_ref/extra_requirements)."
+    {
+      echo "requests"
+      echo "boto3"
+      echo "${MAS_REQUIREMENT}"
+      for r in "${EXTRA_REQ[@]}"; do echo "$r"; done
+    } | awk 'NF' | sort -u
+  } > "${PACKAGE_DIR}/requirements.txt"
+else
+  echo "[INFO] Using your requirements.txt (it was not generated by maws); requirements_source,"
+  echo "       requirements_ref and extra_requirements in params.json do not apply to it."
+  if ! grep -Eq '^[[:space:]]*mas([[:space:]]|\[|=|@|$)' requirements.txt; then
+    echo "[WARN] Your requirements.txt has no 'mas' line: the Lambda needs ${MAS_REQUIREMENT}"
+  fi
+fi
+
+if [[ -f template.yaml || -f samconfig.toml ]]; then
+  echo "[INFO] template.yaml / samconfig.toml in the project folder are not used: maws generates"
+  echo "       ${TEMPLATE_FILE} from params.json on every deploy. Delete them if you did not write them."
+fi
+
+# --- Build (generated template, staged package): sam build
+# --base-dir . resolves CodeUri (${PACKAGE_DIR}) from the project folder, not from ${BUILD_DIR}.
 echo ">> sam build"
-sam build
+sam build --template-file "${TEMPLATE_FILE}" --base-dir . --build-dir "${SAM_BUILD_DIR}"
 
 # --- Upload .env.prod to SSM ---
+# Every upload creates a new parameter version and the function reads the exact version it was
+# deployed with (MAWS_ENV_PARAMETER_VERSION). Uploading before the deploy is therefore safe: if
+# the deploy fails, CloudFormation rolls back and the running function keeps reading its old
+# version. (Uploading after the deploy instead would let the new function start with old secrets.)
 echo ">> Uploading .env.prod to SSM: ${ENV_PARAM}"
-aws ssm put-parameter \
+ENV_PARAM_VERSION=$(aws ssm put-parameter \
   --name "${ENV_PARAM}" \
   --type "SecureString" \
   --value "file://.env.prod" \
   --overwrite \
-  --region "${REGION}" >/dev/null
+  --region "${REGION}" \
+  --query Version --output text)
+[[ "${ENV_PARAM_VERSION}" =~ ^[0-9]+$ ]] || die "[ERR] Could not read the new version of SSM parameter ${ENV_PARAM} (got: '${ENV_PARAM_VERSION}')."
+echo "   SSM parameter version ${ENV_PARAM_VERSION}"
 
 # --- Deploy ---
+# All deploy settings are passed here; no samconfig.toml is generated.
 echo ">> sam deploy"
-sam deploy --no-confirm-changeset
+sam deploy \
+  --template-file "${SAM_BUILD_DIR}/template.yaml" \
+  --stack-name "${STACK}" \
+  --s3-bucket "${DEPLOY_BUCKET}" \
+  --s3-prefix "${STACK}" \
+  --region "${REGION}" \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides "EnvParamVersion=${ENV_PARAM_VERSION}" \
+  --no-confirm-changeset \
+  --no-fail-on-empty-changeset
 
 # --- Retrieve API URL ---
 API_URL=$(aws cloudformation describe-stacks \
@@ -711,9 +1043,18 @@ fi
 
 if [[ "${HISTORY_APPEND_ENABLED}" == "true" ]]; then
   echo "[INFO] History append endpoint: ${API_URL}/history/outgoing"
-  if [[ -z "${MAWS_HISTORY_WRITE_SECRET:-}" ]]; then
+  if [[ -z "$(env_file_value MAWS_HISTORY_WRITE_SECRET)" ]]; then
     echo "[WARN] history_append.enabled=true but .env.prod has no MAWS_HISTORY_WRITE_SECRET; the endpoint will answer 503."
   fi
+fi
+
+echo "[INFO] Logs: CloudWatch log group ${LOG_GROUP_NAME} (retention: $([[ "${LOG_RETENTION_DAYS}" -gt 0 ]] && echo "${LOG_RETENTION_DAYS} days" || echo "never expire"))."
+echo "       Dropped/failed updates: CloudWatch metrics MAWS/DroppedMessages and MAWS/FailedMessages."
+if [[ "${BUSY_POLICY}" == "fifo" && "${WORKER_DLQ}" == "true" ]]; then
+  echo "[INFO] Failed worker jobs go to SQS queue ${STACK}-worker-dlq.fifo after ${MAX_RECEIVE_COUNT} receives."
+fi
+if [[ "${ASYNC_FAILURE_QUEUE}" == "true" ]]; then
+  echo "[INFO] Worker invocations that fail after Lambda's 2 retries go to SQS queue ${STACK}-async-failures."
 fi
 
 echo "[OK] Done."

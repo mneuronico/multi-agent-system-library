@@ -376,6 +376,7 @@ def test_worker_lock_denied_returns_explicit_response():
 
     runtime.initialize_system = initialize_system
     runtime.try_acquire_user_lock = lambda chat_id, context=None: False
+    runtime.busy_wait_seconds = 0  # drop immediately; the bounded wait is covered in test_maws_medium_priority
 
     response = MawsRuntime.handle_apigw_event(
         runtime,
@@ -624,8 +625,9 @@ def test_failed_self_invoke_can_be_captured_to_s3():
 
     response = MawsRuntime.handle_apigw_event(runtime, event, _Context())
 
-    assert response["statusCode"] == 200
-    assert "warning" in json.loads(response["body"])
+    # 5xx so Telegram delivers the update again instead of it being lost.
+    assert response["statusCode"] == 502
+    assert "retry" in json.loads(response["body"])
     [(bucket, key)] = list(runtime.s3.puts)
     assert bucket == "history-bucket"
     assert key.startswith("failed-events/")
@@ -724,6 +726,7 @@ def _history_worker_runtime(workspace_tmp_path, *, enabled=True, lock_results=(T
     runtime.history_append_enabled = enabled
     runtime.history_append_lock_wait = lock_wait
     runtime.history_append_lock_poll = 0
+    runtime.busy_wait_seconds = 0  # webhook jobs drop immediately when the lock is busy
     runtime.bucket_name = "history-bucket"
     runtime.history_prefix = "history"
     runtime.history_mode = "per_user"

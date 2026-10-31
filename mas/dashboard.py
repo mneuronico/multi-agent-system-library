@@ -3,15 +3,37 @@ from __future__ import annotations
 from ._shared import *
 
 import argparse
+import hmac
+import ipaddress
+import os
+import secrets
 import socket
 import socketserver
 import webbrowser
 from http.server import BaseHTTPRequestHandler
+from importlib import resources
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from typing import Set, Tuple
+from urllib.parse import parse_qs, quote, urlparse
 
-from .manager import AgentSystemManager
 from .parser import Parser
+
+
+# The dashboard is a read-only viewer: it reads config.json, the JSON files it imports and the
+# history databases. It never imports fns.py / std.py, never loads .env and never creates folders.
+
+TOKEN_HEADER = "X-MAS-Dashboard-Token"
+TOKEN_ENV_VAR = "MAS_DASHBOARD_TOKEN"
+_LOOPBACK_HOST_NAMES = ("localhost", "127.0.0.1", "[::1]")
+_MAX_IMPORT_DEPTH = 10
+
+
+def _send_security_headers(handler: BaseHTTPRequestHandler) -> None:
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("X-Frame-Options", "DENY")
+    # The page URL can carry the access token; never send it to another site.
+    handler.send_header("Referrer-Policy", "no-referrer")
 
 
 def _json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
@@ -19,6 +41,7 @@ def _json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    _send_security_headers(handler)
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -28,6 +51,7 @@ def _html_response(handler: BaseHTTPRequestHandler, body: str, status: int = 200
     handler.send_response(status)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
+    _send_security_headers(handler)
     handler.end_headers()
     handler.wfile.write(raw)
 
@@ -50,72 +74,132 @@ def _coerce_blocks(content: Any) -> List[dict]:
     return [{"type": "text", "content": content}]
 
 
-def _component_kind(component: Any) -> str:
-    cls = component.__class__.__name__.lower()
-    if cls.endswith("bot"):
-        return "bot"
-    return cls
+def _raw_components(config: dict) -> List[dict]:
+    components = config.get("components", []) if isinstance(config, dict) else []
+    return [c for c in components if isinstance(c, dict)] if isinstance(components, list) else []
 
 
-def _component_to_summary(name: str, component: Any) -> dict:
-    kind = _component_kind(component)
-    summary = {
-        "name": name,
-        "type": kind,
-        "description": getattr(component, "description", None),
-    }
+def _function_name(ref: Any) -> Any:
+    if isinstance(ref, str) and ref.startswith("fn:"):
+        return ref[3:]
+    return ref
+
+
+def _component_summary(component: dict, imported_from: Optional[str] = None) -> dict:
+    """Describe a component from its JSON definition, with the defaults the manager applies."""
+    summary = dict(component)
+    kind = summary.get("type")
     if kind == "agent":
-        summary.update({
-            "system": getattr(component, "system_prompt_original", None),
-            "required_outputs": getattr(component, "required_outputs", None),
-            "default_output": getattr(component, "default_output", None),
-            "models": getattr(component, "models", None),
-            "positive_filter": getattr(component, "positive_filter", None),
-            "negative_filter": getattr(component, "negative_filter", None),
-            "model_params": getattr(component, "model_params", None),
-            "include_timestamp": getattr(component, "include_timestamp", None),
-        })
-    elif kind == "tool":
-        summary.update({
-            "inputs": getattr(component, "inputs", None),
-            "outputs": getattr(component, "outputs", None),
-            "default_output": getattr(component, "default_output", None),
-            "function": getattr(getattr(component, "function", None), "__name__", None),
-        })
-    elif kind == "process":
-        summary.update({
-            "function": getattr(getattr(component, "function", None), "__name__", None),
-            "expected_params": getattr(component, "expected_params", None),
-        })
-    elif kind == "automation":
-        summary["sequence"] = getattr(component, "sequence", None)
+        # Same defaults as AgentSystemManager._create_component_from_json.
+        summary.setdefault("system", "You are a helpful assistant.")
+        summary.setdefault("required_outputs", {"response": "Text to send to user."})
+        summary.setdefault("default_output", {"response": "No valid response."})
+    if kind in ("tool", "process") and "function" in summary:
+        summary["function"] = _function_name(summary["function"])
+    if kind == "automation":
+        summary.setdefault("sequence", [])
+    if imported_from:
+        summary["imported_from"] = imported_from
     return summary
 
 
-def _raw_components(config: dict) -> List[dict]:
-    components = config.get("components", [])
-    return components if isinstance(components, list) else []
+def _normalize_imports(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return []
 
 
-def _automation_sequences(config: dict, manager: Optional[AgentSystemManager]) -> List[dict]:
-    out = []
-    if manager is not None:
-        for name, automation in manager.automations.items():
-            out.append({
-                "name": name,
-                "description": getattr(automation, "description", None),
-                "sequence": getattr(automation, "sequence", []),
-            })
+def _parse_import(import_str: str) -> Tuple[str, Optional[List[str]]]:
+    # Same syntax as AgentSystemManager._process_single_import: "file", "file->comp", "file?[a, b]".
+    file_part = import_str.strip()
+    names = None
+    if "->" in file_part:
+        file_part, single = file_part.split("->", 1)
+        names = [single.strip()]
+    elif "?" in file_part:
+        file_part, comps = file_part.split("?", 1)
+        comps = comps.strip()
+        if comps.startswith("[") and comps.endswith("]"):
+            names = [c.strip() for c in comps[1:-1].split(",") if c.strip()] or None
+    file_part = file_part.strip()
+    if not os.path.splitext(file_part)[1]:
+        file_part += ".json"
+    return file_part, names
+
+
+def _read_import_file(project_dir: Path, file_part: str) -> Tuple[dict, str]:
+    path = Path(file_part)
+    if path.is_absolute():
+        candidates = [path]
+    else:
+        candidates = [project_dir / path]
+    for candidate in candidates:
+        if candidate.is_file():
+            return json.loads(candidate.read_text(encoding="utf-8")), str(candidate)
+    if not path.is_absolute():
+        # Not in the project: look in the packaged standard library (mas/lib), like the manager.
+        name = f"{path.stem}.json"
+        try:
+            ref = resources.files("mas.lib").joinpath(name)
+            if ref.is_file():
+                return json.loads(ref.read_text(encoding="utf-8")), f"mas/lib/{name}"
+        except (FileNotFoundError, ModuleNotFoundError):
+            pass
+    raise FileNotFoundError(f"could not find '{file_part}' in the project or in mas/lib")
+
+
+def _imported_components(
+    project_dir: Path,
+    imports: List[str],
+    errors: List[str],
+    seen: Optional[Set[str]] = None,
+    depth: int = 0,
+) -> List[dict]:
+    """Components brought in by general_parameters.imports, read from JSON (no code is run)."""
+    seen = set() if seen is None else seen
+    out: List[dict] = []
+    if depth > _MAX_IMPORT_DEPTH:
         return out
-
-    for component in _raw_components(config):
-        if component.get("type") == "automation":
-            out.append({
-                "name": component.get("name") or "automation",
-                "description": component.get("description"),
-                "sequence": component.get("sequence", []),
-            })
+    for import_str in imports:
+        if import_str in seen:
+            continue
+        seen.add(import_str)
+        file_part, names = _parse_import(import_str)
+        try:
+            imported, source = _read_import_file(project_dir, file_part)
+        except Exception as exc:
+            errors.append(f"Could not read import '{import_str}': {exc}")
+            continue
+        own = [_component_summary(c, imported_from=source) for c in _raw_components(imported)]
+        general = imported.get("general_parameters", {}) if isinstance(imported, dict) else {}
+        nested = _imported_components(
+            project_dir,
+            _normalize_imports(general.get("imports") if isinstance(general, dict) else None),
+            errors,
+            seen,
+            depth + 1,
+        )
+        for component in own + nested:
+            if names and component.get("name") not in names:
+                continue
+            out.append(component)
     return out
+
+
+def _automation_sequences(components: List[dict]) -> List[dict]:
+    return [
+        {
+            "name": component.get("name") or "automation",
+            "description": component.get("description"),
+            "sequence": component.get("sequence", []),
+        }
+        for component in components
+        if component.get("type") == "automation"
+    ]
 
 
 def _parse_input_spec(step: Any) -> Optional[dict]:
@@ -207,9 +291,7 @@ def _read_history_file(path: Path, limit: int) -> dict:
     }
 
 
-def _history_mode_from_config(config: dict, manager: Optional[AgentSystemManager] = None) -> str:
-    if manager is not None:
-        return getattr(manager, "history_mode", "per_user")
+def _history_mode_from_config(config: dict) -> str:
     general = config.get("general_parameters", {}) if isinstance(config, dict) else {}
     storage = general.get("history_storage", {}) if isinstance(general, dict) else {}
     if isinstance(storage, dict) and storage.get("mode"):
@@ -284,11 +366,9 @@ def _read_shared_history_files(paths: List[Path], limit: int) -> List[dict]:
     return histories
 
 
-def _history_folder(project_dir: Path, config: dict, manager: Optional[AgentSystemManager] = None) -> Path:
-    if manager is not None and getattr(manager, "history_folder", None):
-        return Path(manager.history_folder)
+def _history_folder(project_dir: Path, config: dict) -> Path:
     general = config.get("general_parameters", {}) if isinstance(config, dict) else {}
-    configured = general.get("history_folder")
+    configured = general.get("history_folder") if isinstance(general, dict) else None
     if configured:
         folder = Path(configured)
         return folder if folder.is_absolute() else project_dir / folder
@@ -304,7 +384,6 @@ def build_dashboard_state(project_dir: Path, history_limit: int = 200) -> dict:
         "config_path": str(config_path),
         "has_config": config_path.is_file(),
         "load_error": None,
-        "manager_loaded": False,
         "config": {},
         "general_parameters": {},
         "components": [],
@@ -324,24 +403,29 @@ def build_dashboard_state(project_dir: Path, history_limit: int = 200) -> dict:
         return state
 
     config = state["config"]
-    state["general_parameters"] = config.get("general_parameters", {}) if isinstance(config, dict) else {}
+    if not isinstance(config, dict):
+        state["config"] = {}
+        state["load_error"] = "config.json must contain a JSON object."
+        return state
+    general = config.get("general_parameters", {})
+    state["general_parameters"] = general if isinstance(general, dict) else {}
 
-    manager = None
-    try:
-        manager = AgentSystemManager(config=str(config_path), base_directory=str(project_dir))
-        state["manager_loaded"] = True
-        ordered_names = getattr(manager, "_component_order", [])
-        components = []
-        for name in ordered_names:
-            component = manager._get_component(name)
-            if component is not None:
-                components.append(_component_to_summary(name, component))
-        state["components"] = components
-    except Exception as exc:
-        state["load_error"] = f"Loaded raw config, but manager initialization failed: {exc}"
-        state["components"] = _raw_components(config)
+    # Read the definitions from JSON only. Building an AgentSystemManager here would import the
+    # project's function files (running their module-level code), load .env and create folders.
+    errors: List[str] = []
+    components = [_component_summary(c) for c in _raw_components(config)]
+    known = {c.get("name") for c in components}
+    for component in _imported_components(
+        project_dir, _normalize_imports(state["general_parameters"].get("imports")), errors
+    ):
+        if component.get("name") not in known:
+            known.add(component.get("name"))
+            components.append(component)
+    state["components"] = components
+    if errors:
+        state["load_error"] = "; ".join(errors)
 
-    state["automations"] = _automation_sequences(config, manager)
+    state["automations"] = _automation_sequences(components)
     state["annotated_automations"] = [
         {
             **automation,
@@ -350,9 +434,9 @@ def build_dashboard_state(project_dir: Path, history_limit: int = 200) -> dict:
         for automation in state["automations"]
     ]
 
-    folder = _history_folder(project_dir, config, manager)
+    folder = _history_folder(project_dir, config)
     if folder.is_dir():
-        if _history_mode_from_config(config, manager) == "shared":
+        if _history_mode_from_config(config) == "shared":
             shared_paths = sorted(folder.glob("shared_history_*.sqlite"))
             state["histories"] = _read_shared_history_files(shared_paths, history_limit)
         else:
@@ -1189,8 +1273,22 @@ document.querySelectorAll('.nav button').forEach(btn => btn.addEventListener('cl
 document.getElementById('refreshBtn').addEventListener('click', loadState);
 document.getElementById('openFlowBtn').addEventListener('click', () => setView('flow'));
 
+// When the server requires an access token, the page is opened as /?token=... and every API
+// request sends it back in a header.
+const DASHBOARD_TOKEN = new URLSearchParams(window.location.search).get('token');
+
 async function loadState() {
-  const res = await fetch('/api/state');
+  const headers = DASHBOARD_TOKEN ? { 'X-MAS-Dashboard-Token': DASHBOARD_TOKEN } : {};
+  const res = await fetch('/api/state', { headers, cache: 'no-store' });
+  if (!res.ok) {
+    let message = `Could not load the dashboard state (HTTP ${res.status}).`;
+    try {
+      const body = await res.json();
+      if (body && body.error) message = body.error;
+    } catch (e) {}
+    document.getElementById('status').innerHTML = `<div class="status-banner error">${esc(message)}</div>`;
+    return;
+  }
   STATE = await res.json();
   if (selectedUser === null && STATE.histories[0]) selectedUser = STATE.histories[0].user_id;
   if (selectedComponentName === null && STATE.components[0]) selectedComponentName = STATE.components[0].name;
@@ -1945,6 +2043,164 @@ loadState();
 """
 
 
+_UNAUTHORIZED_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><title>MAS Dashboard</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem;">
+<h1>Access token required</h1>
+<p>This dashboard requires an access token. Open it with the full URL that <code>mas dashboard</code>
+printed in the terminal (it ends with <code>?token=...</code>).</p>
+</body></html>
+"""
+
+
+def _strip_brackets(host: Any) -> str:
+    host = str(host or "").strip()
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
+def _is_ipv6(host: str) -> bool:
+    return ":" in _strip_brackets(host)
+
+
+def _is_wildcard_host(host: str) -> bool:
+    return _strip_brackets(host) in ("", "0.0.0.0", "::")
+
+
+def _url_host(host: str) -> str:
+    name = _strip_brackets(host)
+    return f"[{name}]" if ":" in name else name
+
+
+def is_loopback_host(host: str) -> bool:
+    name = _strip_brackets(host).lower()
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def allowed_host_headers(host: str, port: int) -> Optional[Set[str]]:
+    """Host header values the dashboard answers; None means any (wildcard binds rely on the token).
+
+    Checking the Host header stops DNS rebinding: a web page on attacker.example that re-points its
+    name to 127.0.0.1 still sends "Host: attacker.example", so it cannot read the dashboard.
+    """
+    if _is_wildcard_host(host):
+        return None
+    names = {_url_host(host).lower()}
+    if is_loopback_host(host):
+        names.update(_LOOPBACK_HOST_NAMES)
+    allowed = {f"{name}:{port}" for name in names}
+    if port == 80:
+        allowed |= names
+    return allowed
+
+
+class _DashboardHandler(BaseHTTPRequestHandler):
+    server_version = "MASDashboard"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        logger.debug("[dashboard] " + format, *args)
+
+    def _authorized(self, parsed) -> bool:
+        allowed = self.server.allowed_hosts
+        host_header = (self.headers.get("Host") or "").strip().lower()
+        if allowed is not None and host_header not in allowed:
+            _json_response(
+                self,
+                {"error": "Invalid Host header. Open the dashboard with the URL printed by `mas dashboard`."},
+                status=403,
+            )
+            return False
+
+        token = self.server.dashboard_token
+        if token:
+            supplied = self.headers.get(TOKEN_HEADER)
+            if supplied is None:
+                values = parse_qs(parsed.query).get("token")
+                supplied = values[0] if values else None
+            if not supplied or not hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8")):
+                if parsed.path in ("/", "/index.html"):
+                    _html_response(self, _UNAUTHORIZED_HTML, status=401)
+                else:
+                    _json_response(self, {"error": "Missing or invalid dashboard access token."}, status=401)
+                return False
+        return True
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if not self._authorized(parsed):
+            return None
+        if parsed.path in ("/", "/index.html"):
+            return _html_response(self, HTML)
+        if parsed.path == "/api/state":
+            query = parse_qs(parsed.query)
+            limit = self.server.history_limit
+            if "history_limit" in query:
+                try:
+                    limit = max(1, int(query["history_limit"][0]))
+                except Exception:
+                    pass
+            return _json_response(self, build_dashboard_state(self.server.project_path, history_limit=limit))
+        return _json_response(self, {"error": "not found"}, status=404)
+
+
+class _DashboardServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second server bind a port that is already in use, with no
+    # error. Reuse the address only elsewhere, and claim the port exclusively on Windows.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+class _DashboardServerV6(_DashboardServer):
+    address_family = socket.AF_INET6
+
+
+def create_dashboard_server(
+    project_dir: Union[str, Path],
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    *,
+    history_limit: int = 200,
+    token: Optional[str] = None,
+) -> socketserver.ThreadingTCPServer:
+    """Bind the dashboard server without serving it. Raises OSError if the port cannot be bound.
+
+    A non-loopback host always requires an access token; one is generated when none is given.
+    """
+    bind_host = _strip_brackets(host)
+    if not token and not is_loopback_host(bind_host):
+        token = secrets.token_urlsafe(24)
+    server_cls = _DashboardServerV6 if _is_ipv6(bind_host) else _DashboardServer
+    httpd = server_cls((bind_host, port), _DashboardHandler)
+    httpd.project_path = Path(project_dir).resolve()
+    httpd.history_limit = max(1, int(history_limit))
+    httpd.dashboard_token = token or None
+    httpd.bind_host = bind_host
+    httpd.allowed_hosts = allowed_host_headers(bind_host, httpd.server_address[1])
+    return httpd
+
+
+def dashboard_url(httpd: socketserver.BaseServer) -> str:
+    """The URL to open the dashboard with, including the access token when one is required."""
+    host = httpd.bind_host
+    if _is_wildcard_host(host):
+        host = "::1" if _is_ipv6(host) else "127.0.0.1"
+    url = f"http://{_url_host(host)}:{httpd.server_address[1]}/"
+    if httpd.dashboard_token:
+        url += f"?token={quote(httpd.dashboard_token, safe='')}"
+    return url
+
+
 def serve_dashboard(
     project_dir: Union[str, Path],
     host: str = "127.0.0.1",
@@ -1952,70 +2208,79 @@ def serve_dashboard(
     *,
     open_browser: bool = True,
     history_limit: int = 200,
+    token: Optional[str] = None,
+    auto_port: bool = False,
 ) -> int:
     project_path = Path(project_dir).resolve()
+    if not project_path.is_dir():
+        print(f"Could not start dashboard: '{project_path}' is not a directory.")
+        return 1
 
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: Any) -> None:
-            logger.debug("[dashboard] " + format, *args)
-
-        def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path in ("/", "/index.html"):
-                return _html_response(self, HTML)
-            if parsed.path == "/api/state":
-                query = parse_qs(parsed.query)
-                limit = history_limit
-                if "history_limit" in query:
-                    try:
-                        limit = max(1, int(query["history_limit"][0]))
-                    except Exception:
-                        pass
-                return _json_response(self, build_dashboard_state(project_path, history_limit=limit))
-            return _json_response(self, {"error": "not found"}, status=404)
-
-    class Server(socketserver.ThreadingTCPServer):
-        allow_reuse_address = True
+    def bind(bind_port: int):
+        return create_dashboard_server(
+            project_path, host, bind_port, history_limit=history_limit, token=token
+        )
 
     try:
-        with Server((host, port), Handler) as httpd:
-            actual_host, actual_port = httpd.server_address
-            url = f"http://{actual_host}:{actual_port}"
-            print(f"MAS dashboard running at {url}")
-            print(f"Project: {project_path}")
-            if not (project_path / "config.json").is_file():
-                print("Warning: no config.json found in this directory.")
-            if open_browser:
-                webbrowser.open(url)
-            httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\nDashboard stopped.")
-        return 0
+        httpd = bind(port)
     except OSError as exc:
-        print(f"Could not start dashboard on {host}:{port}: {exc}")
-        return 1
+        if not auto_port:
+            print(f"Could not start dashboard on {host}:{port}: {exc}")
+            print("Choose another port with --port, or pass --auto-port to use a free one.")
+            return 1
+        try:
+            httpd = bind(0)
+        except OSError as exc:
+            print(f"Could not start dashboard on {host}: {exc}")
+            return 1
+
+    with httpd:
+        url = dashboard_url(httpd)
+        # flush: the URL (with the token) must show up even when stdout is a pipe or a log file.
+        print(f"MAS dashboard running at {url}", flush=True)
+        print(f"Project: {project_path}", flush=True)
+        if not is_loopback_host(httpd.bind_host):
+            print(
+                "Warning: the dashboard is listening on a non-loopback address. Anyone who can reach "
+                "this machine and has the URL above (it includes the access token) can read the "
+                "configuration and every user's history.",
+                flush=True,
+            )
+        if not (project_path / "config.json").is_file():
+            print("Warning: no config.json found in this directory.", flush=True)
+        if open_browser:
+            webbrowser.open(url)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nDashboard stopped.")
+    return 0
 
 
 def find_free_port(host: str, preferred: int) -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        try:
-            sock.bind((host, preferred))
-            return sock.getsockname()[1]
-        except OSError:
-            pass
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        return sock.getsockname()[1]
+    family = socket.AF_INET6 if _is_ipv6(host) else socket.AF_INET
+    bind_host = _strip_brackets(host)
+    for candidate in (preferred, 0):
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            try:
+                sock.bind((bind_host, candidate))
+                return sock.getsockname()[1]
+            except OSError:
+                if candidate == 0:
+                    raise
+    raise OSError("no free port found")
 
 
 def dashboard_main(args: argparse.Namespace) -> int:
-    port = args.port
-    if args.auto_port:
-        port = find_free_port(args.host, args.port)
+    token = getattr(args, "token", None) or os.environ.get(TOKEN_ENV_VAR) or None
     return serve_dashboard(
         args.directory,
         host=args.host,
-        port=port,
+        port=args.port,
         open_browser=not args.no_browser,
         history_limit=args.history_limit,
+        token=token,
+        auto_port=bool(args.auto_port),
     )

@@ -367,6 +367,8 @@ def test_weather_tool_returns_its_declared_outputs(monkeypatch):
     requests = sys.modules["requests"]
 
     class Response:
+        status_code = 200
+
         def raise_for_status(self):
             return None
 
@@ -395,7 +397,7 @@ def test_places_tool_returns_its_declared_output_and_limits_detail_calls(monkeyp
     monkeypatch.setattr(std, "api_formatting", lambda response: [{"place_id": str(i)} for i in range(20)])
     monkeypatch.setattr(std, "get_place_details", lambda key, place_id: calls.append(place_id) or {"result": {"name": place_id}})
     requests = sys.modules["requests"]
-    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: type("R", (), {"json": lambda self: {}})())
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: type("R", (), {"status_code": 200, "json": lambda self: {}})())
     declared = next(
         c for c in json.loads((ROOT / "mas" / "lib" / "std.json").read_text(encoding="utf-8"))["components"]
         if c["name"] == "google_places_search"

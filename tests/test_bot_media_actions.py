@@ -85,6 +85,7 @@ def test_telegram_parse_payload_supports_video_document_and_sticker():
 
 def test_telegram_send_blocks_supports_video_document_and_sticker(workspace_tmp_path):
     bot = _telegram_bot()
+    bot.manager.files_folder = str(workspace_tmp_path)
     calls = []
 
     class _Message:
@@ -195,6 +196,7 @@ def test_whatsapp_parse_and_build_blocks_supports_media_and_reactions(monkeypatc
 
 def test_whatsapp_send_blocks_and_reactions_use_cloud_api_payloads(monkeypatch, workspace_tmp_path):
     bot = _whatsapp_bot()
+    bot.manager.files_folder = str(workspace_tmp_path)
     sent_payloads = []
     reaction_emoji = "\U0001f44d"
 

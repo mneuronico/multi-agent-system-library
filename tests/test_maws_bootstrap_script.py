@@ -1,8 +1,13 @@
-"""Run maws/resources/bootstrap.sh end to end with stubbed aws, sam, curl and pip.
+"""Run maws/resources/bootstrap.sh (and pull_history.sh) end to end with stubbed aws, sam, curl and pip.
 
 Nothing here touches the network: aws/sam/curl and `python3 -m pip` are replaced by stubs on PATH
 (checked before every run). Needs bash and jq, so it is skipped where jq is missing (e.g. Git Bash
 on Windows) and runs on Linux/WSL/CI. This module deliberately imports nothing from mas/maws.
+
+The aws stub simulates: `ssm put-parameter` returning a version (MAWS_TEST_SSM_VERSION), the legacy
+log group lookup (MAWS_TEST_LEGACY_LOG_GROUP), and `s3api head-bucket` for buckets owned by another
+account (MAWS_TEST_FOREIGN_BUCKETS, 403) or missing until `s3 mb` creates them
+(MAWS_TEST_MISSING_BUCKETS, 404).
 """
 
 from __future__ import annotations
@@ -26,9 +31,26 @@ TELEGRAM_OK = '{"ok":true,"result":true,"description":"Webhook was set"}'
 _STUBS = {
     "aws": r"""#!/usr/bin/env bash
 printf 'aws %s\n' "$*" >> "${MAWS_TEST_LOG}"
+arg_after() { local want="$1"; shift; while [[ $# -gt 0 ]]; do [[ "$1" == "$want" ]] && { printf '%s' "$2"; return; }; shift; done; }
 case "$1 $2" in
-  "sts get-caller-identity") echo "123456789012" ;;
+  "sts get-caller-identity")
+    printf '%s' "${AWS_PROFILE-<unset>}" > "${MAWS_TEST_LOG}.profile"
+    echo "123456789012" ;;
   "cloudformation describe-stacks") echo "${MAWS_TEST_API_URL}" ;;
+  "cloudformation describe-stack-resource")
+    if [[ -n "${MAWS_TEST_LEGACY_LOG_GROUP:-}" ]]; then echo "${MAWS_TEST_LEGACY_LOG_GROUP}"
+    else echo "An error occurred (ValidationError): Resource does not exist" >&2; exit 254; fi ;;
+  "ssm put-parameter") echo "${MAWS_TEST_SSM_VERSION-7}" ;;
+  "s3api head-bucket")
+    bucket="$(arg_after --bucket "$@")"
+    [[ "$(arg_after --expected-bucket-owner "$@")" == "123456789012" ]] || { echo "missing owner check" >&2; exit 99; }
+    if [[ " ${MAWS_TEST_FOREIGN_BUCKETS:-} " == *" ${bucket} "* ]]; then
+      echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2; exit 254
+    fi
+    if [[ " ${MAWS_TEST_MISSING_BUCKETS:-} " == *" ${bucket} "* ]] && ! grep -qx "${bucket}" "${MAWS_TEST_LOG}.created" 2>/dev/null; then
+      echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2; exit 254
+    fi ;;
+  "s3 mb") printf '%s\n' "${3#s3://}" >> "${MAWS_TEST_LOG}.created" ;;
 esac
 exit 0
 """,
@@ -80,7 +102,7 @@ class _Bootstrap:
         (self.project / "fns.py").write_text("# fns\n", encoding="utf-8")
 
     def env(self, **extra):
-        env = dict(os.environ)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("AWS_")}
         env["PATH"] = str(self.stubs) + os.pathsep + env.get("PATH", "")
         env.update(
             MAWS_TEST_LOG=self.log.as_posix(),
@@ -127,7 +149,16 @@ class _Bootstrap:
         return calls
 
     def template(self):
-        return (self.project / "template.yaml").read_text(encoding="utf-8")
+        return (self.project / ".maws_build" / "template.yaml").read_text(encoding="utf-8")
+
+    def package_file(self, name):
+        return (self.project / ".maws_package" / name).read_text(encoding="utf-8")
+
+    def command_index(self, prefix):
+        return next(i for i, line in enumerate(self.commands()) if line.startswith(prefix))
+
+    def commands_starting(self, prefix):
+        return [line for line in self.commands() if line.startswith(prefix)]
 
 
 @pytest.fixture
@@ -149,6 +180,7 @@ def _whatsapp(**extra):
 def _assert_failed_before_aws(bootstrap, code, out):
     assert code != 0
     assert bootstrap.commands() == []  # no aws/sam/curl/pip at all
+    assert not (bootstrap.project / ".maws_build" / "template.yaml").exists()
     assert not (bootstrap.project / "template.yaml").exists()
 
 
@@ -216,8 +248,12 @@ def test_telegram_deploy_with_crlf_env_sets_a_checked_webhook(bootstrap):
         "--data-urlencode", f"secret_token={SECRET}",
     ]]
     commands = bootstrap.commands()
-    names = [line.split(" ", 2)[0] + " " + line.split(" ", 2)[1] for line in commands if " " in line]
-    assert names.index("aws ssm") < names.index("sam deploy") < names.index("aws cloudformation")
+    assert (
+        bootstrap.command_index("sam build")
+        < bootstrap.command_index("aws ssm put-parameter")
+        < bootstrap.command_index("sam deploy")
+        < bootstrap.command_index("aws cloudformation describe-stacks")
+    )
     assert commands[-1] == "curl"
 
     template = bootstrap.template()
@@ -303,3 +339,382 @@ def test_fifo_lock_ttl_expires_before_sqs_redelivery(bootstrap):
     assert "VisibilityTimeout: 330" in template
     assert 'LOCK_TTL_SECONDS: "315"' in template
     assert "Runtime: python3.11" in template
+
+
+# -------------------------
+# Medium-priority fixes
+# -------------------------
+TG_ENV = f"TELEGRAM_TOKEN=123:tok\nTELEGRAM_WEBHOOK_SECRET_TOKEN={SECRET}\n"
+WA_ENV = "WHATSAPP_TOKEN=t\nWHATSAPP_VERIFY_TOKEN=v\nWHATSAPP_APP_SECRET=app\n"
+
+
+def test_explicit_false_booleans_are_honoured(bootstrap):
+    params = _telegram(
+        sync_tokens_s3=False,
+        runtime={"ensure_delivery": False},
+        infra={"tracing": False},
+        failure_handling={"async_failure_queue": False},
+    )
+
+    code, out = bootstrap.run(params, TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    assert 'SYNC_TOKENS_S3: "false"' in template
+    assert 'ENSURE_DELIVERY: "false"' in template
+    assert "Tracing: PassThrough" in template
+    assert "TracingEnabled: false" in template
+    assert "AsyncFailureQueue" not in template
+    assert "EventInvokeConfig" not in template
+
+
+def test_boolean_defaults_when_absent(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    assert 'SYNC_TOKENS_S3: "true"' in template
+    assert 'ENSURE_DELIVERY: "true"' in template
+    assert "Tracing: Active" in template
+    assert 'VERBOSE: "false"' in template
+
+
+def test_bootstrap_has_no_jq_default_operator_on_booleans():
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+    for key in ("sync_tokens_s3", "ensure_delivery", "tracing", "verbose", "persist_files_s3",
+                "capture_failed_events", "worker_dlq", "enabled", "s3_versioning"):
+        assert f".{key} // true" not in text and f".{key} // false" not in text, key
+
+
+@pytest.mark.parametrize(
+    ("params", "message"),
+    [
+        (_telegram(verbose="maybe"), "verbose in params.json must be true or false"),
+        (_telegram(infra={"log_retention_days": 10}), "infra.log_retention_days"),
+        (_telegram(busy_policy="queue"), "busy_policy"),
+        ({"region": "us-east-1", "bot": "telegram"}, 'has no "project"'),
+        (_telegram(failure_handling={"max_receive_count": 0}), "max_receive_count"),
+    ],
+)
+def test_invalid_params_fail_before_any_aws_call(bootstrap, params, message):
+    code, out = bootstrap.run(params, TG_ENV)
+
+    _assert_failed_before_aws(bootstrap, code, out)
+    assert message in out
+
+
+def test_self_invoke_permission_is_scoped_to_this_function(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    assert 'Resource: "*"' not in template
+    policy = template[template.index("DemoBotSelfInvokePolicy:"):]
+    assert "Type: AWS::IAM::Policy" in policy
+    assert "- !Ref DemoBotFunctionRole" in policy
+    assert "- !GetAtt DemoBotFunction.Arn" in policy
+    assert '- !Sub "${DemoBotFunction.Arn}:*"' in policy
+    function = template[template.index("  DemoBotFunction:"):template.index("DemoBotSelfInvokePolicy:")]
+    assert "lambda:InvokeFunction" not in function  # in the role's own policies it would be a cycle
+
+
+def test_fifo_has_no_self_invoke_permission_and_a_dlq_by_default(bootstrap):
+    code, out = bootstrap.run(_telegram(busy_policy="fifo"), TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    assert "lambda:InvokeFunction" not in template
+    assert "DemoBotWorkerDlq:" in template
+    assert "deadLetterTargetArn: !GetAtt DemoBotWorkerDlq.Arn" in template
+    assert "maxReceiveCount: 3" in template
+    assert "WorkerDeadLetterQueueUrl" in template
+    assert "AsyncFailureQueue" not in template  # nothing is invoked asynchronously in FIFO mode
+
+
+def test_fifo_dlq_opt_out_and_max_receive_count(bootstrap):
+    code, out = bootstrap.run(_telegram(busy_policy="fifo", failure_handling={"worker_dlq": False}), TG_ENV)
+    assert code == 0, out
+    assert "WorkerDlq" not in bootstrap.template()
+    assert "failure_handling.worker_dlq=false" in out
+
+    code, out = bootstrap.run(_telegram(busy_policy="fifo", failure_handling={"max_receive_count": 5}), TG_ENV)
+    assert code == 0, out
+    assert "maxReceiveCount: 5" in bootstrap.template()
+
+
+def test_drop_mode_async_invocations_have_an_on_failure_queue(bootstrap):
+    code, out = bootstrap.run(_whatsapp(), WA_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    assert "DemoBotAsyncFailureQueue:" in template
+    assert 'QueueName: !Sub "${AWS::StackName}-async-failures"' in template
+    assert "MaximumRetryAttempts: 2" in template
+    assert "Destination: !GetAtt DemoBotAsyncFailureQueue.Arn" in template
+    send = template.index("Resource: !GetAtt DemoBotAsyncFailureQueue.Arn")
+    assert template.rfind("sqs:SendMessage", 0, send) > template.index("  DemoBotFunction:")
+    assert "demo-bot-stack-async-failures" in out
+
+
+def test_buckets_are_checked_with_the_expected_owner(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV)
+
+    assert code == 0, out
+    heads = bootstrap.commands_starting("aws s3api head-bucket")
+    assert heads == [
+        "aws s3api head-bucket --bucket demo-bot-deployment-bucket --expected-bucket-owner 123456789012",
+        "aws s3api head-bucket --bucket demo-bot-history-bucket --expected-bucket-owner 123456789012",
+    ]
+    assert not bootstrap.commands_starting("aws s3 mb")
+
+
+def test_missing_deployment_bucket_is_created_and_verified(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV, MAWS_TEST_MISSING_BUCKETS="demo-bot-deployment-bucket demo-bot-history-bucket")
+
+    assert code == 0, out
+    assert bootstrap.commands_starting("aws s3 mb") == ["aws s3 mb s3://demo-bot-deployment-bucket --region us-east-1"]
+    assert len(bootstrap.commands_starting("aws s3api head-bucket --bucket demo-bot-deployment-bucket")) == 2
+    assert "does not exist yet; the stack creates it" in out
+
+
+@pytest.mark.parametrize("bucket", ["demo-bot-deployment-bucket", "demo-bot-history-bucket"])
+def test_bucket_owned_by_another_account_stops_the_deploy(bootstrap, bucket):
+    code, out = bootstrap.run(_telegram(), TG_ENV, MAWS_TEST_FOREIGN_BUCKETS=bucket)
+
+    assert code != 0
+    assert f"{bucket} exists but is not owned by account 123456789012" in out
+    assert not bootstrap.commands_starting("aws s3 mb")
+    assert not bootstrap.commands_starting("sam build")
+    assert not bootstrap.commands_starting("aws ssm")
+
+
+def test_user_files_in_the_project_are_never_overwritten(bootstrap):
+    custom = {
+        "requirements.txt": "requests\nboto3\nmas[maws,telegram,whatsapp,env] @ git+https://example.com/fork.git\npandas\n",
+        "lambda_function.py": "from maws import build_lambda_handler\nlambda_handler = build_lambda_handler('telegram')  # mine\n",
+        "template.yaml": "# my own template\n",
+        "samconfig.toml": "# my own samconfig\n",
+    }
+    for name, content in custom.items():
+        (bootstrap.project / name).write_text(content, encoding="utf-8")
+
+    code, out = bootstrap.run(_telegram(), TG_ENV)
+
+    assert code == 0, out
+    for name, content in custom.items():
+        assert (bootstrap.project / name).read_text(encoding="utf-8") == content, name
+    assert bootstrap.package_file("requirements.txt") == custom["requirements.txt"]
+    assert bootstrap.package_file("lambda_function.py") == custom["lambda_function.py"]
+    assert "Using your lambda_function.py" in out
+    assert "Using your requirements.txt" in out
+    assert "are not used" in out
+    assert "# my own" not in bootstrap.template()
+    assert not (bootstrap.project / ".maws_package" / "template.yaml").exists()
+    assert not (bootstrap.project / ".maws_package" / "samconfig.toml").exists()
+    [build] = bootstrap.commands_starting("sam build")
+    assert build == "sam build --template-file .maws_build/template.yaml --base-dir . --build-dir .aws-sam/build"
+
+
+def test_new_project_gets_generated_files_in_the_package_only(bootstrap):
+    params = _telegram(requirements_ref="v0.3.4", extra_requirements=["pandas"])
+
+    code, out = bootstrap.run(params, TG_ENV)
+
+    assert code == 0, out
+    for name in ("requirements.txt", "lambda_function.py", "template.yaml", "samconfig.toml"):
+        assert not (bootstrap.project / name).exists(), name
+    requirements = bootstrap.package_file("requirements.txt").splitlines()
+    assert requirements[0].startswith("# Generated by maws update")
+    assert "mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git@v0.3.4" in requirements
+    assert "pandas" in requirements
+    assert "build_lambda_handler(BOT_TYPE)" in bootstrap.package_file("lambda_function.py")
+    assert "requirements_ref is not set" not in out
+
+
+def test_files_written_by_older_maws_are_replaced_in_the_package_but_left_in_place(bootstrap):
+    legacy_handler = (
+        'import os\nfrom maws import build_lambda_handler\n\n'
+        'BOT_TYPE = os.environ.get("BOT_TYPE", "whatsapp")\nlambda_handler = build_lambda_handler(BOT_TYPE)\n'
+    )
+    legacy_requirements = (
+        "boto3\nmas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git\nrequests\n"
+    )
+    (bootstrap.project / "lambda_function.py").write_text(legacy_handler, encoding="utf-8")
+    (bootstrap.project / "requirements.txt").write_text(legacy_requirements, encoding="utf-8")
+
+    code, out = bootstrap.run(_telegram(requirements_ref="abc1234"), TG_ENV)
+
+    assert code == 0, out
+    assert (bootstrap.project / "requirements.txt").read_text(encoding="utf-8") == legacy_requirements
+    assert (bootstrap.project / "lambda_function.py").read_text(encoding="utf-8") == legacy_handler
+    assert "@abc1234" in bootstrap.package_file("requirements.txt")  # params.json still applies
+    assert bootstrap.package_file("lambda_function.py").startswith("# Generated by maws update")
+
+
+def test_env_prod_is_read_not_sourced(bootstrap):
+    marker = bootstrap.project / "pwned"
+    env_prod = (
+        TG_ENV
+        + "WEIRD=a b; touch pwned\n"
+        + "SUBST=$(touch pwned)\n"
+        + "QUOTE=it's\n"
+        + "AWS_PROFILE=\"deploy-profile\"\n"
+        + "MAWS_HISTORY_WRITE_SECRET=x\n"
+    )
+
+    code, out = bootstrap.run(_telegram(history_append={"enabled": True}), env_prod)
+
+    assert code == 0, out
+    assert not marker.exists()
+    assert (bootstrap.log.parent / "commands.log.profile").read_text(encoding="utf-8") == "deploy-profile"
+    assert "Using AWS_PROFILE from .env.prod" in out
+    assert "MAWS_HISTORY_WRITE_SECRET; the endpoint will answer 503" not in out
+
+
+def test_history_append_secret_warning_uses_the_env_reader(bootstrap):
+    code, out = bootstrap.run(_telegram(history_append={"enabled": True}), TG_ENV)
+
+    assert code == 0, out
+    assert "no MAWS_HISTORY_WRITE_SECRET; the endpoint will answer 503" in out
+    assert (bootstrap.log.parent / "commands.log.profile").read_text(encoding="utf-8") == "<unset>"
+
+
+def test_function_reads_the_ssm_version_it_was_deployed_with(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV, MAWS_TEST_SSM_VERSION="42")
+
+    assert code == 0, out
+    template = bootstrap.template()
+    assert "MAWS_ENV_PARAMETER_VERSION: !Ref EnvParamVersion" in template
+    [ssm] = bootstrap.commands_starting("aws ssm put-parameter")
+    assert "--query Version --output text" in ssm
+    [deploy] = bootstrap.commands_starting("sam deploy")
+    assert "--parameter-overrides EnvParamVersion=42" in deploy
+    assert "--no-fail-on-empty-changeset" in deploy
+    assert "--stack-name demo-bot-stack --s3-bucket demo-bot-deployment-bucket --s3-prefix demo-bot-stack" in deploy
+    assert bootstrap.command_index("aws ssm put-parameter") < bootstrap.command_index("sam deploy")
+
+
+def test_missing_ssm_version_stops_before_deploying(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV, MAWS_TEST_SSM_VERSION="")
+
+    assert code != 0
+    assert "Could not read the new version of SSM parameter" in out
+    assert not bootstrap.commands_starting("sam deploy")
+
+
+@pytest.mark.parametrize(
+    ("params", "warning"),
+    [
+        (_telegram(), "requirements_ref is not set"),
+        (_telegram(requirements_source="pypi"), "installs the PyPI project named 'mas'"),
+    ],
+)
+def test_requirement_source_warnings(bootstrap, params, warning):
+    code, out = bootstrap.run(params, TG_ENV)
+
+    assert code == 0, out
+    assert warning in out
+
+
+def test_default_log_group_has_retention_and_receives_the_logs(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    group = template[template.index("  DemoBotLogs:"):]
+    assert 'LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-maws"' in group
+    assert "RetentionInDays: 30" in group
+    assert "LogGroup: !Ref DemoBotLogs" in template
+    assert "LogFormat: JSON" in template
+    assert "/aws/lambda/demo-bot-stack-maws (retention: 30 days)" in out
+
+
+def test_stack_with_the_legacy_log_group_keeps_it(bootstrap):
+    code, out = bootstrap.run(
+        _telegram(infra={"log_retention_days": 14}),
+        TG_ENV,
+        MAWS_TEST_LEGACY_LOG_GROUP="/aws/lambda/demo-bot-stack-DemoBotFunction-AbC",
+    )
+
+    assert code == 0, out
+    template = bootstrap.template()
+    assert "  DemoBotFunctionLogGroup:" in template
+    assert 'LogGroupName: !Sub "/aws/lambda/${DemoBotFunction}"' in template
+    assert "RetentionInDays: 14" in template
+    assert "LogGroup: !Ref" not in template  # the default destination is that group
+    assert "DemoBotLogs" not in template
+
+
+def test_log_retention_zero_keeps_logs_forever(bootstrap):
+    code, out = bootstrap.run(_telegram(infra={"log_retention_days": 0}), TG_ENV)
+
+    assert code == 0, out
+    assert "RetentionInDays" not in bootstrap.template()
+
+
+def test_lifecycle_only_expires_user_data_and_noncurrent_versions(bootstrap):
+    params = _telegram(infra={"s3_lifecycle_days": 90, "s3_versioning": True}, files_s3_prefix="media")
+
+    code, out = bootstrap.run(params, TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    rules = template[template.index("LifecycleConfiguration:"):template.index("  DemoBotLogs:")]
+    assert "Prefix: history/" in rules
+    assert "Prefix: media/" in rules
+    assert "Prefix: failed-events/" in rules
+    assert "secrets" not in rules
+    assert rules.count("ExpirationInDays: 90") == 3
+    assert "NoncurrentDays: 30" in rules
+    assert "ExpiredObjectDeleteMarker: true" in rules
+    assert "ExpireMawsObjects" not in template
+
+
+def test_versioning_without_lifecycle_still_expires_noncurrent_versions(bootstrap):
+    code, out = bootstrap.run(_telegram(infra={"s3_versioning": True, "s3_noncurrent_version_days": 7}), TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    assert "NoncurrentDays: 7" in template
+    assert "ExpirationInDays" not in template
+
+
+def test_no_lifecycle_by_default(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV)
+
+    assert code == 0, out
+    assert "LifecycleConfiguration" not in bootstrap.template()
+
+
+# -------------------------
+# pull_history.sh
+# -------------------------
+PULL_HISTORY = ROOT / "maws" / "resources" / "pull_history.sh"
+
+
+def _pull(bootstrap, **extra):
+    (bootstrap.project / "params.json").write_text(json.dumps(_telegram()), encoding="utf-8")
+    script = Path(os.path.relpath(PULL_HISTORY, bootstrap.project)).as_posix()
+    proc = subprocess.run(
+        [bootstrap.bash, script, "--config", "params.json"],
+        cwd=bootstrap.project, env=bootstrap.env(**extra), capture_output=True, timeout=60,
+    )
+    return proc.returncode, proc.stdout.decode("utf-8", "replace") + proc.stderr.decode("utf-8", "replace")
+
+
+def test_pull_history_checks_the_bucket_owner(bootstrap):
+    code, out = _pull(bootstrap)
+
+    assert code == 0, out
+    assert bootstrap.commands_starting("aws s3api head-bucket") == [
+        "aws s3api head-bucket --bucket demo-bot-history-bucket --expected-bucket-owner 123456789012"
+    ]
+    assert bootstrap.commands_starting("aws s3 sync")
+
+
+def test_pull_history_refuses_a_bucket_of_another_account(bootstrap):
+    code, out = _pull(bootstrap, MAWS_TEST_FOREIGN_BUCKETS="demo-bot-history-bucket")
+
+    assert code != 0
+    assert "not owned by account 123456789012" in out
+    assert not bootstrap.commands_starting("aws s3 sync")

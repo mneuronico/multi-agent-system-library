@@ -1,8 +1,10 @@
 from __future__ import annotations
 import sys
 import os
+import copy as _copy
 import json
 import json as _json
+import re as _re
 import secrets as _secrets
 import tempfile as _tempfile
 import subprocess as _subprocess
@@ -10,7 +12,7 @@ import shutil as _shutil
 import platform as _platform
 import datetime as _dt
 from pathlib import Path
-from typing import Optional, Union, List, Dict
+from typing import Any, Optional, Union, List, Dict
 
 from .runtime import _require_boto3
 
@@ -24,9 +26,45 @@ except Exception:  # pragma: no cover
 DEFAULT_LAMBDA_RUNTIME = "python3.12"
 
 
+class MawsConfigError(ValueError):
+    """params.json or a --set override is invalid. The CLI prints it and exits with code 2."""
+
+
 def _new_telegram_webhook_secret() -> str:
     """Random secret_token for Telegram setWebhook (Telegram accepts 1-256 chars of A-Za-z0-9_-)."""
     return _secrets.token_urlsafe(32)
+
+
+def _legacy_bucket_names(project: str) -> Dict[str, str]:
+    """
+    Bucket names bootstrap.sh derives when params.json does not set them. Existing deployments use
+    these names, so they must never change (a different history bucket means losing the history).
+    """
+    return {
+        "history_bucket": f"{project}-history-bucket",
+        "deployment_bucket": f"{project}-deployment-bucket",
+    }
+
+
+def _unique_bucket_name(project: str, kind: str) -> str:
+    """
+    A hard-to-guess S3 bucket name for a new project, e.g. ``my-bot-history-3f9a1c2e``. S3 names
+    are global, so predictable names can be claimed by another account first.
+    """
+    suffix = _secrets.token_hex(4)
+    base = _re.sub(r"[^a-z0-9-]+", "-", str(project).lower()).strip("-") or "maws"
+    if base.startswith(("xn--", "sthree-")):
+        base = "maws-" + base
+    room = 63 - len(kind) - len(suffix) - 2
+    base = base[:room].rstrip("-") or "maws"
+    return f"{base}-{kind}-{suffix}"
+
+
+def _new_project_bucket_names(project: str) -> Dict[str, str]:
+    return {
+        "history_bucket": _unique_bucket_name(project, "history"),
+        "deployment_bucket": _unique_bucket_name(project, "deploy"),
+    }
 
 
 def _resource_path(name: str) -> Path:
@@ -86,6 +124,54 @@ def _run_bash(
         sys.stderr.write("\n------------------------------------------\n")
     return proc.returncode
 
+class _NonFiniteJsonNumber(ValueError):
+    pass
+
+
+def _reject_json_constant(name: str):
+    raise _NonFiniteJsonNumber(name)
+
+
+def _parse_override_value(key: str, raw: str) -> Any:
+    """
+    Parse the value of ``--set key=value``. It stays a string unless it is a JSON literal that
+    round-trips exactly: ``true``/``false``/``null``, ``120``, ``1.5``, ``"quoted text"``, or a JSON
+    object/array. So ``1.10``, ``0123456``, ``1e3`` and ``nan`` stay strings. NaN/Infinity would
+    produce invalid JSON for bootstrap.sh and are refused.
+    """
+    try:
+        parsed = _json.loads(raw, parse_constant=_reject_json_constant)
+    except _NonFiniteJsonNumber:
+        raise MawsConfigError(
+            f"--set {key}={raw}: NaN/Infinity are not valid JSON numbers. "
+            f"Quote the value to pass it as text: --set '{key}=\"{raw}\"'."
+        ) from None
+    except ValueError:
+        return raw
+    if isinstance(parsed, (dict, list, str)):
+        return parsed
+    if _json.dumps(parsed) == raw:
+        return parsed
+    return raw
+
+
+def _set_override(out: Dict, key: str, value: Any):
+    """``infra.tracing`` sets out["infra"]["tracing"], creating intermediate objects."""
+    parts = [part.strip() for part in key.split(".")]
+    if not all(parts):
+        raise MawsConfigError(f"--set {key}=...: invalid key.")
+    target = out
+    for depth, part in enumerate(parts[:-1]):
+        current = target.get(part)
+        if current is None:
+            current = target[part] = {}
+        elif not isinstance(current, dict):
+            path = ".".join(parts[: depth + 1])
+            raise MawsConfigError(f"--set {key}=...: {path} is {current!r}, not an object.")
+        target = current
+    target[parts[-1]] = value
+
+
 def _apply_overrides(
     base: Dict,
     project: Optional[str],
@@ -93,35 +179,15 @@ def _apply_overrides(
     bot: Optional[str],
     kv: Optional[List[str]],
 ) -> Dict:
-    out = dict(base)
+    out = _copy.deepcopy(base)
     if project: out["project"] = project
     if region:  out["region"] = region
     if bot:     out["bot"] = bot
     for item in (kv or []):
         if "=" not in item:
-            print(f"[maws] Ignoring invalid override: {item}")
-            continue
+            raise MawsConfigError(f"Invalid override {item!r}: use --set key=value (dotted keys for nested params, e.g. infra.tracing=false).")
         k, v = item.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        # simple coercion: true/false/int/float/JSON; otherwise string
-        vl = v.lower()
-        if v.startswith("{") or v.startswith("["):
-            try:
-                out[k] = _json.loads(v)
-                continue
-            except Exception:
-                pass
-        if vl in ("true","false"):
-            out[k] = (vl == "true")
-        else:
-            try:
-                out[k] = int(v)
-            except ValueError:
-                try:
-                    out[k] = float(v)
-                except ValueError:
-                    out[k] = v
+        _set_override(out, k.strip(), _parse_override_value(k.strip(), v.strip()))
     return out
 
 
@@ -185,24 +251,20 @@ def update(
     if params is not None and config_path is not None:
         raise ValueError("Pass either 'params' (dict) or 'config_path', but not both.")
 
-    tmp_conf_path = None
     if params is None:
-        conf_path = workdir / (config_path or "params.json")
-        base = {}
-        if conf_path.exists():
-            try:
-                base = _json.loads(conf_path.read_text(encoding="utf-8"))
-            except Exception:
-                print(f"[maws] Could not read {conf_path}, using empty base.")
-        merged = _apply_overrides(base, project, region, bot, set_kv)
-        tmp_conf_path = workdir / "params.tmp.json"
-        tmp_conf_path.write_text(_json.dumps(merged, indent=2), encoding="utf-8")
-        conf = str(tmp_conf_path)
+        # A params.json that does not parse is an error, never an empty config: deploying {} would
+        # derive new default names and could create an empty history bucket.
+        base = _load_params(workdir / (config_path or "params.json"))
     else:
-        merged = _apply_overrides(params, project, region, bot, set_kv)
-        tmp_conf_path = workdir / "params.tmp.json"
-        tmp_conf_path.write_text(_json.dumps(merged, indent=2), encoding="utf-8")
-        conf = str(tmp_conf_path)
+        base = params
+    merged = _apply_overrides(base, project, region, bot, set_kv)
+    try:
+        rendered = _json.dumps(merged, indent=2, allow_nan=False)
+    except ValueError as e:
+        raise MawsConfigError(f"params contain a value that is not valid JSON (NaN/Infinity): {e}") from None
+    tmp_conf_path = workdir / "params.tmp.json"
+    tmp_conf_path.write_text(rendered, encoding="utf-8")
+    conf = tmp_conf_path.name
 
     try:
         return _run_bash(script, ["--config", conf], cwd=workdir, quiet=quiet)
@@ -368,39 +430,56 @@ def start(
             val = default
         return val
 
-    # Ask only when arguments were not provided; provide friendly defaults
-    if project is None:
-        project = _ask("Project name", "my-bot")
-    if region is None:
-        region = _ask("AWS region", "us-east-1")
-    if bot is None:
-        bot = _ask_choice("Bot type", ["telegram", "whatsapp"], "telegram")
+    params_path = workdir / "params.json"
+    # An existing params.json is the source of truth (and must parse: never treat it as {}).
+    existing_params = _load_params(params_path) if params_path.exists() else None
+    keep_existing = existing_params is not None and not overwrite
+    current = existing_params or {}
+    fallback = {"project": "my-bot", "region": "us-east-1", "bot": "telegram"}
+
+    def _choose(key: str, explicit: Optional[str], ask) -> str:
+        value_now = current.get(key)
+        if keep_existing and value_now not in (None, ""):
+            if explicit is not None and str(explicit).strip().lower() != str(value_now).strip().lower():
+                print(
+                    f"[WARN] params.json already sets {key}={value_now!r}; keeping it. "
+                    f"Pass --overwrite to replace it with {explicit!r}."
+                )
+            return str(value_now)
+        if explicit is not None:
+            return explicit
+        # Re-running with --overwrite offers the current values as defaults.
+        return ask(str(value_now or fallback[key]))
+
+    project = _choose("project", project, lambda d: _ask("Project name", d))
+    region = _choose("region", region, lambda d: _ask("AWS region", d))
+    bot = _choose(
+        "bot", bot,
+        lambda d: _ask_choice("Bot type", ["telegram", "whatsapp"], d if d in ("telegram", "whatsapp") else "telegram"),
+    )
 
     bot = bot.lower()
     if bot not in ("whatsapp", "telegram"):
         raise ValueError("bot must be 'whatsapp' or 'telegram'.")
 
-    params_path = workdir / "params.json"
-
-    # If it does NOT exist, create with a minimal template:
-    if not params_path.exists() or overwrite:
-        base = {
-            "project": project or "my-bot",
-            "region": region or "us-east-1",
-            "bot": (bot or "whatsapp").lower(),
-        }
+    if existing_params is None:
+        # New project: explicit, hard-to-guess bucket names instead of the predictable defaults.
+        base = {"project": project, "region": region, "bot": bot, **_new_project_bucket_names(project)}
         params_path.write_text(_json.dumps(base, indent=2), encoding="utf-8")
     else:
-        # Exists: if overrides were provided, merge them without clobbering other keys
-        if project or region or bot:
-            try:
-                data = _json.loads(params_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-            if project is not None: data["project"] = project
-            if region  is not None: data["region"]  = region
-            if bot     is not None: data["bot"]     = (bot or "").lower() or data.get("bot", "whatsapp")
+        # Existing project: keep every other key (bucket names, stack name, ...). Without
+        # --overwrite only keys that are missing are filled in.
+        data = dict(existing_params)
+        for key, value in (("project", project), ("region", region), ("bot", bot)):
+            data[key] = value
+        if data != existing_params:
             params_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+        if overwrite and existing_params.get("project") not in (None, project):
+            print(
+                f"[WARN] project changed from {existing_params.get('project')!r} to {project!r}. Stack, bucket and SSM "
+                "names that params.json does not set explicitly are derived from the project name, so the next "
+                "maws update deploys a separate stack (with empty histories)."
+            )
 
     config_path = workdir / "config.json"
     fns_path = workdir / "fns.py"
@@ -431,11 +510,18 @@ def start(
         "openrouter": "openai/gpt-5-nano",
         "groq":   "llama-3.1-70b-versatile",
     }
-    provider = _ask("Default provider (google/openai/openrouter/groq)", "google").lower()
+    # Only ask what will be written: an existing config.json / .env.prod is kept unless --overwrite.
+    config_will_be_written = overwrite or not config_path.exists()
+    env_will_be_written = overwrite or not env_path.exists()
+    provider = "google"
+    if config_will_be_written or env_will_be_written:
+        provider = _ask("Default provider (google/openai/openrouter/groq)", "google").lower()
     if provider not in _default_models_map:
         print(f"[maws] Unknown provider '{provider}', using 'google'.")
         provider = "google"
-    model = _ask("Default model", _default_models_map[provider]) or _default_models_map[provider]
+    model = _default_models_map[provider]
+    if config_will_be_written:
+        model = _ask("Default model", model) or model
 
     # 3) config.json with default_models
     config_template = {
@@ -480,12 +566,14 @@ def start(
         "openrouter": "OPENROUTER_API_KEY",
         "groq":   "GROQ_API_KEY",
     }[provider]
-    maybe_key = _ask(f"Paste {provider_key_env} (press Enter to skip)")
+    maybe_key = _ask(f"Paste {provider_key_env} (press Enter to skip)") if env_will_be_written else ""
     if maybe_key:
         entered[provider] = maybe_key
 
-    # Ask for bot tokens
-    if bot == "telegram":
+    # Ask for bot tokens (only when .env.prod will be written)
+    if not env_will_be_written:
+        pass
+    elif bot == "telegram":
         tk = _ask("Paste TELEGRAM_TOKEN (press Enter to skip)")
         if tk:
             entered["telegram_token"] = tk
@@ -538,11 +626,11 @@ def start(
         env_lines.append("# TELEGRAM_WEBHOOK_SECRET_TOKEN=")
         env_lines.append("# WEBHOOK_VERIFY_TOKEN=")
 
-    env_written = overwrite or not env_path.exists()
+    env_written = env_will_be_written
     _write(env_path, "\n".join(env_lines) + "\n")
 
     # 5) .gitignore
-    _write(gi_path, ".aws-sam/\n.maws_package/\n__pycache__/\nhistory/\nfiles/\n.env\n.env.*\n.bootstrap_state.json\n")
+    _write(gi_path, ".aws-sam/\n.maws_build/\n.maws_package/\nparams.tmp.json\n__pycache__/\nhistory/\nfiles/\n.env\n.env.*\n.bootstrap_state.json\n")
 
     # Copy scripts if they are missing
     #_ensure_script_in_cwd("bootstrap.sh", workdir, force=False)
@@ -556,21 +644,32 @@ def start(
     print("  - .gitignore")
 
     if install_deps:
-        print("\n[INFO] Installing system dependencies (best effort)...")
+        print("\n[INFO] Installing system dependencies (best effort, requested with --install-deps)...")
+        print(
+            "[INFO] This uses sudo: apt-get for curl/unzip/jq, and the latest AWS CLI / SAM CLI installers\n"
+            "       downloaded from awscli.amazonaws.com and github.com/aws/aws-sam-cli. Their checksums and\n"
+            "       signatures are NOT verified; prefer your package manager or the official instructions."
+        )
         ok = _best_effort_install()
         if not ok:
             print("[INFO] Follow the instructions shown above to finish any pending installation steps.")
 
-    # Probar credenciales
+    # Check credentials; 'aws configure' only runs when asked for and credentials do not work.
     if _shutil.which("aws"):
+        credentials_work = False
         try:
-            out = _subprocess.check_output(["aws", "sts", "get-caller-identity", "--output", "json"], text=True)
+            out = _subprocess.check_output(
+                ["aws", "sts", "get-caller-identity", "--output", "json"], text=True, stderr=_subprocess.DEVNULL
+            )
             acct = _json.loads(out).get("Account")
+            credentials_work = True
             print(f"[OK] AWS ready. Account: {acct}")
         except Exception:
             print("[INFO] Configure credentials:  aws configure  (or use AWS_PROFILE)")
 
-        if run_config:
+        if run_config and credentials_work:
+            print("[INFO] AWS credentials already work; not running 'aws configure'.")
+        elif run_config:
             print("[INFO] Running 'aws configure'...")
             try:
                 _subprocess.call(["aws", "configure"])
@@ -633,12 +732,24 @@ def _effective_region(explicit: Optional[str], params: Dict) -> str:
     )
 
 def _load_params(conf_path: Path) -> Dict:
+    """
+    Read params.json. A missing file is ``{}``; a file that cannot be parsed raises
+    MawsConfigError with the parser's message instead of silently becoming ``{}``.
+    """
+    conf_path = Path(conf_path)
+    if not conf_path.exists():
+        return {}
     try:
-        if conf_path.exists():
-            return json.loads(conf_path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
+        data = json.loads(conf_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as e:
+        raise MawsConfigError(
+            f"{conf_path} is not valid JSON: {e.msg} (line {e.lineno}, column {e.colno}). Fix it and re-run."
+        ) from None
+    except (OSError, UnicodeDecodeError) as e:
+        raise MawsConfigError(f"Could not read {conf_path}: {e}") from None
+    if not isinstance(data, dict):
+        raise MawsConfigError(f"{conf_path} must contain a JSON object, not {type(data).__name__}.")
+    return data
 
 def _save_params(conf_path: Path, data: Dict):
     conf_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -663,6 +774,7 @@ def setup(
     """
     workdir = Path(project_dir or Path.cwd())
     conf = workdir / (config_path or "params.json")
+    new_project = not conf.exists()
     data = _load_params(conf)
 
     # current defaults (if present) or reasonable fallbacks
@@ -679,8 +791,11 @@ def setup(
     bot     = bot.lower() if bot in ("telegram", "whatsapp") else d_bot
 
     stack_name = _ask("CloudFormation stack_name", data.get("stack_name") or f"{project}-stack")
-    history_bucket = _ask("S3 history_bucket", data.get("history_bucket") or f"{project}-history-bucket")
-    deploy_bucket  = _ask("S3 deployment_bucket", data.get("deployment_bucket") or f"{project}-deployment-bucket")
+    # A new project gets unguessable bucket names. An existing params.json without bucket names
+    # may already be deployed with the legacy defaults: keep those, or the history would be lost.
+    default_buckets = _new_project_bucket_names(project) if new_project else _legacy_bucket_names(project)
+    history_bucket = _ask("S3 history_bucket", data.get("history_bucket") or default_buckets["history_bucket"])
+    deploy_bucket  = _ask("S3 deployment_bucket", data.get("deployment_bucket") or default_buckets["deployment_bucket"])
     env_param_name = _ask("SSM env_param_name", data.get("env_param_name") or f"/{project}/prod/env")
     api_path       = _ask("API path", data.get("api_path") or "/webhook")
 
@@ -894,32 +1009,84 @@ def list_projects(region: Optional[str] = None) -> List[Dict]:
 
     return out_rows
 
-# --- NUEVO: remove_project ---
-def _empty_bucket(s3, bucket: str):
-    """Delete objects and versions (if versioning is enabled) to allow bucket/stack removal."""
+# --- remove_project ---
+def _client_error_code(error: BaseException) -> str:
+    response = getattr(error, "response", None)
+    if isinstance(response, dict):
+        return str(response.get("Error", {}).get("Code", ""))
+    return ""
+
+
+def _is_missing_stack_error(error: BaseException) -> bool:
+    return "does not exist" in str(error) and _client_error_code(error) in ("ValidationError", "")
+
+
+def _ssm_client(region: Optional[str] = None):
+    kw = {"region_name": region} if region else {}
+    return _require_boto3().client("ssm", **kw)
+
+
+def _account_id(region: Optional[str] = None) -> Optional[str]:
+    """The caller's AWS account id, or None when it cannot be determined."""
     try:
-        # versiones y delete-markers
-        paginator = s3.get_paginator("list_object_versions")
-        for page in paginator.paginate(Bucket=bucket):
-            to_del = []
-            for v in page.get("Versions", []):
-                to_del.append({"Key": v["Key"], "VersionId": v["VersionId"]})
-            for m in page.get("DeleteMarkers", []):
-                to_del.append({"Key": m["Key"], "VersionId": m["VersionId"]})
-            if to_del:
-                for chunk in [to_del[i:i+1000] for i in range(0, len(to_del), 1000)]:
-                    s3.delete_objects(Bucket=bucket, Delete={"Objects": chunk})
-        # objetos actuales (por si no hay versioning)
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket):
-            keys = [{"Key": it["Key"]} for it in page.get("Contents", [])]
-            if keys:
-                for chunk in [keys[i:i+1000] for i in range(0, len(keys), 1000)]:
-                    s3.delete_objects(Bucket=bucket, Delete={"Objects": chunk})
-    except s3.exceptions.NoSuchBucket:
-        return
+        kw = {"region_name": region} if region else {}
+        return str(_require_boto3().client("sts", **kw).get_caller_identity()["Account"])
+    except Exception:
+        return None
+
+
+def _is_no_such_bucket(s3, error: BaseException) -> bool:
+    no_such_bucket = getattr(getattr(s3, "exceptions", None), "NoSuchBucket", None)
+    if isinstance(no_such_bucket, type) and isinstance(error, no_such_bucket):
+        return True
+    return _client_error_code(error) == "NoSuchBucket"
+
+
+def _delete_object_batch(s3, bucket: str, objects: List[Dict], owner: Dict):
+    for start in range(0, len(objects), 1000):
+        response = s3.delete_objects(
+            Bucket=bucket, Delete={"Objects": objects[start:start + 1000], "Quiet": True}, **owner
+        )
+        errors = response.get("Errors") if isinstance(response, dict) else None
+        if errors:
+            raise RuntimeError(f"{len(errors)} object(s) could not be deleted, e.g. {errors[0]}")
+
+
+def _empty_bucket(s3, bucket: str, prefix: str = "", expected_owner: Optional[str] = None) -> bool:
+    """
+    Delete every object, version and delete marker under ``prefix`` ("" = the whole bucket).
+    Returns True when done (or the bucket does not exist), False after printing the error.
+    """
+    owner = {"ExpectedBucketOwner": expected_owner} if expected_owner else {}
+    listing = {"Bucket": bucket, **owner}
+    if prefix:
+        listing["Prefix"] = prefix
+    try:
+        for page in s3.get_paginator("list_object_versions").paginate(**listing):
+            objects = [
+                {"Key": item["Key"], "VersionId": item["VersionId"]}
+                for item in page.get("Versions", []) + page.get("DeleteMarkers", [])
+            ]
+            _delete_object_batch(s3, bucket, objects, owner)
+        # Objects of a bucket that never had versioning (normally already covered above).
+        for page in s3.get_paginator("list_objects_v2").paginate(**listing):
+            _delete_object_batch(s3, bucket, [{"Key": item["Key"]} for item in page.get("Contents", [])], owner)
     except Exception as e:
-        print(f"[WARN] Could not empty bucket {bucket}: {e}")
+        if _is_no_such_bucket(s3, e):
+            return True
+        target = f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}"
+        print(f"[ERR] Could not empty {target}: {e}")
+        return False
+    return True
+
+
+def _bucket_is_empty(s3, bucket: str, expected_owner: Optional[str] = None) -> bool:
+    owner = {"ExpectedBucketOwner": expected_owner} if expected_owner else {}
+    versions = s3.list_object_versions(Bucket=bucket, MaxKeys=1, **owner)
+    if versions.get("Versions") or versions.get("DeleteMarkers"):
+        return False
+    return not s3.list_objects_v2(Bucket=bucket, MaxKeys=1, **owner).get("Contents")
+
 
 def remove_project(
     project: Optional[str] = None,
@@ -932,12 +1099,16 @@ def remove_project(
 ) -> int:
     """
     Delete AWS resources for the project:
-      - Empty the history bucket
+      - Check (read-only) that the stack exists in the region; otherwise delete nothing
+      - Empty the history bucket when it is a resource of that stack
       - Remove the CloudFormation stack (API/Lambda/DDB, etc.)
-      - Optionally delete the deployment bucket (if keep_deploy_bucket is False)
-    Pulls names from params.json when not provided explicitly. When ``project`` differs from the
-    params.json project, params.json describes another project: its stack/bucket names are ignored
-    and the default names are derived from ``project``.
+      - Delete the SSM SecureString holding .env.prod
+      - Delete the stack's deployment artifacts (s3://<deployment_bucket>/<stack>/) and the
+        deployment bucket only if nothing else is left in it (unless keep_deploy_bucket)
+    Returns 0 only when every step succeeded. Pulls names from params.json when not provided
+    explicitly. When ``project`` differs from the params.json project, params.json describes
+    another project: its stack/bucket/SSM names are ignored and the default names are derived from
+    ``project``.
     """
     workdir = Path(project_dir or Path.cwd())
     conf = workdir / (config_path or "params.json")
@@ -954,21 +1125,53 @@ def remove_project(
 
     reg = _effective_region(region, data)
     stack = names.get("stack_name") or f"{proj}-stack"
-    history_bucket = names.get("history_bucket") or f"{proj}-history-bucket"
-    deploy_bucket  = names.get("deployment_bucket") or f"{proj}-deployment-bucket"
+    legacy = _legacy_bucket_names(proj)
+    history_bucket = names.get("history_bucket") or legacy["history_bucket"]
+    deploy_bucket  = names.get("deployment_bucket") or legacy["deployment_bucket"]
+    env_param = names.get("env_param_name") or f"/{proj}/prod/env"
+    # samconfig/sam deploy upload this stack's artifacts under s3://<deployment bucket>/<stack>/;
+    # the bucket itself may be shared with other stacks.
+    deploy_prefix = f"{stack}/"
+
+    cf, s3, _ = _boto(reg)
+
+    # Read-only checks first. Bucket names are global: emptying them for a stack that is not in
+    # this region would destroy the data of a deployment that keeps running elsewhere.
+    try:
+        stack_info = cf.describe_stacks(StackName=stack)["Stacks"][0]
+    except Exception as e:
+        if _is_missing_stack_error(e):
+            print(f"[ERR] Stack {stack} does not exist in region {reg}. Nothing was deleted.")
+            print("      Pass --region with the stack's region (or --project / -c for another project).")
+        else:
+            print(f"[ERR] Could not read stack {stack} in region {reg}: {e}. Nothing was deleted.")
+        return 1
+    try:
+        resources = cf.describe_stack_resources(StackName=stack).get("StackResources", [])
+    except Exception as e:
+        print(f"[ERR] Could not list the resources of stack {stack}: {e}. Nothing was deleted.")
+        return 1
+    stack_buckets = {r.get("PhysicalResourceId") for r in resources if r.get("ResourceType") == "AWS::S3::Bucket"}
+    functions = [r.get("PhysicalResourceId") for r in resources if r.get("ResourceType") == "AWS::Lambda::Function"]
+    history_in_stack = history_bucket in stack_buckets
 
     print("\nDeletion plan")
     if other_project and params_project:
         print(f"   [NOTE] --project {proj} differs from {conf.name} (project '{params_project}'):")
-        print(f"          ignoring its stack/bucket names; using the default names for '{proj}'.")
+        print(f"          ignoring its stack/bucket/SSM names; using the default names for '{proj}'.")
         if not region and data.get("region"):
             print(f"          The region below still comes from {conf.name}; pass --region if '{proj}' lives elsewhere.")
     print(f"   Project:          {proj}")
     print(f"   Region:           {reg}")
-    print(f"   Stack to delete:  {stack}")
-    print(f"   Empty bucket:     {history_bucket}")
+    print(f"   Stack to delete:  {stack} ({stack_info.get('StackStatus', 'unknown status')})")
+    if history_in_stack:
+        print(f"   Empty bucket:     {history_bucket} (all histories, files and tokens; deleted with the stack)")
+    else:
+        print(f"   [WARN] {history_bucket} is not a resource of {stack}: it is left untouched.")
+    print(f"   Delete SSM:       {env_param} (SecureString with the .env.prod secrets)")
     if not keep_deploy_bucket:
-        print(f"   Delete bucket:    {deploy_bucket} (deployment)")
+        print(f"   Delete files:     s3://{deploy_bucket}/{deploy_prefix} (deployment artifacts of this stack)")
+        print(f"                     then the bucket {deploy_bucket}, only if nothing else is left in it")
     else:
         print(f"   Keep bucket:      {deploy_bucket} (deployment)")
 
@@ -976,35 +1179,77 @@ def remove_project(
         print("Aborted.")
         return 1
 
-    cf, s3, _ = _boto(reg)
+    failures: List[str] = []
 
-    # Empty history bucket (so CloudFormation can delete it)
-    print(f"[INFO] Emptying s3://{history_bucket} ...")
-    _empty_bucket(s3, history_bucket)
+    # Empty the history bucket (so CloudFormation can delete it).
+    if history_in_stack:
+        print(f"[INFO] Emptying s3://{history_bucket} ...")
+        if not _empty_bucket(s3, history_bucket):
+            print("[ERR] The stack was not deleted: CloudFormation cannot delete a bucket that is not empty.")
+            return 1
 
-    # Delete stack
     print(f"[INFO] Deleting stack {stack} ...")
     try:
         cf.delete_stack(StackName=stack)
-        if wait:
-            waiter = cf.get_waiter("stack_delete_complete")
-            print("[INFO] Waiting for stack deletion to finish...")
-            waiter.wait(StackName=stack)
-            print("[OK] Stack deleted.")
-        else:
-            print("[INFO] Deletion started (asynchronous).")
     except Exception as e:
-        print(f"[WARN] Error deleting stack: {e}")
-
-    # Deployment bucket (outside the stack) - delete if requested
-    if not keep_deploy_bucket:
-        print(f"[INFO] Emptying s3://{deploy_bucket} ...")
-        _empty_bucket(s3, deploy_bucket)
+        print(f"[ERR] Could not delete stack {stack}: {e}")
+        print("      The SSM parameter and the deployment files were kept. Fix the problem and re-run maws remove.")
+        return 1
+    if wait:
+        print("[INFO] Waiting for stack deletion to finish...")
         try:
-            s3.delete_bucket(Bucket=deploy_bucket)
-            print("[OK] Deployment bucket deleted.")
+            cf.get_waiter("stack_delete_complete").wait(StackName=stack)
         except Exception as e:
-            print(f"[WARN] Could not delete deployment bucket: {e}")
+            print(f"[ERR] Stack {stack} was not deleted: {e}")
+            print("      The SSM parameter and the deployment files were kept. Check the stack events in the")
+            print("      CloudFormation console, fix the problem and re-run maws remove.")
+            return 1
+        print("[OK] Stack deleted.")
+    else:
+        print("[INFO] Stack deletion started (asynchronous; use --wait to wait for it). Check it with:")
+        print(f"       aws cloudformation describe-stacks --stack-name {stack} --region {reg}")
 
-    print("[OK] Done. Some resources may take a few minutes to disappear completely.")
+    # SSM SecureString with every secret from .env.prod (not part of the stack).
+    print(f"[INFO] Deleting SSM parameter {env_param} ...")
+    try:
+        _ssm_client(reg).delete_parameter(Name=env_param)
+        print("[OK] SSM parameter deleted.")
+    except Exception as e:
+        if _client_error_code(e) == "ParameterNotFound" or type(e).__name__ == "ParameterNotFound":
+            print("[INFO] SSM parameter not found (already deleted).")
+        else:
+            failures.append(f"SSM parameter {env_param}: {e}")
+
+    # Deployment artifacts (outside the stack; the bucket may be shared).
+    if not keep_deploy_bucket:
+        owner = _account_id(reg)
+        print(f"[INFO] Deleting s3://{deploy_bucket}/{deploy_prefix} ...")
+        if not _empty_bucket(s3, deploy_bucket, prefix=deploy_prefix, expected_owner=owner):
+            failures.append(f"deployment files s3://{deploy_bucket}/{deploy_prefix}")
+        else:
+            owner_kw = {"ExpectedBucketOwner": owner} if owner else {}
+            try:
+                if _bucket_is_empty(s3, deploy_bucket, expected_owner=owner):
+                    s3.delete_bucket(Bucket=deploy_bucket, **owner_kw)
+                    print(f"[OK] Deployment bucket {deploy_bucket} deleted.")
+                else:
+                    print(f"[INFO] Kept deployment bucket {deploy_bucket}: it still holds other objects.")
+            except Exception as e:
+                if _is_no_such_bucket(s3, e):
+                    print(f"[INFO] Deployment bucket {deploy_bucket} does not exist.")
+                else:
+                    failures.append(f"deployment bucket {deploy_bucket}: {e}")
+
+    for function_name in functions:
+        print(
+            f"[INFO] If the log group /aws/lambda/{function_name} exists (Lambda created it before MAWS managed "
+            "the log group), it is not part of the stack: delete it in CloudWatch Logs if you no longer need it."
+        )
+
+    if failures:
+        print("[ERR] Not everything could be deleted:")
+        for failure in failures:
+            print(f"      - {failure}")
+        return 1
+    print("[OK] Done." + ("" if wait else " The stack is still being deleted in the background."))
     return 0

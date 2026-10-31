@@ -518,7 +518,8 @@ def test_run_callbacks_accept_two_or_three_arguments(workspace_tmp_path):
         on_complete_params={"marker": "ok"},
     )
 
+    # on_update runs once the component's output is in the history.
     assert calls == [
-        ("update", 0, True),
+        ("update", 1, True),
         ("complete", 1, "ok"),
     ]

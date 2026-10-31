@@ -36,6 +36,8 @@ def _tty_with_answers(monkeypatch, answers):
 
     monkeypatch.setattr(cli, "_is_tty", lambda: True)
     monkeypatch.setattr("builtins.input", fake_input)
+    # API keys are read with getpass (no echo); they come from the same queue of answers.
+    monkeypatch.setattr(cli.getpass, "getpass", fake_input)
     return prompts
 
 
@@ -236,3 +238,95 @@ def test_start_from_description_writes_env_when_missing(workspace_tmp_path, monk
     assert cli.main(["start", "-d", str(workspace_tmp_path), "-c", DESCRIPTION]) == 0
 
     assert (workspace_tmp_path / ".env").read_text(encoding="utf-8") == "GOOGLE_API_KEY=sk-bootstrap\n"
+
+
+# --- API keys are typed without echo -------------------------------------------
+
+def _plain_and_secret_prompts(monkeypatch, plain_answers, secret_answers):
+    """input() answers the plain prompts and getpass() the secret ones; an API key typed with echo fails."""
+    seen = {"input": [], "getpass": []}
+    plain = list(plain_answers)
+    secret = list(secret_answers)
+
+    def fake_input(prompt=""):
+        seen["input"].append(prompt)
+        if "API_KEY" in prompt:
+            raise AssertionError(f"an API key was read with input(), which echoes it: {prompt!r}")
+        return plain.pop(0) if plain else ""
+
+    def fake_getpass(prompt=""):
+        seen["getpass"].append(prompt)
+        return secret.pop(0) if secret else ""
+
+    monkeypatch.setattr(cli, "_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", fake_input)
+    monkeypatch.setattr(cli.getpass, "getpass", fake_getpass)
+    return seen
+
+
+def test_start_reads_the_api_key_without_echo(workspace_tmp_path, monkeypatch):
+    seen = _plain_and_secret_prompts(monkeypatch, ["", ""], ["sk-hidden"])
+
+    assert cli.main(["start", "-d", str(workspace_tmp_path)]) == 0
+
+    assert (workspace_tmp_path / ".env").read_text(encoding="utf-8") == "GOOGLE_API_KEY=sk-hidden\n"
+    assert [p for p in seen["getpass"] if "GOOGLE_API_KEY" in p]
+
+
+def test_start_from_description_reads_both_keys_without_echo(workspace_tmp_path, monkeypatch):
+    _FakeBootstrapManager.calls = []
+    monkeypatch.setattr(cli, "AgentSystemManager", _FakeBootstrapManager)
+    monkeypatch.setenv("GOOGLE_API_KEY", "placeholder")  # restored after the test; the CLI sets it
+    # bootstrap provider and model; final provider "openai" and model
+    seen = _plain_and_secret_prompts(monkeypatch, ["", "", "openai", ""], ["sk-bootstrap", "sk-final"])
+
+    assert cli.main(["start", "-d", str(workspace_tmp_path), "-c", DESCRIPTION]) == 0
+
+    assert (workspace_tmp_path / ".env").read_text(encoding="utf-8") == "OPENAI_API_KEY=sk-final\n"
+    assert any("GOOGLE_API_KEY" in p for p in seen["getpass"])
+    assert any("OPENAI_API_KEY" in p for p in seen["getpass"])
+
+
+# --- Exit codes -----------------------------------------------------------------
+
+def test_cli_without_a_command_exits_with_a_usage_error():
+    with pytest.raises(SystemExit) as exc:
+        cli.main([])
+    assert exc.value.code == 2
+
+
+def test_run_without_config_returns_1(workspace_tmp_path, capsys):
+    assert cli.main(["run", "-d", str(workspace_tmp_path)]) == 1
+    assert "config.json" in capsys.readouterr().out
+
+
+def test_start_returns_1_when_the_directory_cannot_be_created(workspace_tmp_path, monkeypatch, capsys):
+    _no_tty(monkeypatch)
+    blocker = workspace_tmp_path / "a-file"
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    assert cli.main(["start", "-d", str(blocker / "project")]) == 1
+    assert "Could not create the project directory" in capsys.readouterr().out
+
+
+def test_dashboard_returns_1_for_a_missing_directory(workspace_tmp_path, capsys):
+    missing = workspace_tmp_path / "missing"
+
+    assert cli.main(["dashboard", "-d", str(missing), "--no-browser"]) == 1
+    assert "is not a directory" in capsys.readouterr().out
+    assert not missing.exists()
+
+
+def test_console_script_exit_code_reaches_the_shell(workspace_tmp_path):
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-m", "mas.cli.cli", "run", "-d", str(workspace_tmp_path / "missing")],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr

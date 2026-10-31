@@ -1,7 +1,13 @@
+import http.client
 import json
+import os
+import socket
 import sqlite3
+import threading
 
-from mas import AgentSystemManager
+import pytest
+
+from mas import AgentSystemManager, dashboard
 from mas.dashboard import build_dashboard_state
 
 
@@ -137,7 +143,6 @@ def test_dashboard_state_loads_config_automations_and_histories(workspace_tmp_pa
     state = build_dashboard_state(workspace_tmp_path, history_limit=20)
 
     assert state["has_config"] is True
-    assert state["manager_loaded"] is True
     assert state["load_error"] is None
     assert [component["name"] for component in state["components"]] == [
         "weather_context",
@@ -196,7 +201,7 @@ def test_dashboard_state_reports_missing_config(workspace_tmp_path):
     state = build_dashboard_state(workspace_tmp_path)
 
     assert state["has_config"] is False
-    assert state["manager_loaded"] is False
+    assert state["components"] == []
     assert "No config.json" in state["load_error"]
 
 
@@ -284,3 +289,224 @@ def test_cli_dashboard_command_dispatches(monkeypatch, workspace_tmp_path):
     assert called["args"].auto_port is True
     assert called["args"].no_browser is True
     assert called["args"].history_limit == 5
+
+
+# --- Read-only state: no project code, no .env, no folders ------------------------
+
+def test_dashboard_state_does_not_run_project_code_or_create_folders(workspace_tmp_path, monkeypatch):
+    import mas.manager
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the dashboard must not build an AgentSystemManager")
+
+    monkeypatch.setattr(mas.manager.AgentSystemManager, "__init__", forbidden)
+    marker = workspace_tmp_path / "fns_was_imported.txt"
+    (workspace_tmp_path / "fns.py").write_text(
+        f"open({str(marker)!r}, 'w').write('ran')\n\ndef collect(messages):\n    return {{}}\n",
+        encoding="utf-8",
+    )
+    (workspace_tmp_path / ".env").write_text("MAS_DASHBOARD_TEST_SECRET=from-dotenv\n", encoding="utf-8")
+    monkeypatch.delenv("MAS_DASHBOARD_TEST_SECRET", raising=False)
+    (workspace_tmp_path / "config.json").write_text(
+        json.dumps({
+            "general_parameters": {"imports": "std->weather_search"},
+            "components": [
+                {"type": "process", "name": "collect", "function": "fn:collect"},
+                {"type": "agent", "name": "answer"},
+                {"type": "automation", "name": "flow", "sequence": ["collect", "answer", "weather_search"]},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    before = sorted(path.name for path in workspace_tmp_path.iterdir())
+
+    state = build_dashboard_state(workspace_tmp_path)
+
+    assert not marker.exists()
+    assert "MAS_DASHBOARD_TEST_SECRET" not in os.environ
+    assert sorted(path.name for path in workspace_tmp_path.iterdir()) == before  # no history/, files/
+    assert state["load_error"] is None
+    components = {c["name"]: c for c in state["components"]}
+    assert list(components) == ["collect", "answer", "flow", "weather_search"]
+    assert components["collect"]["function"] == "collect"
+    assert components["answer"]["required_outputs"] == {"response": "Text to send to user."}
+    assert components["weather_search"]["function"] == "weather_query"
+    assert components["weather_search"]["imported_from"].replace("\\", "/").endswith("std.json")
+    assert [a["name"] for a in state["automations"]] == ["flow"]
+
+
+def test_dashboard_reports_imports_it_cannot_read(workspace_tmp_path):
+    (workspace_tmp_path / "config.json").write_text(
+        json.dumps({
+            "general_parameters": {"imports": ["missing_library", "std?[current_date]"]},
+            "components": [{"type": "agent", "name": "answer"}],
+        }),
+        encoding="utf-8",
+    )
+
+    state = build_dashboard_state(workspace_tmp_path)
+
+    assert "missing_library" in state["load_error"]
+    assert [c["name"] for c in state["components"]] == ["answer", "current_date"]
+
+
+# --- HTTP server: Host header, access token, port clashes -------------------------
+
+def _write_minimal_project(root):
+    (root / "config.json").write_text(
+        json.dumps({"components": [{"type": "agent", "name": "secret_agent", "system": "Top secret."}]}),
+        encoding="utf-8",
+    )
+
+
+class _RunningServer:
+    def __init__(self, project_dir, **kwargs):
+        self.httpd = dashboard.create_dashboard_server(project_dir, "127.0.0.1", 0, **kwargs)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=10)
+
+    def get(self, path, host=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.putrequest("GET", path, skip_host=True)
+            if host is not False:
+                conn.putheader("Host", host or f"127.0.0.1:{self.port}")
+            for key, value in (headers or {}).items():
+                conn.putheader(key, value)
+            conn.endheaders()
+            response = conn.getresponse()
+            return response.status, response.read().decode("utf-8"), dict(response.getheaders())
+        finally:
+            conn.close()
+
+
+def test_dashboard_rejects_foreign_host_headers(workspace_tmp_path):
+    _write_minimal_project(workspace_tmp_path)
+
+    with _RunningServer(workspace_tmp_path) as server:
+        for host in ("attacker.example", f"attacker.example:{server.port}", f"127.0.0.1:{server.port + 1}"):
+            status, body, _ = server.get("/api/state", host=host)
+            assert status == 403, host
+            assert "secret_agent" not in body
+        assert server.get("/", host="attacker.example")[0] == 403
+        assert server.get("/api/state", host=False)[0] == 403  # no Host header at all
+
+        for host in (f"127.0.0.1:{server.port}", f"localhost:{server.port}", f"[::1]:{server.port}"):
+            status, body, headers = server.get("/api/state", host=host)
+            assert status == 200, host
+            assert "secret_agent" in body
+            assert headers["Cache-Control"] == "no-store"
+        status, body, headers = server.get("/")
+        assert status == 200
+        assert "MAS Dashboard" in body
+        assert headers["Referrer-Policy"] == "no-referrer"
+
+
+def test_dashboard_token_protects_the_html_and_the_api(workspace_tmp_path):
+    _write_minimal_project(workspace_tmp_path)
+
+    with _RunningServer(workspace_tmp_path, token="s3cret-token") as server:
+        status, body, _ = server.get("/api/state")
+        assert status == 401
+        assert "secret_agent" not in body
+        assert server.get("/api/state?token=wrong")[0] == 401
+        assert server.get("/api/state", headers={dashboard.TOKEN_HEADER: "wrong"})[0] == 401
+        status, body, _ = server.get("/")
+        assert status == 401
+        assert "?token=" in body
+
+        status, body, _ = server.get("/api/state", headers={dashboard.TOKEN_HEADER: "s3cret-token"})
+        assert status == 200
+        assert "secret_agent" in body
+        assert server.get("/api/state?token=s3cret-token")[0] == 200
+        status, body, _ = server.get("/?token=s3cret-token")
+        assert status == 200
+        assert dashboard.TOKEN_HEADER in body  # the page sends the token back on API calls
+
+
+def _no_bind(monkeypatch):
+    monkeypatch.setattr(dashboard._DashboardServer, "server_bind", lambda self: None)
+    monkeypatch.setattr(dashboard._DashboardServer, "server_activate", lambda self: None)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.20"])
+def test_non_loopback_hosts_always_require_a_token(workspace_tmp_path, monkeypatch, host):
+    _no_bind(monkeypatch)  # no real socket on a network interface during tests
+
+    httpd = dashboard.create_dashboard_server(workspace_tmp_path, host, 8765)
+    try:
+        assert httpd.dashboard_token and len(httpd.dashboard_token) >= 20
+        url = dashboard.dashboard_url(httpd)
+        assert url.endswith(f"/?token={httpd.dashboard_token}")
+        if host == "0.0.0.0":
+            assert httpd.allowed_hosts is None  # any name reaches it; the token is what protects it
+            assert url.startswith("http://127.0.0.1:8765/")
+        else:
+            assert httpd.allowed_hosts == {"192.168.1.20:8765"}
+            assert url.startswith("http://192.168.1.20:8765/")
+    finally:
+        httpd.server_close()
+
+    given = dashboard.create_dashboard_server(workspace_tmp_path, host, 8765, token="mine")
+    try:
+        assert given.dashboard_token == "mine"
+    finally:
+        given.server_close()
+
+
+def test_loopback_hosts_accept_only_local_names():
+    assert dashboard.allowed_host_headers("127.0.0.1", 8765) == {
+        "127.0.0.1:8765", "localhost:8765", "[::1]:8765"
+    }
+    assert "localhost" in dashboard.allowed_host_headers("localhost", 80)
+    assert dashboard.is_loopback_host("::1")
+    assert dashboard.is_loopback_host("[::1]")
+    assert not dashboard.is_loopback_host("0.0.0.0")
+    assert not dashboard.is_loopback_host("10.0.0.5")
+
+
+def test_a_second_dashboard_on_the_same_port_fails_clearly(workspace_tmp_path, capsys):
+    first = dashboard.create_dashboard_server(workspace_tmp_path, "127.0.0.1", 0)
+    port = first.server_address[1]
+    try:
+        with pytest.raises(OSError):
+            dashboard.create_dashboard_server(workspace_tmp_path, "127.0.0.1", port)
+
+        assert dashboard.serve_dashboard(workspace_tmp_path, "127.0.0.1", port, open_browser=False) == 1
+        assert "Could not start dashboard" in capsys.readouterr().out
+
+        if os.name == "nt":
+            # Another program asking for SO_REUSEADDR cannot take the port over either.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as other:
+                other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                with pytest.raises(OSError):
+                    other.bind(("127.0.0.1", port))
+
+        assert dashboard.find_free_port("127.0.0.1", port) != port
+    finally:
+        first.server_close()
+
+
+def test_dashboard_main_passes_token_and_auto_port(monkeypatch, workspace_tmp_path):
+    from mas.cli import cli
+
+    seen = {}
+    monkeypatch.setattr(dashboard, "serve_dashboard", lambda *args, **kwargs: seen.update(kwargs) or 0)
+    monkeypatch.setenv(dashboard.TOKEN_ENV_VAR, "from-env")
+
+    assert cli.main(["dashboard", "-d", str(workspace_tmp_path), "--auto-port", "--no-browser"]) == 0
+    assert seen["token"] == "from-env"
+    assert seen["auto_port"] is True
+
+    assert cli.main(["dashboard", "-d", str(workspace_tmp_path), "--token", "from-flag"]) == 0
+    assert seen["token"] == "from-flag"
+    assert seen["auto_port"] is False

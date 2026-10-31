@@ -1,5 +1,6 @@
 # mas/cli/cli.py
 import argparse
+import getpass
 import sys
 import json
 from pathlib import Path
@@ -22,7 +23,16 @@ def _ask(prompt: str, default: str = None) -> str:
         return default or ""
     return response or default or ""
 
-def _ask_required(prompt: str, missing_msg: str, attempts: int = 3) -> str:
+def _ask_secret(prompt: str) -> str:
+    """Prompt for a secret (an API key) without echoing it on screen."""
+    if not _is_tty():
+        return ""
+    try:
+        return getpass.getpass(f"{prompt}: ").strip()
+    except EOFError:
+        return ""
+
+def _ask_required(prompt: str, missing_msg: str, attempts: int = 3, secret: bool = False) -> str:
     """Prompt for a value that cannot be empty. Returns "" if none could be obtained.
 
     Without a TTY nothing can be typed, so this gives up at once instead of looping forever.
@@ -30,7 +40,7 @@ def _ask_required(prompt: str, missing_msg: str, attempts: int = 3) -> str:
     if not _is_tty():
         return ""
     for _ in range(attempts):
-        value = _ask(prompt)
+        value = _ask_secret(prompt) if secret else _ask(prompt)
         if value:
             return value
         print(missing_msg)
@@ -66,7 +76,11 @@ def _ask_choice(prompt: str, choices: list[str], default: str) -> str:
 
 def start(project_dir_str: str = None, config_str: str = None, verbose: bool = False):
     project_dir = Path(project_dir_str or Path.cwd())
-    project_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"Could not create the project directory '{project_dir}': {e}")
+        return 1
 
     if config_str:
         # --config mode: from JSON file or description
@@ -121,6 +135,7 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
             bootstrap_api_key = _ask_required(
                 f"Enter your {bootstrap_key_name} (required for this process)",
                 "An API key is required so the LLM can generate the system.",
+                secret=True,
             )
             if not bootstrap_api_key:
                 if not _is_tty():
@@ -172,7 +187,7 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
                     if target_provider == bootstrap_provider:
                         target_api_key_value = bootstrap_api_key
                     else:
-                        target_api_key_value = _ask(f"Enter your {target_api_key_name} for the final system (optional)")
+                        target_api_key_value = _ask_secret(f"Enter your {target_api_key_name} for the final system (optional)")
 
                     env_content = f"{target_api_key_name}={target_api_key_value}\n" if target_api_key_value else f"# {target_api_key_name}=\n"
                     env_created = _write_new_file(env_path, env_content)
@@ -229,7 +244,7 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
         api_key_name = f"{provider.upper()}_API_KEY" if provider else None
         api_key_value = ""
         if need_env:
-            api_key_value = _ask(f"Enter your {api_key_name} (optional, you may leave it blank)")
+            api_key_value = _ask_secret(f"Enter your {api_key_name} (optional, you may leave it blank)")
 
         # 3. Create the files that do not exist yet
         config_content = {
@@ -295,8 +310,6 @@ def start(project_dir_str: str = None, config_str: str = None, verbose: bool = F
         print("2. Run `python main.py` to test your agent.")
         return 0
 
-# >> ADD THIS FUNCTION BEFORE THE `main` FUNCTION <<
-
 def run_system(project_dir_str: str, input_str: str = None, component_name: str = None, verbose: bool = False):
     """
     Load and execute a MAS system from a project directory.
@@ -344,8 +357,8 @@ def run_system(project_dir_str: str, input_str: str = None, component_name: str 
         return 1
 
 def main(argv=None):
-    """Entry point for the CLI."""
-    argv = argv or sys.argv[1:]
+    """Entry point for the CLI. Returns the process exit code: 0 on success, 1 on failure."""
+    argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(prog="mas", description="CLI for the Multi-Agent System (MAS) library.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -370,6 +383,11 @@ def main(argv=None):
     dashboard_parser.add_argument("--auto-port", action="store_true", help="Use the requested port if free, otherwise choose a free port.")
     dashboard_parser.add_argument("--no-browser", action="store_true", help="Start the server without opening a browser.")
     dashboard_parser.add_argument("--history-limit", type=int, default=200, help="Maximum messages to load per user history.")
+    dashboard_parser.add_argument(
+        "--token",
+        help="Access token the dashboard requires (default: $MAS_DASHBOARD_TOKEN). With a non-loopback "
+             "--host a token is always required; one is generated and printed if none is given.",
+    )
 
     args = parser.parse_args(argv)
 

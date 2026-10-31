@@ -16,11 +16,15 @@ import pytest
 
 import telegram
 
+import mas.bots as bots_module
 from mas.bots import DEFAULT_ERROR_MSG, Bot, TelegramBot, WhatsappBot
 
 
 # conftest.py replaces python-telegram-bot with a stub module (no __file__) when it is missing.
 REAL_PTB = getattr(telegram, "__file__", None) is not None
+
+# Bots log through the library logger (mas._shared), like the rest of MAS.
+BOT_LOGGER = bots_module.logger.name
 
 
 class _Manager:
@@ -280,12 +284,12 @@ def test_message_already_too_old_on_arrival_is_dropped_with_a_warning(caplog):
     manager = _Manager()
     bot = _RecordingBot(manager, max_allowed_message_delay=120)
 
-    with caplog.at_level(logging.DEBUG, logger="mas.bots"):
+    with caplog.at_level(logging.DEBUG, logger=BOT_LOGGER):
         asyncio.run(bot.process_payload(_msg("u1", "stale", age=600)))
 
     assert manager.runs == []
     assert bot.sent == []
-    warnings = [r for r in caplog.records if r.name == "mas.bots" and r.levelno == logging.WARNING]
+    warnings = [r for r in caplog.records if r.name == BOT_LOGGER and r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "u1" in warnings[0].getMessage()
     assert "max_allowed_message_delay=120" in warnings[0].getMessage()
@@ -307,7 +311,7 @@ def test_max_allowed_message_delay_none_accepts_any_age():
 def _error_records(caplog):
     return [
         r for r in caplog.records
-        if r.name == "mas.bots" and r.levelno == logging.ERROR and r.exc_info
+        if r.name == BOT_LOGGER and r.levelno == logging.ERROR and r.exc_info
     ]
 
 
@@ -325,7 +329,7 @@ def test_run_failure_is_logged_and_user_gets_error_reply(caplog):
             bot.process_payload(_msg("u1", "after")),
         )
 
-    with caplog.at_level(logging.ERROR, logger="mas.bots"):
+    with caplog.at_level(logging.ERROR, logger=BOT_LOGGER):
         asyncio.run(scenario())
 
     assert bot.sent == [("u1", DEFAULT_ERROR_MSG), ("u1", "echo after")]
@@ -354,7 +358,7 @@ def test_callback_error_gets_error_reply(caplog):
 
     bot = _RecordingBot(_Manager(), on_complete=bad_on_complete)
 
-    with caplog.at_level(logging.ERROR, logger="mas.bots"):
+    with caplog.at_level(logging.ERROR, logger=BOT_LOGGER):
         asyncio.run(bot.process_payload(_msg("u1", "hi")))
 
     assert bot.sent == [("u1", DEFAULT_ERROR_MSG)]
@@ -394,7 +398,7 @@ def test_failing_error_reply_is_logged_not_raised(caplog):
 
     bot = _BrokenSendBot(_Manager(run=run))
 
-    with caplog.at_level(logging.ERROR, logger="mas.bots"):
+    with caplog.at_level(logging.ERROR, logger=BOT_LOGGER):
         asyncio.run(bot.process_payload(_msg("u1", "hi")))
 
     assert len(_error_records(caplog)) == 2
@@ -408,7 +412,7 @@ def test_unparseable_payload_is_logged_and_skipped(caplog):
 
     bot = _BadParseBot(_Manager())
 
-    with caplog.at_level(logging.ERROR, logger="mas.bots"):
+    with caplog.at_level(logging.ERROR, logger=BOT_LOGGER):
         asyncio.run(bot.process_payload({"weird": True}))
 
     assert bot.sent == []
@@ -467,13 +471,13 @@ def test_disallowed_user_is_ignored_without_calling_the_model(caplog):
     manager = _Manager()
     bot = _RecordingBot(manager, allowed_user_ids=[111, "222"])
 
-    with caplog.at_level(logging.INFO, logger="mas.bots"):
+    with caplog.at_level(logging.INFO, logger=BOT_LOGGER):
         asyncio.run(bot.process_payload(_msg("999", "let me in")))
         asyncio.run(bot.process_payload(_msg("999", "/start")))
 
     assert manager.runs == []
     assert bot.sent == []
-    infos = [r for r in caplog.records if r.name == "mas.bots" and r.levelno == logging.INFO]
+    infos = [r for r in caplog.records if r.name == BOT_LOGGER and r.levelno == logging.INFO]
     assert len(infos) == 2
     assert all("999" in r.getMessage() for r in infos)
 
@@ -589,7 +593,7 @@ def test_whatsapp_stale_message_in_batch_is_dropped_but_fresh_one_runs(caplog):
         {"from": "100", "id": "new", "type": "text", "timestamp": str(int(time.time())), "text": {"body": "new"}},
     ]}}]}]}
 
-    with caplog.at_level(logging.WARNING, logger="mas.bots"):
+    with caplog.at_level(logging.WARNING, logger=BOT_LOGGER):
         asyncio.run(bot.process_webhook_update(webhook))
 
     assert manager.texts() == ["new"]

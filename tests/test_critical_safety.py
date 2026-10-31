@@ -237,7 +237,10 @@ def test_maws_template_deploys_only_the_staged_package():
 
     assert "CodeUri: ${PACKAGE_DIR}" in bootstrap
     assert "CodeUri: .\n" not in bootstrap
-    assert bootstrap.index("Staging Lambda package") < bootstrap.index("sam build\n")
+    # The package must be staged before the `sam build` command runs (not just mentioned in a comment).
+    build_command = re.search(r"^sam build\b", bootstrap, re.M)
+    assert build_command, "sam build command not found in bootstrap.sh"
+    assert bootstrap.index("Staging Lambda package") < build_command.start()
 
 
 def test_maws_package_excludes_secrets_and_histories(workspace_tmp_path):

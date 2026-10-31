@@ -25,14 +25,19 @@ class Parser:
 
 
     def _parse_as_function_reference(self, full_ref: str) -> dict:
-        return {
-            "is_function": True,
-            "function_name": full_ref.strip(),
-            "component_or_param": None,
-            "multiple_sources": None,
-            "single_source": None,
-            "selection": None,
-        }
+        # "fn:check" or "fns.py:check", optionally followed by ":<input spec>" naming the
+        # messages the function receives, e.g. "fn:check:second_loop_agent?[query]".
+        ref = full_ref.strip()
+        if ref.startswith("fn:"):
+            head, rest = "fn:", ref[3:]
+        else:
+            split_at = ref.index(".py:") + len(".py:")
+            head, rest = ref[:split_at], ref[split_at:]
+        name, _, input_spec = rest.partition(":")
+        result = self._parse_input_sources(input_spec) if input_spec.strip() else self._empty_parse_result()
+        result["is_function"] = True
+        result["function_name"] = head + name.strip()
+        return result
 
 
     def _parse_as_non_function(self, spec: str) -> dict:
