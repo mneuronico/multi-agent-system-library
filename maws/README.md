@@ -38,8 +38,9 @@ pip install \
 `maws update` builds the Lambda requirement from `params.json`:
 
 * `requirements_source: "git"` (default) installs from this GitHub repository. Without `requirements_ref` it installs **whatever is on the default branch at deploy time**, so two deploys of the same project can ship different code; the deploy prints a warning. Set `requirements_ref` to a commit SHA (most reproducible) or a release tag. Check which tags exist (`git ls-remote --tags https://github.com/mneuronico/multi-agent-system-library`) before pinning one: not every released version is tagged.
-* `requirements_source: "pypi"` installs the PyPI project named `mas` (`mas[...]` or `mas[...]==<requirements_ref>`). This library is documented and installed from GitHub, and nothing in this repository says that the PyPI name `mas` belongs to it. If that name is taken by an unrelated project (or registered later by someone else), the deploy installs that package into your Lambda, where it runs with access to your secrets. This was not checked against PyPI (no network access while writing this); verify the PyPI project yourself before using `pypi`. The deploy prints a warning.
 * `requirements_source: "local"` uses `requirements_ref` as a local path or requirement line.
+
+Any other value stops the deploy. In particular there is no `pypi` source: the package named `mas` on PyPI is a different project, not this library, so never install MAS as a bare `mas` / `mas[...]` requirement.
 
 ### `requirements.txt` example
 

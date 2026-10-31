@@ -159,6 +159,11 @@ FUNCTION_TRACING="Active"
 
 REQUIREMENTS_SOURCE=$(jq -r '.requirements_source // "git"' "${CONF}")
 REQUIREMENTS_REF=$(jq -r '.requirements_ref // empty' "${CONF}")
+case "${REQUIREMENTS_SOURCE}" in
+  git|local) ;;
+  pypi) die "[ERR] requirements_source \"pypi\" is not supported: the PyPI package named 'mas' is a different"             "      project, not this library. Use \"git\" (the default, pin requirements_ref) or \"local\"." ;;
+  *) die "[ERR] requirements_source in ${CONF} must be \"git\" or \"local\" (got: ${REQUIREMENTS_SOURCE})." ;;
+esac
 
 TELEGRAM_ENV_KEY=$(jq -r '.telegram.env_token_key // empty' "${CONF}")
 [[ -z "${TELEGRAM_ENV_KEY}" || "${TELEGRAM_ENV_KEY}" == "null" ]] && TELEGRAM_ENV_KEY="TELEGRAM_TOKEN"
@@ -335,16 +340,6 @@ BUCKET_ID="${PROJECT_LOGICAL}HistoryBucket"
 # --- MAS requirement ---
 MAS_EXTRA="maws,telegram,whatsapp,env"
 case "${REQUIREMENTS_SOURCE}" in
-  pypi)
-    if [[ -n "${REQUIREMENTS_REF}" && "${REQUIREMENTS_REF}" != "null" ]]; then
-      MAS_REQUIREMENT="mas[${MAS_EXTRA}]==${REQUIREMENTS_REF}"
-    else
-      MAS_REQUIREMENT="mas[${MAS_EXTRA}]"
-    fi
-    echo "[WARN] requirements_source=pypi installs the PyPI project named 'mas'. This library is documented and"
-    echo "       installed from GitHub; make sure the PyPI 'mas' project really is this library before using it."
-    echo "       Otherwise an unrelated package would run inside your Lambda, with access to your secrets."
-    ;;
   local)
     if [[ -z "${REQUIREMENTS_REF}" || "${REQUIREMENTS_REF}" == "null" ]]; then
       echo "requirements_source=local requires requirements_ref to point at a local package path"
@@ -352,7 +347,7 @@ case "${REQUIREMENTS_SOURCE}" in
     fi
     MAS_REQUIREMENT="${REQUIREMENTS_REF}"
     ;;
-  git|*)
+  git)
     MAS_REQUIREMENT="mas[${MAS_EXTRA}] @ git+https://github.com/mneuronico/multi-agent-system-library.git"
     if [[ -n "${REQUIREMENTS_REF}" && "${REQUIREMENTS_REF}" != "null" ]]; then
       MAS_REQUIREMENT="${MAS_REQUIREMENT}@${REQUIREMENTS_REF}"

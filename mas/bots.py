@@ -1433,7 +1433,7 @@ class TelegramBot(Bot):
     ):
         super().__init__(manager=manager, **kwargs)
         if Application is None or HTTPXRequest is None:
-            raise ImportError("python-telegram-bot is required for TelegramBot. Install mas[telegram].")
+            raise ImportError("python-telegram-bot is required for TelegramBot: pip install python-telegram-bot")
 
         token = telegram_token or self.manager.get_key("telegram_token")
         if not token:
@@ -2187,7 +2187,7 @@ class WhatsappBot(Bot):
 
     def create_flask_app(self, base_path: str = "/webhook"):
         if Flask is None:
-            raise ImportError("Flask is required to run the WhatsApp webhook server. Install mas[whatsapp].")
+            raise ImportError("Flask is required to run the WhatsApp webhook server: pip install 'Flask>=3,<4'")
         if self.verify_signature and not self.app_secret:
             raise ValueError(
                 "WhatsApp webhook POSTs must be authenticated with your Meta app secret. "

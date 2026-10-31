@@ -111,7 +111,7 @@ def _safe_key_part(value: str) -> str:
 
 def _require_boto3():
     if boto3 is None:
-        raise ImportError("boto3 and botocore are required for maws AWS operations. Install mas[aws] or mas[maws].")
+        raise ImportError("boto3 and botocore are required for maws AWS operations: pip install boto3")
     return boto3
 
 

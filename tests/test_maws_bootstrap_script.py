@@ -602,18 +602,27 @@ def test_missing_ssm_version_stops_before_deploying(bootstrap):
     assert not bootstrap.commands_starting("sam deploy")
 
 
-@pytest.mark.parametrize(
-    ("params", "warning"),
-    [
-        (_telegram(), "requirements_ref is not set"),
-        (_telegram(requirements_source="pypi"), "installs the PyPI project named 'mas'"),
-    ],
-)
-def test_requirement_source_warnings(bootstrap, params, warning):
-    code, out = bootstrap.run(params, TG_ENV)
+def test_requirement_source_warnings(bootstrap):
+    code, out = bootstrap.run(_telegram(), TG_ENV)
 
     assert code == 0, out
-    assert warning in out
+    assert "requirements_ref is not set" in out
+
+
+@pytest.mark.parametrize(
+    ("source", "error"),
+    [
+        ("pypi", "the PyPI package named 'mas' is a different"),
+        ("gti", 'must be "git" or "local" (got: gti)'),
+    ],
+)
+def test_requirement_source_other_than_git_or_local_stops_before_touching_aws(bootstrap, source, error):
+    code, out = bootstrap.run(_telegram(requirements_source=source), TG_ENV)
+
+    assert code != 0
+    assert error in out
+    assert not bootstrap.commands_starting("aws")
+    assert not bootstrap.commands_starting("sam")
 
 
 def test_default_log_group_has_retention_and_receives_the_logs(bootstrap):

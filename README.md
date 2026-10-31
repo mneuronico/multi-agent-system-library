@@ -2023,11 +2023,11 @@ MAS includes bot adapters for Telegram and WhatsApp Cloud API. Both adapters sha
 4. `manager.run(...)` executes the configured component or automation.
 5. The last result, or your callback result, is converted back into platform messages.
 
-Install the optional dependencies for the channel you use:
+Install the optional dependencies for the channel you use (always from GitHub: the `mas` package on PyPI is a different project):
 
 ```bash
-pip install "mas[telegram]"
-pip install "mas[whatsapp]"
+pip install "mas[telegram] @ git+https://github.com/mneuronico/multi-agent-system-library"
+pip install "mas[whatsapp] @ git+https://github.com/mneuronico/multi-agent-system-library"
 ```
 
 #### Telegram Startup
@@ -3178,7 +3178,7 @@ maws update \
 * Stops before uploading or deploying anything if the webhook secret is missing from `.env.prod` (or, for Telegram, has characters other than `A-Z a-z 0-9 _ -`).
 * Persists `.env.prod` to **SSM** as a secure parameter automatically, as a new parameter version that the deployed function is pinned to (a failed deploy leaves the running function on its old secrets). `.env.prod` is read, never executed as shell code.
 * Refuses deployment/history buckets owned by another AWS account.
-* Warns when `requirements_ref` is not set (the Lambda then gets whatever is on the default branch at deploy time; pin a commit SHA or an existing tag) and when `requirements_source` is `pypi` (see the maws README: the PyPI name `mas` is not documented as this library).
+* Warns when `requirements_ref` is not set (the Lambda then gets whatever is on the default branch at deploy time; pin a commit SHA or an existing tag). `requirements_source` must be `git` (default) or `local`.
 * Telegram: calls `setWebhook` on every deploy and exits non-zero with Telegram's error description if it is rejected.
 * Prints the **ApiUrl** output on success (use it to set your WhatsApp webhook if necessary).
 
