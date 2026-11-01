@@ -92,6 +92,7 @@ def test_tts_files_live_in_the_users_folder(workspace_tmp_path):
 
 def test_clear_global_history_deletes_all_files(workspace_tmp_path):
     manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
+    manager.add_blocks("hello", user_id="u1")
     stored = manager.save_file(b"data", user_id="u1")[5:]
 
     manager.clear_global_history()
@@ -192,6 +193,11 @@ def test_truncated_responses_fall_back_to_the_next_model(workspace_tmp_path, mon
     assert out[0]["content"] == {"response": "full"}
     errors = out[0]["metadata"]["provider_errors"]
     assert "truncated" in errors[0]["message"]
+    # The limit was too low for this request; the model is fine and stays first for everyone else.
+    health = manager.get_model_health("openai", "small")
+    assert not (health or {}).get("in_cooldown")
+    models = [{"provider": "openai", "model": "small"}, {"provider": "groq", "model": "big"}]
+    assert [m["model"] for m in manager.order_models_for_availability(models)] == ["small", "big"]
 
 
 # --- Context window ----------------------------------------------------------------

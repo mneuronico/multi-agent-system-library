@@ -1051,6 +1051,37 @@ def test_remove_fails_loudly_and_keeps_secrets_when_the_stack_is_not_deleted(wor
     assert ("alpha-stack/abc.zip", "null") in s3.buckets["shared-deploy"]
 
 
+def test_remove_waits_for_the_stack_by_default(workspace_tmp_path, monkeypatch):
+    code, cf, _, ssm = _remove(workspace_tmp_path, monkeypatch)
+
+    assert code == 0
+    assert ("wait", "alpha-stack") in cf.calls
+    assert ssm.deleted == ["/alpha/prod/env"]
+
+
+def test_remove_without_waiting_keeps_secrets_and_artifacts(workspace_tmp_path, monkeypatch, capsys):
+    # The stack deletion can still fail after this returns; its function must keep its secrets.
+    code, cf, s3, ssm = _remove(workspace_tmp_path, monkeypatch, wait=False)
+
+    assert code == 0
+    assert ("wait", "alpha-stack") not in cf.calls
+    assert ssm.deleted == []
+    assert ("alpha-stack/abc.zip", "null") in s3.buckets["shared-deploy"]
+    out = capsys.readouterr().out
+    assert "aws ssm delete-parameter --name /alpha/prod/env --region sa-east-1" in out
+    assert "aws s3 rm s3://shared-deploy/alpha-stack/ --recursive" in out
+
+
+def test_remove_cli_waits_unless_told_not_to(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "_remove", lambda **kwargs: calls.append(kwargs["wait"]) or 0)
+
+    cli.main(["remove", "--yes"])
+    cli.main(["remove", "--yes", "--no-wait"])
+
+    assert calls == [True, False]
+
+
 def test_remove_does_not_empty_a_history_bucket_outside_the_stack(workspace_tmp_path, monkeypatch, capsys):
     code, _, s3, _ = _remove(workspace_tmp_path, monkeypatch, cf=_RemoveCloudFormation(buckets=()))
 

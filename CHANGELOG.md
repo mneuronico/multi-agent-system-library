@@ -22,6 +22,7 @@ The first deploy also changes the stack:
 - Logs go to a new log group, `/aws/lambda/<stack>-maws`, kept 30 days (`infra.log_retention_days`, `0` keeps them forever). The old `/aws/lambda/<function>` group keeps the older logs with no retention; delete it or set a retention in CloudWatch.
 - `drop` mode gets a `<stack>-async-failures` SQS queue, and `fifo` mode gets a worker dead-letter queue (`<stack>-worker-dlq.fifo`, 3 receives). Both are on by default; see `failure_handling` in `maws/README.md`.
 - The self-invoke IAM permission is scoped to the function itself. S3 lifecycle rules only expire `history/`, the files prefix and `failed-events/`.
+- With `persist_files_s3`, the function gets `s3:DeleteObject` on the files prefix: files deleted during a job (for example by `/clear`) are deleted from S3 too, instead of being downloaded again by the next job.
 
 #### WhatsApp bots run with `start_whatsapp_bot`
 
@@ -40,11 +41,11 @@ The first deploy also changes the stack:
 - **A `while` step with only `condition` now runs while the condition is true**, checked before every iteration. Before, `condition` was used as both `start_condition` (run the first iteration only if it is true) and `end_condition` (stop after any iteration in which it is true). If you meant "repeat until X", write `end_condition: X`.
 - **`while` stops after `max_iterations` (default `100`) and raises.** Set `"max_iterations": null` to remove the limit.
 - **An automation step naming a component that does not exist is an error.** Systems loaded from JSON fail when they load; automations created in Python fail when the step runs. Before, the step was skipped.
-- **A response cut off by the token limit counts as a failed model attempt**, and MAS tries the next model. Before, the incomplete JSON was repaired silently. Raise `max_tokens` if the logs say "Response truncated".
+- **A response cut off by the token limit counts as a failed model attempt**, and MAS tries the next model. Before, the incomplete JSON was repaired silently. Raise `max_tokens` if the logs say "Response truncated". It does not count against the model's health, so the model is not put in cooldown for other requests.
 - **OpenAI receives `max_tokens` as `max_completion_tokens`.** Other `model_params` keys are not sent to any provider, and a warning names them once.
 - **Tool parameters annotated `str` receive the text verbatim**, and empty strings stay empty strings. `"true"`, `"false"`, `"null"` and `"none"` are still converted for other parameters.
 - **`file:` references are only read from inside `files_folder`.** A file copied in from a `.pkl` path is stored as `.bin` and loads as bytes; only objects pickled by MAS itself are unpickled.
-- **Clearing history deletes files.** `clear_message_history(user)` also deletes that user's files, including TTS audio, now saved under `files/<user>/tts/`. `clear_global_history()` deletes the whole files folder.
+- **Clearing history deletes files.** `clear_message_history(user)` also deletes that user's files, including TTS audio, now saved under `files/<user>/tts/`. `clear_global_history()` deletes the folder of every user whose history it clears, and leaves anything else in `files_folder`. `reset_system()` no longer deletes a history, files or logs folder that is the project directory, one of its parents or a filesystem root.
 - **`get_cost_report()` raises** when the manager was created without `usage_logging=True`.
 - **`add_message()` returns the new message number.**
 - **`run()` without `component_name` prefers your own system's latest automation.** Imported automations are only used when you have none, and the default linear automation leaves out imported components.
@@ -86,14 +87,15 @@ Behaviour changes for Telegram and WhatsApp:
 - The dashboard checks the `Host` header (DNS rebinding) and requires a token off loopback.
 - `markdown_to_pdf` shows raw HTML as text and renders without JavaScript or local file access.
 - API keys are scrubbed from standard-library errors. Webhook secrets and tokens are redacted from maws failed-event captures.
-- `maws remove` checks that the stack exists in the chosen region before emptying buckets. It deletes the SSM parameter, and deletes the deployment bucket only when nothing else is in it.
+- `maws remove` checks that the stack exists in the chosen region before emptying buckets. It waits for the stack to be deleted before deleting the SSM parameter and the deployment artifacts (`--no-wait` keeps them and prints the commands), and deletes the deployment bucket only when nothing else is in it.
 - Deploy and history buckets owned by another AWS account are refused.
 
 ### Added
 
-- `max_context_messages`, for the manager and per agent: the most history messages an agent reads. The default `None` keeps the whole history, so cost grows with every message unless you set it.
+- `max_context_messages`, for the manager and per agent: the most history messages an agent reads. The default `None` keeps the whole history, so cost grows with every message unless you set it. The trimmed conversation always starts with a user turn.
 - `while` conditions can call functions: `"fn:name"`, or `"fn:name:<input spec>"`, from JSON as documented.
 - Bots: `allowed_user_ids`, `media_dirs`, `max_media_bytes`, `dedup_ttl`, `send_queue_timeout`, `maintenance_timeout` and `error_msg`. `sender_id` and `message_id` are added to the metadata. Telegram groups accept `/command@YourBot`.
+- Bots: `/clear_all_users` and `/reset_system` wait for messages in progress (`maintenance_timeout`) and run one at a time. `WhatsappBot.create_flask_app()` builds the webhook app for your own WSGI server.
 - Bots split texts over 4096 characters and captions over 1024. Duplicate deliveries are ignored for an hour, and each user's replies are sent in order.
 - maws:
   - Drop mode waits up to `runtime.busy_wait_seconds` (default 30 s) for a busy user before dropping the update; `0` restores the immediate drop.

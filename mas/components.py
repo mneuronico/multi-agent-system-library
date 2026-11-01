@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from ._shared import *
 
+
+class ResponseTruncatedError(ValueError):
+    """A model response cut off by the output token limit (incomplete, so it is not used)."""
+
+
 class Component:
     def __init__(self, name: str):
         self.name = name 
@@ -546,6 +551,14 @@ class Agent(Component):
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
                 logger.warning(f"[Agent:{self.name}] JSON decoding error with provider={provider}, model={model_name}: {json_err}")
+            except ResponseTruncatedError as truncated:
+                # The next model is tried, but the model itself is healthy: the limit was too low for
+                # this request. Recording it as a model failure would put the model in cooldown and
+                # route every other user to the fallbacks.
+                failure_metadata = self._provider_exception_metadata(provider, model_name, truncated)
+                failure_metadata["truncated"] = True
+                provider_attempts.append(failure_metadata)
+                logger.warning(f"[Agent:{self.name}] Response truncated with provider={provider}, model={model_name}: {truncated}")
             except ValueError as val_err:
                 failure_metadata = self._provider_exception_metadata(provider, model_name, val_err)
                 provider_attempts.append(failure_metadata)
@@ -589,13 +602,26 @@ class Agent(Component):
         # Model output is untrusted data. The only blocks it may produce are variable blocks for
         # variables declared in general_parameters.variables. Anything else (component overrides
         # such as "agent:system_prompt" or "agent:base_url", image/document blocks pointing at
-        # local paths, unknown block types) is stored as plain text content.
-        candidates = parsed if isinstance(parsed, list) else [parsed]
-        if candidates and all(self._is_declared_variable_block(item) for item in candidates):
-            return self.manager._to_blocks(candidates, self.manager._active_user_id())
+        # local paths, unknown block types) is stored as plain text content. A JSON array gives one
+        # block per item, as it always did.
+        if isinstance(parsed, list):
+            blocks = self._model_output_item_blocks(parsed)
+            if blocks:
+                return blocks
+        elif self._is_declared_variable_block(parsed):
+            return self.manager._to_blocks([parsed], self.manager._active_user_id())
         if not isinstance(parsed, dict):
             parsed = {"response": parsed}
         return [{"type": "text", "content": parsed}]
+
+    def _model_output_item_blocks(self, item: Any) -> List[Dict[str, Any]]:
+        if isinstance(item, list):
+            return [block for sub_item in item for block in self._model_output_item_blocks(sub_item)]
+        if self._is_declared_variable_block(item):
+            return self.manager._to_blocks([item], self.manager._active_user_id())
+        if isinstance(item, dict):
+            return [{"type": "text", "content": item}]
+        return [{"type": "text", "content": str(item)}]
 
     def _is_declared_variable_block(self, value: Any) -> bool:
         if not (isinstance(value, dict) and value.get("type") == "variable" and "value" in value):
@@ -782,7 +808,7 @@ class Agent(Component):
         # A response cut by the token limit is incomplete JSON that the lenient parser would
         # "repair" into partial output. Fail the attempt instead so the next model is tried.
         if finish_reason == truncated_value:
-            raise ValueError(
+            raise ResponseTruncatedError(
                 f"Response truncated by the output token limit (finish reason '{finish_reason}'). "
                 "Raise model_params.max_tokens or shorten the required outputs."
             )
@@ -1233,6 +1259,13 @@ class Agent(Component):
         limit = self._runtime_max_context_messages()
         if limit:
             filtered_msgs = filtered_msgs[-int(limit):]
+            # The cut can land on this agent's own reply, which would make the conversation start
+            # with an assistant turn; providers such as Anthropic require a user turn first.
+            first_user_turn = next(
+                (i for i, msg in enumerate(filtered_msgs) if msg[0] != self.name), None
+            )
+            if first_user_turn:
+                filtered_msgs = filtered_msgs[first_user_turn:]
         conversation = self._transform_to_conversation(filtered_msgs)
         conversation = [{"role": "system", "content": self._runtime_system_prompt()}] + conversation
         return conversation

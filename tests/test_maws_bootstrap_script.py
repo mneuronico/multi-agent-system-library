@@ -406,6 +406,26 @@ def test_invalid_params_fail_before_any_aws_call(bootstrap, params, message):
 
 
 @pytest.mark.parametrize(
+    ("params", "statement"),
+    [
+        (_telegram(persist_files_s3=True), 'Resource: "arn:aws:s3:::demo-bot-history-bucket/files/*"'),
+        (_telegram(persist_files_s3=True, files_s3_prefix="/media/"), 'Resource: "arn:aws:s3:::demo-bot-history-bucket/media/*"'),
+        (_telegram(), None),
+    ],
+)
+def test_delete_permission_is_limited_to_persisted_user_files(bootstrap, params, statement):
+    code, out = bootstrap.run(params, TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    if statement is None:
+        assert "s3:DeleteObject" not in template
+    else:
+        block = template[template.index('Action: [ "s3:DeleteObject" ]'):]
+        assert block.splitlines()[1].strip() == statement
+
+
+@pytest.mark.parametrize(
     ("runtime", "expected"),
     [
         ({}, None),  # the runtime default (8 days) applies

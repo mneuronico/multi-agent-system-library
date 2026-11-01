@@ -403,6 +403,9 @@ class _FakeCloudFormation:
     def delete_stack(self, StackName):
         self.deleted.append(StackName)
 
+    def get_waiter(self, name):
+        return types.SimpleNamespace(wait=lambda StackName: None)
+
 
 class _FakeBucketS3:
     def __init__(self):

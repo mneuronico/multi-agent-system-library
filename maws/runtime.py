@@ -36,6 +36,7 @@ except ImportError:
 
 # MAS
 from mas import AgentSystemManager, TelegramBot, WhatsappBot
+from mas._shared import safe_path_component
 
 
 # Warnings go through `logging` so they carry level WARNING in Lambda's JSON logs.
@@ -102,17 +103,8 @@ def _json_env(name: str, default):
     return value
 
 
-def _safe_key_part(value: str) -> str:
-    raw = str(value)
-    if (
-        raw
-        and raw not in {".", ".."}
-        and ".." not in raw
-        and re.fullmatch(r"[A-Za-z0-9_.-]+", raw)
-    ):
-        return raw
-    encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
-    return f"u_{encoded or 'empty'}"
+# The same naming as the manager's history and files folders: maws syncs the folders the manager writes.
+_safe_key_part = safe_path_component
 
 
 def _require_boto3():
@@ -784,21 +776,34 @@ class MawsRuntime:
             self.s3.download_file(self.bucket_name, key, str(dst))
             print(f"[maws] s3://{self.bucket_name}/{key} -> {dst}")
 
-    def _sync_user_files_to_s3(self, chat_id: str):
+    def _sync_user_files_to_s3(self, chat_id: str, mirror_deletions: bool = False):
+        """
+        Upload the user's local files. With ``mirror_deletions`` (the job started from a complete
+        copy of the S3 files), files that were deleted during the job, for example by clearing the
+        history, are deleted from S3 too; otherwise the next job would download them again.
+        """
         if not getattr(self, "persist_files_s3", False):
             return
         local_dir = self._local_user_files_dir(chat_id)
-        if not local_dir.exists():
-            return
         prefix = self._files_s3_prefix_for(chat_id)
-        for path in local_dir.rglob("*"):
-            if not path.is_file():
+        uploaded = set()
+        if local_dir.exists():
+            for path in local_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(local_dir).as_posix()
+                key = f"{prefix}/{rel}"
+                with open(path, "rb") as fp:
+                    self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=fp.read())
+                uploaded.add(key)
+                print(f"[maws] uploaded {path} -> s3://{self.bucket_name}/{key}")
+        if not mirror_deletions:
+            return
+        for key in self._iter_s3_keys(prefix + "/"):
+            if key.endswith("/") or key in uploaded:
                 continue
-            rel = path.relative_to(local_dir).as_posix()
-            key = f"{prefix}/{rel}"
-            with open(path, "rb") as fp:
-                self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=fp.read())
-            print(f"[maws] uploaded {path} -> s3://{self.bucket_name}/{key}")
+            self.s3.delete_object(Bucket=self.bucket_name, Key=key)
+            print(f"[maws] deleted s3://{self.bucket_name}/{key} (no longer in the user's files)")
 
     def _known_secret_values(self) -> List[str]:
         values = set(_LOADED_SECRET_VALUES)
@@ -1857,6 +1862,9 @@ class MawsRuntime:
         event_id = str(job.get("event_id") or "")
         start = time.time()
         imported_history = False
+        # Deletions are mirrored to S3 only when this job started from a full copy of the user's
+        # S3 files: after a failed download, a missing local file does not mean it was deleted.
+        files_synced = False
         result = {"statusCode": 200, "body": json.dumps("Processed.")}
         s3_key = self.s3_sqlite_key(chat_id)
         local_db = os.path.join(getattr(self, "TMP_DIR", "/tmp"), "history", f"{_safe_key_part(chat_id)}.sqlite")
@@ -1871,6 +1879,7 @@ class MawsRuntime:
             imported_history = True
 
             self._sync_user_files_from_s3(chat_id)
+            files_synced = True
             self.manager.set_current_user(chat_id)
 
             if is_history_append:
@@ -1906,7 +1915,7 @@ class MawsRuntime:
                             sqlite_bytes = self.manager.export_history(chat_id)
                             if sqlite_bytes:
                                 self.s3.put_object(Bucket=self.bucket_name, Key=s3_key, Body=sqlite_bytes)
-                        self._sync_user_files_to_s3(chat_id)
+                        self._sync_user_files_to_s3(chat_id, mirror_deletions=files_synced)
                     except Exception as e:
                         print(f"[maws][save][ERR] {e}")
                         self._capture_failed_event(job, "worker_save_failed", e)

@@ -239,6 +239,10 @@ class Bot(abc.ABC):
         self._activity_guard = threading.Lock()
         self._active_turns = 0
         self._maintenance_requests = 0
+        # Turns that are themselves running a maintenance command, and whether one is executing:
+        # maintenance commands run one at a time and never count as work the others wait for.
+        self._maintenance_turns = 0
+        self._maintenance_running = False
 
     # ------------------------------------------------------------------
     # Users, admins and allow lists
@@ -527,19 +531,7 @@ class Bot(abc.ABC):
         return roots
 
     def _is_allowed_media_path(self, path: str) -> bool:
-        try:
-            target = os.path.normcase(os.path.realpath(path))
-        except (TypeError, ValueError, OSError):
-            return False
-        for root in self._media_roots():
-            try:
-                real_root = os.path.normcase(os.path.realpath(root))
-                if target != real_root and os.path.commonpath([real_root, target]) == real_root:
-                    return True
-            except (TypeError, ValueError, OSError):
-                # For example a root on another Windows drive.
-                continue
-        return False
+        return any(is_path_inside(root, path) for root in self._media_roots())
 
     def _local_path(self, media: Any) -> Optional[str]:
         """Return the local file ``media`` points to, or None for URLs and platform ids.
@@ -828,32 +820,43 @@ class Bot(abc.ABC):
     async def _run_maintenance(self, operation: Callable[[], Any]) -> Tuple[bool, Any]:
         """Run ``operation`` once no other user's message is in flight.
 
-        New messages are held from the moment this is called until it returns. Returns
-        ``(True, result)``, or ``(False, number_still_running)`` when ``maintenance_timeout``
-        passes first, in which case ``operation`` is not run.
+        New messages are held from the moment this is called until it returns. Maintenance
+        commands run one at a time. Returns ``(True, result)``, or ``(False, number_still_running)``
+        when ``maintenance_timeout`` passes first, in which case ``operation`` is not run (0 means
+        another maintenance command was still running).
         """
+        own_turn = 1 if _ACTIVE_TURN.get() is self else 0
         with self._activity_guard:
             self._maintenance_requests += 1
+            self._maintenance_turns += own_turn
         try:
-            own_turn = 1 if _ACTIVE_TURN.get() is self else 0
             timeout = self.maintenance_timeout
             deadline = None if timeout is None else _time.monotonic() + timeout
             while True:
                 with self._activity_guard:
-                    others = self._active_turns - own_turn
-                if others <= 0:
-                    break
+                    # A turn running another maintenance command only waits here; counting it
+                    # would make two admin commands wait for each other until both time out.
+                    others = self._active_turns - self._maintenance_turns
+                    if others <= 0 and not self._maintenance_running:
+                        self._maintenance_running = True
+                        break
                 if deadline is not None and _time.monotonic() >= deadline:
                     self.logger.warning(
                         "[Bot] Admin maintenance command gave up after %s s: %d message(s) from "
-                        "other users were still being processed.", timeout, others,
+                        "other users were still being processed%s.", timeout, max(others, 0),
+                        "" if others > 0 else " (another maintenance command was running)",
                     )
-                    return False, others
+                    return False, max(others, 0)
                 await asyncio.sleep(self._ACTIVITY_POLL_SECONDS)
-            return True, await asyncio.to_thread(operation)
+            try:
+                return True, await asyncio.to_thread(operation)
+            finally:
+                with self._activity_guard:
+                    self._maintenance_running = False
         finally:
             with self._activity_guard:
                 self._maintenance_requests -= 1
+                self._maintenance_turns -= own_turn
 
     def _enqueue_send(
         self,
@@ -1226,6 +1229,11 @@ class Bot(abc.ABC):
         manager.clear_message_history(user_id)
 
     def _maintenance_timeout_text(self, still_running: int, outcome: str) -> str:
+        if not still_running:
+            return (
+                f"Timed out after {self.maintenance_timeout:g} s waiting for another admin command "
+                f"to finish. {outcome}; please try again."
+            )
         return (
             f"Timed out after {self.maintenance_timeout:g} s waiting for {still_running} message(s) "
             f"from other users to finish. {outcome}; please try again."
@@ -1803,6 +1811,7 @@ class WhatsappBot(Bot):
         self.headers_json = {"Authorization": f"Bearer {self.whatsapp_token}", "Content-Type": "application/json"}
         self.headers_auth = {"Authorization": f"Bearer {self.whatsapp_token}"}
         self.persistent_loop = None
+        self._persistent_loop_guard = threading.Lock()
 
         if self.verbose:
             self.logger.info("[WhatsappBot] Instance of WhatsappBot created and configured.")
@@ -2209,22 +2218,33 @@ class WhatsappBot(Bot):
                     return "Forbidden", 403
                 data = request.get_json(force=True, silent=True) or {}
                 asyncio.run_coroutine_threadsafe(
-                    self.process_webhook_update(data), self.persistent_loop
+                    self.process_webhook_update(data), self._ensure_event_loop()
                 )
                 return "OK", 200
         return app
 
+    def _ensure_event_loop(self) -> asyncio.AbstractEventLoop:
+        """The background event loop that processes webhook updates, started on first use.
+
+        Flask (run_server, or an app from create_flask_app served by any WSGI server) handles
+        requests in its own threads and hands each update to this loop.
+        """
+        with self._persistent_loop_guard:
+            loop = self.persistent_loop
+            if loop is None or loop.is_closed():
+                loop = asyncio.new_event_loop()
+
+                def run_asyncio_loop():
+                    asyncio.set_event_loop(loop)
+                    loop.run_forever()
+
+                threading.Thread(target=run_asyncio_loop, daemon=True, name="mas-whatsapp-loop").start()
+                self.persistent_loop = loop
+            return loop
+
     def run_server(self, host: str = "0.0.0.0", port: int = 5000, base_path: str = "/webhook"):
         app = self.create_flask_app(base_path)
-
-        self.persistent_loop = asyncio.new_event_loop()
-
-        def run_asyncio_loop():
-            asyncio.set_event_loop(self.persistent_loop)
-            self.persistent_loop.run_forever()
-
-        loop_thread = threading.Thread(target=run_asyncio_loop, daemon=True)
-        loop_thread.start()
+        self._ensure_event_loop()
 
         if self.verbose: self.logger.info(f"[WhatsappBot] Flask server running at http://{host}:{port}{base_path}")
         try:

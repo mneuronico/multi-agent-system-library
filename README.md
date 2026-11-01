@@ -621,7 +621,7 @@ Here are the primary block types the system uses:
 
     Component parameters can be overridden with variable keys shaped like `component_name:parameter_name`. For example, `{"type":"variable","key":"assistant:temperature","value":0}` updates the agent's model params for subsequent runs, and `assistant:provider` / `assistant:model` can redirect the model used by that component. Python code can read or write these values with `manager.get_variable(key, user_id=None)` and `manager.set_variable(key, value, user_id=None)`.
 
-    An agent's output is model-generated, so it is treated as data. An agent may emit variable blocks only for variables declared in `general_parameters.variables` (for example, a router agent setting `mode`). Component parameter overrides (`component:parameter`) and any other block shape returned by a model (images or documents with local paths, unknown block types) are stored as plain text content, so a prompt injection cannot rewrite a component's prompt, models or `base_url`. Set those overrides from Python, tools or processes.
+    An agent's output is model-generated, so it is treated as data. An agent may emit variable blocks only for variables declared in `general_parameters.variables` (for example, a router agent setting `mode`). Component parameter overrides (`component:parameter`) and any other block shape returned by a model (images or documents with local paths, unknown block types) are stored as plain text content, so a prompt injection cannot rewrite a component's prompt, models or `base_url`. Set those overrides from Python, tools or processes. A JSON array returned by a model becomes one block per item (objects as text blocks with that object as content).
 
 #### Automatic Conversion to Blocks (`_to_blocks`)
 
@@ -873,8 +873,8 @@ agent_name = manager.create_agent(
     -   `process`: selects messages from all roles from the process type.
     -   Exact role names (e.g., `myagent`)
 -   **`include_timestamp`**:  Whether this agent should receive `timestamp` information for each message. Defaults to whatever was defined for the manager if not specified, which itself defaults to False.
--   **`model_params`**: Dictionary including params for advanced LLM configuration. Supported params right now are `temperature`, `max_tokens` and `top_p` (plus `base_url` for `nvidia`). Not defining these will use default configuration for each provider. `max_tokens` is sent to OpenAI as `max_completion_tokens`, which reasoning models such as `gpt-5` require. Any other key is not sent to the provider, and MAS logs a warning naming it. A response cut off by the token limit counts as a failed attempt (MAS tries the next model instead of repairing incomplete JSON); raise `max_tokens` if you see "Response truncated" in the logs.
--   **`max_context_messages`**: Maximum number of history messages (after filters) this agent reads when no explicit input selection is given. Defaults to the manager's `max_context_messages`, which defaults to `None` (the whole history). Without a limit every call sends the full conversation, so cost and latency grow with each message; set a limit for long-running conversations.
+-   **`model_params`**: Dictionary including params for advanced LLM configuration. Supported params right now are `temperature`, `max_tokens` and `top_p` (plus `base_url` for `nvidia`). Not defining these will use default configuration for each provider. `max_tokens` is sent to OpenAI as `max_completion_tokens`, which reasoning models such as `gpt-5` require. Any other key is not sent to the provider, and MAS logs a warning naming it. A response cut off by the token limit counts as a failed attempt (MAS tries the next model instead of repairing incomplete JSON); raise `max_tokens` if you see "Response truncated" in the logs. A truncated response does not count against the model's health, so it does not put the model in cooldown for other requests.
+-   **`max_context_messages`**: Maximum number of history messages (after filters) this agent reads when no explicit input selection is given. Defaults to the manager's `max_context_messages`, which defaults to `None` (the whole history). Without a limit every call sends the full conversation, so cost and latency grow with each message; set a limit for long-running conversations. When the cut would leave this agent's own reply first, that reply is left out too, so the conversation sent to the model starts with a user turn (some providers, such as Anthropic, require it).
 -   **`description`**: Optional description of the component, solely to be read by the developer.
 
 
@@ -1668,7 +1668,7 @@ If you need to clear the message history for a user, the `manager` offers a simp
 manager.clear_message_history(user_id) # if not provided, it will use the current user_id
 ```
 
-Clearing a user's history also deletes the files stored for that user (`files/<user>/`, including generated TTS audio), since nothing references them anymore. `clear_global_history()` does the same for every user.
+Clearing a user's history also deletes the files stored for that user (`files/<user>/`, including generated TTS audio), since nothing references them anymore. `clear_global_history()` does the same for every user whose history it clears; anything else in `files_folder` is left alone. `reset_system()` wipes the history, files and logs folders, but never one that is the project directory (for example `files_folder: "."`), one of its parents or a filesystem root: it logs an error and keeps that folder.
 
 ### Adding Messages: `add_message`
 
@@ -2471,7 +2471,7 @@ Admin-only commands are registered when `manager.admin_user_id` is set. Only the
 - `/reset_system`: deletes histories, saved files, and logs.
 - `/logs`: sends `usage.log` and `summary.log` when usage logging is enabled.
 
-`/clear_all_users` and `/reset_system` close the history databases and delete folders, so they do not run while other users' messages are being processed. From the moment the admin sends one, new messages from other users wait; the command then waits up to `maintenance_timeout` seconds (default 60) for the messages already in progress to finish, runs, and lets the waiting messages continue. If messages are still in progress when the timeout passes, nothing is cleared or deleted and the admin is told how many messages were still running, so they can try again. Only messages handled by the same bot object are waited for: if other code (another bot, a web server) uses the same manager, stop it first. Custom commands do not get this protection.
+`/clear_all_users` and `/reset_system` close the history databases and delete folders, so they do not run while other users' messages are being processed. From the moment the admin sends one, new messages from other users wait; the command then waits up to `maintenance_timeout` seconds (default 60) for the messages already in progress to finish, runs, and lets the waiting messages continue. If messages are still in progress when the timeout passes, nothing is cleared or deleted and the admin is told how many messages were still running, so they can try again. Only messages handled by the same bot object are waited for: if other code (another bot, a web server) uses the same manager, stop it first. These commands run one at a time: a second one (for example the admin in a group and in a private chat) waits for the first instead of counting it as a message in progress. Custom commands do not get this protection.
 
 Unknown commands get `unknown_command_msg` on both platforms (pass `None` to stay silent). In Telegram groups, `/command@YourBotName` is accepted and commands for other bots are ignored (see [Telegram Groups](#telegram-groups)).
 
@@ -3100,7 +3100,7 @@ On AWS, the stack includes:
 * Loads secrets from **SSM** (`ENV_PARAMETER_NAME`) into `os.environ` on cold start.
 * Optionally **syncs “token files”** (API tokens, etc.) from **S3** into `/tmp` and exposes their paths via env vars.
 * Verifies Telegram POSTs with `X-Telegram-Bot-Api-Secret-Token` and WhatsApp POSTs with `X-Hub-Signature-256` (mandatory unless `webhook_security.allow_unauthenticated` is set).
-* Optionally syncs user media/files to S3 when `persist_files_s3=true`.
+* Optionally syncs user media/files to S3 when `persist_files_s3=true`; files deleted during a job (for example by `/clear`) are deleted from S3 too.
 * On each webhook:
 
   1. Normalizes provider payloads into one job per processable message.
@@ -3241,16 +3241,16 @@ maws remove \
   [--region <region>] \
   [-y|--yes] \
   [--keep-deploy-bucket] \
-  [--wait] \
+  [--no-wait] \
   [-c|--config params.json] \
   [--dir <path>]
 ```
 
 * First checks (read-only) that the stack exists in the chosen region; otherwise nothing is deleted and it exits with `1` (bucket names are global, so emptying them for a stack in another region would destroy a live deployment's data).
 * Empties the **history bucket** (only if it is a resource of that stack) and deletes the **CloudFormation stack**.
-* Deletes the **SSM SecureString** that holds your `.env.prod` secrets (listed in the deletion plan).
-* Deletes this stack's deployment artifacts (`s3://<deployment_bucket>/<stack>/`) and the **deployment bucket** only if nothing else is left in it, since it may be shared (`--keep-deploy-bucket` keeps the artifacts).
-* `--wait` blocks until the stack is fully deleted. If `delete-stack` or the wait fails, the SSM parameter and artifacts are kept, the error is printed and the exit code is `1`; any failed step makes it exit `1` without printing `[OK] Done`.
+* Waits until the stack is fully deleted, then deletes the **SSM SecureString** that holds your `.env.prod` secrets (listed in the deletion plan) and this stack's deployment artifacts (`s3://<deployment_bucket>/<stack>/`), and the **deployment bucket** only if nothing else is left in it, since it may be shared (`--keep-deploy-bucket` keeps the artifacts).
+* If `delete-stack` or the wait fails, the SSM parameter and artifacts are kept (the stack's function still needs its secrets), the error is printed and the exit code is `1`; any failed step makes it exit `1` without printing `[OK] Done`.
+* `--no-wait` only starts the stack deletion and keeps the SSM parameter and artifacts; it prints the `aws` commands to delete them once the stack is gone. (`--wait` is accepted and is the default.)
 * Stack and bucket names come from `params.json` only when it belongs to the project being removed. If `--project` names a different project than `params.json`, its names are ignored and the defaults (`<project>-stack`, `<project>-history-bucket`, `<project>-deployment-bucket`) are used; the deletion plan says so. The region still falls back to `params.json`, so pass `--region` when the other project lives elsewhere.
 
 ---

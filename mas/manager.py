@@ -11,11 +11,23 @@ import math
 
 def _scoped_to_user_id(method):
     # Public methods that take a user_id act on that user for the call only (see _user_scope).
-    signature = inspect.signature(method)
+    parameters = list(inspect.signature(method).parameters.values())
+    user_param = next(p for p in parameters if p.name == "user_id")
+    # Position of user_id among the arguments after self, when it can be passed positionally.
+    position = (
+        parameters.index(user_param) - 1
+        if user_param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        else None
+    )
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        user_id = signature.bind(self, *args, **kwargs).arguments.get("user_id")
+        if "user_id" in kwargs:
+            user_id = kwargs["user_id"]
+        elif position is not None and len(args) > position:
+            user_id = args[position]
+        else:
+            user_id = None
         with self._user_scope(user_id):
             return method(self, *args, **kwargs)
 
@@ -37,7 +49,10 @@ class _BoundedFileCache(collections.OrderedDict):
     def __setitem__(self, key, value):
         size = len(value) if isinstance(value, (bytes, bytearray)) else 0
         if size > self.max_bytes // 4:
-            return  # too big to be worth keeping in memory; it is read from disk when needed
+            # Too big to keep in memory (it is read from disk when needed); drop any older value
+            # cached under this key so it is not served instead.
+            self.pop(key, None)
+            return
         with self._lock:
             if key in self:
                 super().__delitem__(key)
@@ -1809,16 +1824,7 @@ class AgentSystemManager:
         return os.path.join(self.history_folder, f"{self._safe_user_id(user_id)}.sqlite")
 
     def _safe_user_id(self, user_id: Any) -> str:
-        raw = str(user_id)
-        if (
-            raw
-            and raw not in {".", ".."}
-            and ".." not in raw
-            and re.fullmatch(r"[A-Za-z0-9_.-]+", raw)
-        ):
-            return raw
-        encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
-        return f"u_{encoded or 'empty'}"
+        return safe_path_component(user_id)
 
     def _ensure_user_db(self, user_id: str) -> sqlite3.Connection:
         if self._history_mode_is_shared():
@@ -2123,12 +2129,13 @@ class AgentSystemManager:
                 for db_path in self._list_shared_history_db_paths():
                     conn, should_close = self._open_history_db_for_read(db_path)
                     try:
-                        cur = conn.cursor()
-                        cur.execute(
-                            "SELECT MAX(timestamp) FROM message_history WHERE user_id = ?",
-                            (str(uid),),
-                        )
-                        row_timestamp = cur.fetchone()[0]
+                        with self._conn_lock(conn):
+                            cur = conn.cursor()
+                            cur.execute(
+                                "SELECT MAX(timestamp) FROM message_history WHERE user_id = ?",
+                                (str(uid),),
+                            )
+                            row_timestamp = cur.fetchone()[0]
                         if row_timestamp and (latest_timestamp is None or row_timestamp > latest_timestamp):
                             latest_timestamp = row_timestamp
                     finally:
@@ -2136,9 +2143,10 @@ class AgentSystemManager:
                             conn.close()
         else:
             db_conn = self._get_user_db()
-            cur = db_conn.cursor()
-            cur.execute("SELECT MAX(timestamp) FROM message_history")
-            latest_timestamp = cur.fetchone()[0]
+            with self._conn_lock(db_conn):
+                cur = db_conn.cursor()
+                cur.execute("SELECT MAX(timestamp) FROM message_history")
+                latest_timestamp = cur.fetchone()[0]
 
         if latest_timestamp != self._last_known_update:
             self._last_known_update = latest_timestamp
@@ -2431,12 +2439,7 @@ class AgentSystemManager:
         return value
 
     def _is_managed_file_path(self, file_path: str) -> bool:
-        try:
-            root = os.path.normcase(os.path.realpath(self.files_folder))
-            target = os.path.normcase(os.path.realpath(file_path))
-            return target != root and os.path.commonpath([root, target]) == root
-        except (TypeError, ValueError, OSError):
-            return False
+        return is_path_inside(self.files_folder, file_path)
 
     def _load_file(self, file_path: str) -> Any:
         if not self._is_managed_file_path(file_path):
@@ -4011,24 +4014,26 @@ class AgentSystemManager:
             with self._shared_history_lock:
                 for db_path in self._list_shared_history_db_paths():
                     conn = self._connect_history_db(db_path, self._shared_history_db_key(db_path))
-                    cur = conn.cursor()
-                    cur.execute("DELETE FROM message_history WHERE user_id = ?", (uid,))
-                    cur.execute("SELECT COUNT(*) FROM message_history")
-                    remaining = int(cur.fetchone()[0] or 0)
-                    if remaining == 0:
-                        cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
-                        cur.execute(
-                            "INSERT OR REPLACE INTO history_metadata (key, value) VALUES ('created_at', ?)",
-                            (self._history_now_iso(),),
-                        )
-                    conn.commit()
+                    with self._conn_lock(conn):
+                        cur = conn.cursor()
+                        cur.execute("DELETE FROM message_history WHERE user_id = ?", (uid,))
+                        cur.execute("SELECT COUNT(*) FROM message_history")
+                        remaining = int(cur.fetchone()[0] or 0)
+                        if remaining == 0:
+                            cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
+                            cur.execute(
+                                "INSERT OR REPLACE INTO history_metadata (key, value) VALUES ('created_at', ?)",
+                                (self._history_now_iso(),),
+                            )
+                        conn.commit()
             self._delete_user_files(uid)
             return
 
         conn = self._get_user_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM message_history")
-        conn.commit()
+        with self._conn_lock(conn):
+            cur = conn.cursor()
+            cur.execute("DELETE FROM message_history")
+            conn.commit()
         self._delete_user_files(self._uid())
 
     def _delete_user_files(self, user_id: str) -> None:
@@ -4045,6 +4050,7 @@ class AgentSystemManager:
         os.makedirs(self.history_folder, exist_ok=True)
 
         cleared = 0
+        cleared_users = set()
         for fname in os.listdir(self.history_folder):
             if not fname.endswith(".sqlite"):
                 continue
@@ -4053,6 +4059,11 @@ class AgentSystemManager:
                 conn = sqlite3.connect(db_path, check_same_thread=False)
                 cur = conn.cursor()
                 self._migrate_history_schema(conn)
+                if self._shared_history_sequence(db_path) is not None:
+                    cur.execute("SELECT DISTINCT user_id FROM message_history")
+                    cleared_users.update(str(row[0]) for row in cur.fetchall() if row[0])
+                else:
+                    cleared_users.add(fname[: -len(".sqlite")])
                 cur.execute("DELETE FROM message_history")
                 cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
                 cur.execute(
@@ -4065,27 +4076,45 @@ class AgentSystemManager:
             except Exception:
                 logger.exception(f"Error clearing history for DB: {db_path}")
 
-        # Every user's history is gone, so are the files it referenced.
-        shutil.rmtree(self.files_folder, ignore_errors=True)
-        os.makedirs(self.files_folder, exist_ok=True)
-        self._file_cache = _BoundedFileCache()
+        # The files those histories referenced go too: only each cleared user's own folder, never
+        # the whole files_folder, which may be shared with other content (or be the project itself).
+        for user_id in cleared_users:
+            self._delete_user_files(user_id)
         return cleared
+
+    def _is_wipeable_folder(self, path: str) -> bool:
+        # A folder setting such as "." or ".." must never make a reset delete the project itself
+        # (or a filesystem root).
+        try:
+            target = os.path.normcase(os.path.realpath(path))
+            base = os.path.normcase(os.path.realpath(self.base_directory))
+        except (TypeError, ValueError, OSError):
+            return False
+        if os.path.dirname(target) == target:
+            return False
+        try:
+            return os.path.commonpath([target, base]) != target
+        except ValueError:
+            return True  # on another drive, so not the project or one of its parents
+
+    def _wipe_folder(self, path: str, label: str) -> None:
+        if not self._is_wipeable_folder(path):
+            logger.error(
+                f"[Manager] Not deleting the {label} folder {path}: it is the project directory, one of "
+                "its parents or a filesystem root. Point it at a dedicated folder."
+            )
+            return
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            logger.exception(f"Failed to remove {label} folder.")
 
     def reset_system(self) -> None:
         self._close_all_db_conns()
-        try:
-            shutil.rmtree(self.history_folder, ignore_errors=True)
-        except Exception:
-            logger.exception("Failed to remove history folder.")
-        try:
-            shutil.rmtree(self.files_folder, ignore_errors=True)
-        except Exception:
-            logger.exception("Failed to remove files folder.")
-        try:
-            if hasattr(self, "logs_folder") and self.logs_folder:
-                shutil.rmtree(self.logs_folder, ignore_errors=True)
-        except Exception:
-            logger.exception("Failed to remove logs folder.")
+        self._wipe_folder(self.history_folder, "history")
+        self._wipe_folder(self.files_folder, "files")
+        if hasattr(self, "logs_folder") and self.logs_folder:
+            self._wipe_folder(self.logs_folder, "logs")
 
         os.makedirs(self.history_folder, exist_ok=True)
         os.makedirs(self.files_folder, exist_ok=True)

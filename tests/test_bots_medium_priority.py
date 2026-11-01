@@ -1138,3 +1138,43 @@ def test_whatsapp_api_version_default_parameter_and_key():
 
     with pytest.raises(ValueError, match="Graph API version"):
         _whatsapp_bot(api_version="latest")
+
+
+def test_two_admin_commands_at_once_both_run_one_after_the_other():
+    # The admin in a private chat and in a group are two turns; each used to count the other as
+    # work in progress, so both waited until maintenance_timeout and gave up.
+    manager = _Manager(admin_user_id="admin")
+    bot = _RecordingBot(manager, maintenance_timeout=2)
+
+    async def scenario():
+        await asyncio.gather(
+            bot.process_payload(_msg("admin", "/reset_system")),
+            bot.process_payload(_msg("-100", "/clear_all_users", sender_id="admin")),
+        )
+
+    asyncio.run(scenario())
+
+    assert ("reset",) in manager.events and ("clear_all",) in manager.events
+    assert not any("Timed out" in text for _, text in bot.sent)
+    _assert_idle(bot)
+    assert bot._maintenance_turns == 0 and bot._maintenance_running is False
+
+
+def test_a_flask_app_from_create_flask_app_processes_posts_without_run_server(monkeypatch):
+    flask = pytest.importorskip("flask")
+    if getattr(flask, "__file__", None) is None:
+        pytest.skip("Flask is not installed (stubbed in conftest)")
+    bot = _whatsapp_bot(verify_signature=False)
+    processed = threading.Event()
+
+    async def fake_process(data):
+        processed.set()
+
+    monkeypatch.setattr(bot, "process_webhook_update", fake_process)
+    client = bot.create_flask_app("/hook").test_client()
+
+    response = client.post("/hook", json={"entry": []})
+
+    assert response.status_code == 200
+    assert processed.wait(5)
+    bot.persistent_loop.call_soon_threadsafe(bot.persistent_loop.stop)

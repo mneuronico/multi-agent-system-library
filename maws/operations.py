@@ -1095,16 +1095,18 @@ def remove_project(
     keep_deploy_bucket: bool = False,
     config_path: Optional[Union[str, Path]] = None,
     project_dir: Optional[Union[str, Path]] = None,
-    wait: bool = False,
+    wait: bool = True,
 ) -> int:
     """
     Delete AWS resources for the project:
       - Check (read-only) that the stack exists in the region; otherwise delete nothing
       - Empty the history bucket when it is a resource of that stack
       - Remove the CloudFormation stack (API/Lambda/DDB, etc.)
-      - Delete the SSM SecureString holding .env.prod
-      - Delete the stack's deployment artifacts (s3://<deployment_bucket>/<stack>/) and the
-        deployment bucket only if nothing else is left in it (unless keep_deploy_bucket)
+      - Once the stack is gone, delete the SSM SecureString holding .env.prod and the stack's
+        deployment artifacts (s3://<deployment_bucket>/<stack>/), then the deployment bucket only
+        if nothing else is left in it (unless keep_deploy_bucket)
+    With ``wait=False`` the stack deletion is only started, and the SSM parameter and artifacts are
+    kept: if the deletion failed, the stack's function would no longer find its secrets.
     Returns 0 only when every step succeeded. Pulls names from params.json when not provided
     explicitly. When ``project`` differs from the params.json project, params.json describes
     another project: its stack/bucket/SSM names are ignored and the default names are derived from
@@ -1206,8 +1208,15 @@ def remove_project(
             return 1
         print("[OK] Stack deleted.")
     else:
-        print("[INFO] Stack deletion started (asynchronous; use --wait to wait for it). Check it with:")
+        print("[INFO] Stack deletion started (asynchronous). Check it with:")
         print(f"       aws cloudformation describe-stacks --stack-name {stack} --region {reg}")
+        print(f"[INFO] Kept the SSM parameter {env_param}" + ("" if keep_deploy_bucket else " and the deployment files")
+              + ": if the deletion fails, the stack's function still needs them. Once the stack is gone:")
+        print(f"       aws ssm delete-parameter --name {env_param} --region {reg}")
+        if not keep_deploy_bucket:
+            print(f"       aws s3 rm s3://{deploy_bucket}/{deploy_prefix} --recursive")
+        print("[OK] Done. The stack is still being deleted in the background.")
+        return 0
 
     # SSM SecureString with every secret from .env.prod (not part of the stack).
     print(f"[INFO] Deleting SSM parameter {env_param} ...")
@@ -1251,5 +1260,5 @@ def remove_project(
         for failure in failures:
             print(f"      - {failure}")
         return 1
-    print("[OK] Done." + ("" if wait else " The stack is still being deleted in the background."))
+    print("[OK] Done.")
     return 0

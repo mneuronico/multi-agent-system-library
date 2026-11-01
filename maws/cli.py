@@ -102,7 +102,11 @@ def _main(argv=None):
     sp_rm.add_argument("--keep-deploy-bucket", action="store_true",
                        help="Keep the deployment artifacts (by default s3://<deployment_bucket>/<stack>/ is deleted, "
                             "and the bucket too if nothing else is left in it)")
-    sp_rm.add_argument("--wait", action="store_true", help="Wait until delete-stack completes")
+    sp_rm.add_argument("--wait", dest="wait", action="store_true", default=True,
+                       help="Wait until the stack is deleted, then delete its secrets and artifacts (default)")
+    sp_rm.add_argument("--no-wait", dest="wait", action="store_false",
+                       help="Only start the stack deletion; keeps the SSM parameter and deployment files "
+                            "(prints the commands to delete them once the stack is gone)")
     sp_rm.add_argument("-c", "--config", dest="config_path", default=None)
     sp_rm.add_argument("--dir", dest="project_dir", default=None)
 

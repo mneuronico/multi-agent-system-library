@@ -604,6 +604,18 @@ cat >> "${TEMPLATE_FILE}" <<EOF
               Resource: "arn:aws:s3:::${HISTORY_BUCKET}/*"
 EOF
 
+if [[ "${PERSIST_FILES_S3}" == "true" ]]; then
+  # Files deleted during a job (for example by clearing a user's history) are deleted in S3 too.
+  FILES_PREFIX_ARN="${FILES_PREFIX#/}"
+  FILES_PREFIX_ARN="${FILES_PREFIX_ARN%/}"
+  cat >> "${TEMPLATE_FILE}" <<EOF
+        - Statement:
+            - Effect: Allow
+              Action: [ "s3:DeleteObject" ]
+              Resource: "arn:aws:s3:::${HISTORY_BUCKET}/${FILES_PREFIX_ARN}/*"
+EOF
+fi
+
 if [[ "${BUSY_POLICY}" == "fifo" ]]; then
   cat >> "${TEMPLATE_FILE}" <<EOF
         - Statement:
