@@ -1433,7 +1433,7 @@ class TelegramBot(Bot):
     ):
         super().__init__(manager=manager, **kwargs)
         if Application is None or HTTPXRequest is None:
-            raise ImportError("python-telegram-bot is required for TelegramBot: pip install python-telegram-bot")
+            raise ImportError("python-telegram-bot is required for TelegramBot: pip install 'python-telegram-bot>=22,<23'")
 
         token = telegram_token or self.manager.get_key("telegram_token")
         if not token:

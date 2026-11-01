@@ -68,6 +68,16 @@ def test_integration_dependencies_are_optional_extras():
         assert extra_name in extras
 
 
+def test_python_telegram_bot_is_bounded_to_the_tested_major_version():
+    # Lambda packages resolve the newest allowed version on every deploy, so an unbounded
+    # requirement would ship the next major release of python-telegram-bot untested.
+    extras = _pyproject()["project"]["optional-dependencies"]
+    requirements = [req for reqs in extras.values() for req in reqs if req.startswith("python-telegram-bot")]
+
+    assert requirements
+    assert set(requirements) == {"python-telegram-bot>=22,<23"}
+
+
 def test_split_modules_preserve_public_facades():
     from mas.manager import AgentSystemManager as SplitManager
     from mas.mas import AgentSystemManager as FacadeManager
