@@ -349,6 +349,11 @@ case "${REQUIREMENTS_SOURCE}" in
       exit 1
     fi
     MAS_REQUIREMENT="${REQUIREMENTS_REF}"
+    # A bare path to a wheel, sdist or source folder installs no extras, and the Lambda needs them
+    # (python-telegram-bot for Telegram). A full requirement line with its own extras is kept as is.
+    if [[ "${REQUIREMENTS_REF}" != *"["* && ( "${REQUIREMENTS_REF}" =~ ^[./] || "${REQUIREMENTS_REF}" =~ \.(whl|tar\.gz|zip)$ ) ]]; then
+      MAS_REQUIREMENT="${REQUIREMENTS_REF}[${MAS_EXTRA}]"
+    fi
     ;;
   git)
     MAS_REQUIREMENT="mas[${MAS_EXTRA}] @ git+https://github.com/mneuronico/multi-agent-system-library.git"
@@ -925,6 +930,8 @@ requirements_are_generated() {
     [[ -z "${line}" ]] && continue
     [[ "${line}" == "requests" || "${line}" == "boto3" || "${line}" == "${MAS_REQUIREMENT}" ]] && continue
     [[ "${line}" =~ ${LEGACY_MAS_RE} ]] && continue
+    # Older maws wrote a local requirements_ref without the extras.
+    [[ "${REQUIREMENTS_SOURCE}" == "local" && "${line}" == "${REQUIREMENTS_REF}" ]] && continue
     is_extra_requirement "${line}" && continue
     return 1
   done < requirements.txt

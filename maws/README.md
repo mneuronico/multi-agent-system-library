@@ -346,6 +346,8 @@ A redriven message that was already processed is skipped. One whose worker faile
 
 Failed-event captures never store webhook secrets: header, query and field values whose names look secret (`X-Telegram-Bot-Api-Secret-Token`, `X-Hub-Signature-256`, `Authorization`, cookies, API keys, `hub.verify_token`, ...) are replaced by `[REDACTED]`, and so are Telegram bot tokens and the values of secret-looking keys loaded from SSM wherever they appear (for example in an error message).
 
+The Lambda logs record INFO, where httpx logs every request URL. The Telegram Bot API puts the bot token in that URL, so the runtime redacts it from httpx's log lines.
+
 ### Webhook security
 
 MAWS only uses provider-supported webhook security mechanisms, and webhook authentication is **mandatory**:

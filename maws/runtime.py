@@ -190,6 +190,22 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 )
 
 
+class _TelegramTokenLogFilter(logging.Filter):
+    """httpx logs every request URL at INFO, and the Telegram Bot API puts the bot token in it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        scrubbed = _TELEGRAM_BOT_TOKEN_RE.sub(_REDACTED, message)
+        if scrubbed != message:
+            record.msg, record.args = scrubbed, ()
+        return True
+
+
+# Lambda's JSON log format records INFO, so without this every Telegram reply would write the bot
+# token to CloudWatch.
+logging.getLogger("httpx").addFilter(_TelegramTokenLogFilter())
+
+
 def _scrub_text(text: str, secret_values: Iterable[str]) -> str:
     for secret in sorted(secret_values, key=len, reverse=True):
         if secret and secret in text:

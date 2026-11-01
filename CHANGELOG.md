@@ -86,7 +86,7 @@ Behaviour changes for Telegram and WhatsApp:
 - Bots cannot be made to upload files outside `files_folder` / `media_dirs`, for example your `.env`.
 - The dashboard checks the `Host` header (DNS rebinding) and requires a token off loopback.
 - `markdown_to_pdf` shows raw HTML as text and renders without JavaScript or local file access.
-- API keys are scrubbed from standard-library errors. Webhook secrets and tokens are redacted from maws failed-event captures.
+- API keys are scrubbed from standard-library errors. Webhook secrets and tokens are redacted from maws failed-event captures. On Lambda, the Telegram bot token is redacted from httpx's request logs, which used to write it to CloudWatch on every reply.
 - `maws remove` checks that the stack exists in the chosen region before emptying buckets. It waits for the stack to be deleted before deleting the SSM parameter and the deployment artifacts (`--no-wait` keeps them and prints the commands), and deletes the deployment bucket only when nothing else is in it.
 - Deploy and history buckets owned by another AWS account are refused.
 
@@ -122,6 +122,7 @@ Behaviour changes for Telegram and WhatsApp:
   - A history deleted in S3 is no longer brought back by a warm container.
   - Token files are written back only when changed, with a conditional write.
   - A rejected Telegram `setWebhook` makes `maws update` fail and prints Telegram's error.
+  - `requirements_source: "local"` with a path to a wheel, sdist or folder installs the Lambda extras, so Telegram bots no longer fail with `ImportError: python-telegram-bot is required`.
 - `mas start` never overwrites files; `mas` and `maws` commands return proper exit codes; API keys are typed without echo.
 - `youtube_search` works with `youtube-transcript-api` 1.x.
 

@@ -278,3 +278,18 @@ def test_user_id_passed_positionally_is_scoped_to_the_call(workspace_tmp_path):
     assert manager._uid() == "me"
     assert [m["message"][0]["content"] for m in manager.get_messages("other")] == ["for someone else"]
     assert manager.get_messages("me") == []
+
+
+# --- httpx request logs never write the Telegram bot token --------------------------------
+
+def test_httpx_request_logs_redact_the_telegram_bot_token(caplog):
+    import logging
+
+    token = "123456789:AAH1bGciOiJIUzI1NiJ9abcdefghijklmnop"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        # The call httpx makes for every request.
+        logging.getLogger("httpx").info('HTTP Request: %s %s "%s %d %s"', "POST", url, "HTTP/1.1", 200, "OK")
+
+    assert token not in caplog.text
+    assert 'HTTP Request: POST https://api.telegram.org/bot[REDACTED]/sendMessage "HTTP/1.1 200 OK"' in caplog.text
