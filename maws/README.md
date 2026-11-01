@@ -9,6 +9,7 @@
 * **self-invocation** to process work in the background (avoids API Gateway timeouts), one worker per chat and webhook
 * optional **SQS FIFO** processing for production bots that must not drop messages, with a dead-letter queue by default
 * per-user **locking** with **DynamoDB** conditional writes to avoid concurrent processing
+* each message processed once: repeated deliveries (provider retries, duplicate async invocations, SQS redeliveries) are skipped and counted (`MAWS/DuplicateMessages`)
 * dropped and failed updates logged at WARNING and counted as CloudWatch metrics (`MAWS/DroppedMessages`, `MAWS/FailedMessages`)
 * optional S3-backed user media/file persistence
 * synchronization of **tokens/keys** between **S3** and the ephemeral `/tmp` filesystem
@@ -87,6 +88,7 @@ With `maws update` you do not need this file: the deploy writes it (and `require
 | `MAWS_ENV_PARAMETER_VERSION` | No     | none (latest) | SSM parameter version to read. `maws update` sets it to the version it uploaded. |
 | `MAWS_BUSY_POLICY`         | No       | `"drop"`     | `"drop"` keeps current behavior; `"fifo"` queues work in SQS FIFO.   |
 | `MAWS_BUSY_WAIT_SECONDS`   | No       | `"30"`       | `drop` mode: max seconds a worker waits for a busy user lock before dropping (never more than half of the remaining invocation time; `0` = drop at once). |
+| `MAWS_DEDUP_RETENTION_DAYS` | No      | `"8"`        | Days a processed message is remembered, so a repeated delivery of it is skipped (needs `LOCKS_TABLE_NAME`; `0` = off). See "Repeated deliveries". |
 | `MAWS_QUEUE_URL`           | FIFO     | none         | SQS FIFO queue URL used when `MAWS_BUSY_POLICY=fifo`.                |
 | `HISTORY_MODE`             | No       | `"per_user"` | `"per_user"` or `"shared"`; mirrors MAS history storage.             |
 | `HISTORY_ROTATION`         | No       | `"message_count"` | Shared history rotation: `message_count`, `time_period`, or `both`. |
@@ -146,10 +148,11 @@ Returns a **Lambda handler** already configured for the chosen bot.
 * If the jobs cannot be handed off (SQS `SendMessage` or the async invoke fails), the POST answers `5xx` so Telegram/WhatsApp deliver the update again.
 * In the "second hop":
 
+  * **Claims** each message in the locks table; a message that was already processed, or that another worker is processing, is skipped (`MAWS/DuplicateMessages`). See "Repeated deliveries".
   * Takes a **lock** per `user_id` (or one global lock in shared-history mode) if `LOCKS_TABLE_NAME` is set, once for all the jobs of the invocation. If the lock is held in default `"drop"` mode, it **waits** up to `MAWS_BUSY_WAIT_SECONDS` (default 30, at most half of the remaining invocation time) and then **drops** the update (WARNING log + `MAWS/DroppedMessages` metric). In `"fifo"` mode the SQS invocation fails instead, so SQS redelivers the message after the visibility timeout.
   * **Imports** history from S3 if present. The container's local copy is deleted first, so a history deleted in S3 is never brought back from a warm container.
   * Optionally syncs per-user files/media from S3.
-  * Executes `process_webhook_update` for each job, in order.
+  * Executes `process_webhook_update` for each job, in order, and records each message as processed.
   * **Exports** history and optionally files/media to S3.
   * **Releases** the lock, also when saving fails (a crashed worker's lock simply expires).
 
@@ -248,11 +251,26 @@ To avoid API Gateway timeouts, maws:
 2. **Self-invokes** asynchronously with the actual payload to process in the background: one invocation per chat (all of that chat's messages from the webhook, in order).
 3. Uses a DynamoDB item as a per-user lock (`user_id`) to avoid duplicates when messages arrive in rapid succession.
 
-If one chat's hand-off fails after another chat's succeeded, the provider's retry hands off the successful one again (at-least-once). Asynchronous invocations that fail are retried twice by Lambda and then sent to the `<stack>-async-failures` SQS queue (see Failure handling).
+If one chat's hand-off fails after another chat's succeeded, the provider's retry hands off the successful one again, and its worker skips the messages that were already processed (see "Repeated deliveries"). Asynchronous invocations that fail are retried twice by Lambda and then sent to the `<stack>-async-failures` SQS queue (see Failure handling).
 
 If you do not configure `LOCKS_TABLE_NAME`, locking is **disabled** (best-effort behavior).
 
 Lock expiry is enforced by the conditional write (`expiresAt < now`), not by DynamoDB TTL, which only cleans up old items and can lag for days. Inside Lambda a lock expires 15 seconds after the invocation's deadline: it outlives any running worker, and a crashed worker's lock is gone before SQS redelivers its message (the queue's visibility timeout is `lambda_timeout + 30`). Each lock carries a random token, so a worker only deletes its own lock.
+
+### Repeated deliveries
+
+The same message can reach a worker more than once: the provider retries a whole webhook when one chat's hand-off failed after another chat's succeeded (or when the webhook did not answer in time), Lambda occasionally delivers an asynchronous invocation twice, and SQS redelivers a message whose worker failed after processing it. MAWS processes each message once:
+
+* Before taking the user lock, the worker **claims** each message in the locks table with the same conditional write as the lock. The key is `maws-event#<provider>#<chat id>#<event id>`, where the event id is Telegram's `update_id` or WhatsApp's `wamid`.
+* Once the bot has processed the message, the claim becomes a **processed** record that is kept for `runtime.dedup_retention_days` days (`MAWS_DEDUP_RETENTION_DAYS`, default 8; WhatsApp retries a webhook for up to 7 days). It is written before the history is saved, because the replies have already been sent.
+* A delivery of a message that has a claim or a record is skipped at once, without waiting for the user lock. It is logged (`[maws][dedup] Skipping ...`) and counted in `MAWS/DuplicateMessages`, not in `MAWS/DroppedMessages`.
+
+A message that was not processed keeps no record, so the usual retries still process it: when it was dropped because the user stayed busy, when the user lock was busy in FIFO mode, when its history could not be loaded, or when processing raised (FIFO retries it). Two cases are worth knowing:
+
+* If a worker crashes or times out while processing a message, its claim expires 15 s after that invocation's deadline, like its lock. Lambda's retry or the SQS redelivery then processes the message again, so replies sent before the crash can be sent twice.
+* If saving the history fails after the message was processed, the message is not processed again: the error is logged (and captured with `capture_failed_events`) and that turn is missing from the history.
+
+The records live in the stack's locks table, so they need no extra resource or IAM permission: they cost two DynamoDB writes per message, and DynamoDB TTL deletes them after they expire. Without `LOCKS_TABLE_NAME` there are no records. `"runtime": {"dedup_retention_days": 0}` turns them off. History appends (`/history/outgoing`) keep their own deduplication by `event_id`.
 
 ### Busy-message policy
 
@@ -273,7 +291,7 @@ Every drop is logged at WARNING (`[maws][drop] Dropped ... update <event id> for
 
 Without `LOCKS_TABLE_NAME` there is no lock: nothing is dropped, but concurrent workers of one chat overwrite each other's history (last writer wins). Order between separate webhooks is not guaranteed in drop mode. Use FIFO when every message must be processed, in order.
 
-Set `busy_policy` to `"fifo"` in `params.json` to generate an SQS FIFO queue. In FIFO mode MAWS enqueues one normalized job per provider message, uses the chat id as the FIFO message group in per-user history mode, and uses one global group in shared-history mode to avoid SQLite history races. If enqueueing fails, the webhook answers `503` so the provider retries; jobs that were already enqueued are deduplicated by SQS (content-based `MessageDeduplicationId`, 5-minute window). A job whose user lock is still held (for example by a crashed worker) fails its invocation instead of being acknowledged, so SQS redelivers it after the visibility timeout and the group keeps its order; each such retry counts toward the DLQ's `maxReceiveCount`. A worker without `BUCKET_NAME` or whose MAS initialization fails also fails the invocation, so the job is retried and ends in the DLQ instead of being deleted.
+Set `busy_policy` to `"fifo"` in `params.json` to generate an SQS FIFO queue. In FIFO mode MAWS enqueues one normalized job per provider message, uses the chat id as the FIFO message group in per-user history mode, and uses one global group in shared-history mode to avoid SQLite history races. If enqueueing fails, the webhook answers `503` so the provider retries; jobs that were already enqueued are deduplicated by SQS (content-based `MessageDeduplicationId`, 5-minute window), and later repeats are skipped by the worker (see "Repeated deliveries"). A job whose user lock is still held (for example by a crashed worker) fails its invocation instead of being acknowledged, so SQS redelivers it after the visibility timeout and the group keeps its order; each such retry counts toward the DLQ's `maxReceiveCount`. A worker without `BUCKET_NAME` or whose MAS initialization fails also fails the invocation, so the job is retried and ends in the DLQ instead of being deleted.
 
 The worker DLQ is **on by default** for FIFO (`<stack>-worker-dlq.fifo`, `maxReceiveCount` 3, 14-day retention). Without it, SQS retries a failing message until it expires (4 days) and every later message of that chat waits behind it.
 
@@ -324,7 +342,7 @@ Redrive, once the cause is fixed:
   done
   ```
 
-Redriving a job that was partly processed can process it again (at-least-once).
+A redriven message that was already processed is skipped. One whose worker failed or crashed half-way is processed again, so replies it had already sent can be sent twice.
 
 Failed-event captures never store webhook secrets: header, query and field values whose names look secret (`X-Telegram-Bot-Api-Secret-Token`, `X-Hub-Signature-256`, `Authorization`, cookies, API keys, `hub.verify_token`, ...) are replaced by `[REDACTED]`, and so are Telegram bot tokens and the values of secret-looking keys loaded from SSM wherever they appear (for example in an error message).
 
@@ -446,7 +464,7 @@ ANOTHER=VAL
 * `VERBOSE=true` enables detailed traces in bots/MAS.
 * The function logs (JSON format) go to the stack's log group `/aws/lambda/<stack>-maws` with a retention of `infra.log_retention_days` days, **30 by default**: long enough to investigate a problem reported a few weeks later, short enough that chat ids and (with `VERBOSE`) message contents are not kept forever. `0` keeps logs forever; other values must be a CloudWatch retention (1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, ...).
 * The log group has its own name (set through Lambda's `LoggingConfig`) because Lambda already created `/aws/lambda/<function>` for every deployed function, and CloudFormation cannot create a log group that exists; that is why setting `log_retention_days` on an existing stack used to fail. Changing the retention later is a normal `maws update`. After upgrading, new logs go to the new group; the old `/aws/lambda/<function>` group keeps the older logs without retention (delete it or set a retention in CloudWatch). A stack that already manages `/aws/lambda/<function>` (deployed with `log_retention_days` on a fresh stack) keeps using it.
-* Drops and failures are also metrics: `MAWS/DroppedMessages` and `MAWS/FailedMessages`.
+* Drops, failures and skipped repeated deliveries are also metrics: `MAWS/DroppedMessages`, `MAWS/FailedMessages` and `MAWS/DuplicateMessages`.
 
 ---
 

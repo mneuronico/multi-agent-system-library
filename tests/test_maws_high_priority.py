@@ -54,12 +54,16 @@ class _FakeDynamo:
         self.exceptions = types.SimpleNamespace(ConditionalCheckFailedException=_ConditionalCheckFailed)
 
     def put_item(self, TableName, Item, ConditionExpression, ExpressionAttributeValues):
-        assert ConditionExpression == "attribute_not_exists(user_id) OR expiresAt < :now"
         key = Item["user_id"]["S"]
-        now = int(ExpressionAttributeValues[":now"]["N"])
         current = self.items.get(key)
-        if current is not None and not int(current["expiresAt"]["N"]) < now:
-            raise _ConditionalCheckFailed()
+        if ConditionExpression == "lockToken = :token":
+            if current is None or current["lockToken"]["S"] != ExpressionAttributeValues[":token"]["S"]:
+                raise _ConditionalCheckFailed()
+        else:
+            assert ConditionExpression == "attribute_not_exists(user_id) OR expiresAt < :now"
+            now = int(ExpressionAttributeValues[":now"]["N"])
+            if current is not None and not int(current["expiresAt"]["N"]) < now:
+                raise _ConditionalCheckFailed()
         self.items[key] = Item
 
     def delete_item(self, TableName, Key, ConditionExpression=None, ExpressionAttributeValues=None):
@@ -360,7 +364,9 @@ def test_sqs_job_processes_and_releases_when_the_lock_is_free(workspace_tmp_path
     assert response["statusCode"] == 200
     assert ("process", {"message": {"chat": {"id": 123}}}) in calls
     assert runtime.s3.puts[("history-bucket", "history/123.sqlite")] == b"new"
-    assert dynamo.items == {}
+    # The user lock is released; only the record that this message was processed stays.
+    assert [item["status"]["S"] for item in dynamo.items.values()] == ["processed"]
+    assert "123" not in dynamo.items
 
 
 def test_lock_is_released_when_saving_history_fails_on_the_sqs_path(workspace_tmp_path):
@@ -371,7 +377,11 @@ def test_lock_is_released_when_saving_history_fails_on_the_sqs_path(workspace_tm
         MawsRuntime.handle_apigw_event(runtime, _sqs_event(), _LambdaContext(100_000))
 
     assert ("process", {"message": {"chat": {"id": 123}}}) in calls
-    assert dynamo.items == {}  # the retry will not find the user busy
+    assert "123" not in dynamo.items  # the retry will not find the user busy
+    # The replies were already sent, so the SQS redelivery skips the message instead of answering twice.
+    calls.clear()
+    MawsRuntime.handle_apigw_event(runtime, _sqs_event(), _LambdaContext(100_000))
+    assert not [call for call in calls if call[0] == "process"]
 
 
 # -------------------------

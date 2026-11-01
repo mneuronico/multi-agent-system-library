@@ -58,10 +58,14 @@ class _FakeDynamo:
     def put_item(self, TableName, Item, ConditionExpression, ExpressionAttributeValues):
         self.puts += 1
         key = Item["user_id"]["S"]
-        now = int(ExpressionAttributeValues[":now"]["N"])
         current = self.items.get(key)
-        if current is not None and not int(current["expiresAt"]["N"]) < now:
-            raise _ConditionalCheckFailed()
+        if ConditionExpression == "lockToken = :token":
+            if current is None or current["lockToken"]["S"] != ExpressionAttributeValues[":token"]["S"]:
+                raise _ConditionalCheckFailed()
+        else:
+            now = int(ExpressionAttributeValues[":now"]["N"])
+            if current is not None and not int(current["expiresAt"]["N"]) < now:
+                raise _ConditionalCheckFailed()
         self.items[key] = Item
 
     def delete_item(self, TableName, Key, ConditionExpression=None, ExpressionAttributeValues=None):
@@ -223,8 +227,10 @@ def test_worker_processes_a_chat_group_in_order_under_one_lock(workspace_tmp_pat
 
     assert response["statusCode"] == 200
     assert [call[1] for call in calls if call[0] == "process"] == ["m1", "m2", "m3"]
-    assert runtime.dynamodb.puts == 1  # one lock acquisition for the whole group
-    assert runtime.dynamodb.items == {}  # released afterwards
+    # One lock acquisition for the whole group (the other writes are processed-message records),
+    # released afterwards.
+    assert runtime.dynamodb.puts - 2 * 3 == 1
+    assert sorted(runtime.dynamodb.items) == [f"maws-event#whatsapp#user-a#wamid.{n}" for n in (1, 2, 3)]
     assert runtime.s3.objects[("history-bucket", "history/user-a.sqlite")] == b"new-history"
 
 

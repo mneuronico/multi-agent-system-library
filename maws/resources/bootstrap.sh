@@ -109,6 +109,9 @@ MAX_ALLOWED_MESSAGE_DELAY=$(jq -r '.runtime.max_allowed_message_delay // empty' 
 # busy_policy=drop: max seconds a worker waits for a busy user lock before dropping (runtime default 30).
 BUSY_WAIT_SECONDS=$(jq -r '.runtime.busy_wait_seconds // empty' "${CONF}")
 [[ -z "${BUSY_WAIT_SECONDS}" || "${BUSY_WAIT_SECONDS}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "[ERR] runtime.busy_wait_seconds in ${CONF} must be a number of seconds (got: ${BUSY_WAIT_SECONDS})."
+# How long a processed message is remembered so a repeated delivery is skipped (runtime default: 8 days).
+DEDUP_RETENTION_DAYS=$(jq -r '.runtime.dedup_retention_days // empty' "${CONF}")
+[[ -z "${DEDUP_RETENTION_DAYS}" || "${DEDUP_RETENTION_DAYS}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "[ERR] runtime.dedup_retention_days in ${CONF} must be a number of days, 0 to turn processed-message records off (got: ${DEDUP_RETENTION_DAYS})."
 
 TELEGRAM_SECRET_ENV_KEY=$(jq -r '.webhook_security.telegram_secret_token_env_key // empty' "${CONF}")
 [[ -z "${TELEGRAM_SECRET_ENV_KEY}" || "${TELEGRAM_SECRET_ENV_KEY}" == "null" ]] && TELEGRAM_SECRET_ENV_KEY="TELEGRAM_WEBHOOK_SECRET_TOKEN"
@@ -670,6 +673,12 @@ EOF
 if [[ -n "${BUSY_WAIT_SECONDS}" ]]; then
   cat >> "${TEMPLATE_FILE}" <<EOF
           MAWS_BUSY_WAIT_SECONDS: "${BUSY_WAIT_SECONDS}"
+EOF
+fi
+
+if [[ -n "${DEDUP_RETENTION_DAYS}" ]]; then
+  cat >> "${TEMPLATE_FILE}" <<EOF
+          MAWS_DEDUP_RETENTION_DAYS: "${DEDUP_RETENTION_DAYS}"
 EOF
 fi
 

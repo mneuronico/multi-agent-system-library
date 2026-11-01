@@ -394,6 +394,8 @@ def test_bootstrap_has_no_jq_default_operator_on_booleans():
         (_telegram(busy_policy="queue"), "busy_policy"),
         ({"region": "us-east-1", "bot": "telegram"}, 'has no "project"'),
         (_telegram(failure_handling={"max_receive_count": 0}), "max_receive_count"),
+        (_telegram(runtime={"dedup_retention_days": "a week"}), "runtime.dedup_retention_days"),
+        (_telegram(runtime={"dedup_retention_days": -1}), "runtime.dedup_retention_days"),
     ],
 )
 def test_invalid_params_fail_before_any_aws_call(bootstrap, params, message):
@@ -401,6 +403,25 @@ def test_invalid_params_fail_before_any_aws_call(bootstrap, params, message):
 
     _assert_failed_before_aws(bootstrap, code, out)
     assert message in out
+
+
+@pytest.mark.parametrize(
+    ("runtime", "expected"),
+    [
+        ({}, None),  # the runtime default (8 days) applies
+        ({"dedup_retention_days": 14}, 'MAWS_DEDUP_RETENTION_DAYS: "14"'),
+        ({"dedup_retention_days": 0}, 'MAWS_DEDUP_RETENTION_DAYS: "0"'),
+    ],
+)
+def test_dedup_retention_days_reaches_the_function(bootstrap, runtime, expected):
+    code, out = bootstrap.run(_telegram(runtime=runtime), TG_ENV)
+
+    assert code == 0, out
+    template = bootstrap.template()
+    if expected is None:
+        assert "MAWS_DEDUP_RETENTION_DAYS" not in template
+    else:
+        assert expected in template
 
 
 def test_self_invoke_permission_is_scoped_to_this_function(bootstrap):

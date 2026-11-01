@@ -51,6 +51,12 @@ DEFAULT_BUSY_WAIT_SECONDS = 30.0
 BUSY_WAIT_SHARE_OF_REMAINING = 0.5
 BUSY_WAIT_POLL_SECONDS = 0.5
 
+# Processed-message records: how long a message stays marked as processed, so that a second delivery
+# of it is skipped. WhatsApp retries an unacknowledged webhook for up to 7 days.
+DEFAULT_DEDUP_RETENTION_DAYS = 8.0
+# The records share the locks table with the user locks; their keys start with this prefix.
+DEDUP_KEY_PREFIX = "maws-event#"
+
 
 # -------------------------
 # Utilities and configuration
@@ -331,6 +337,12 @@ class MawsRuntime:
         self.lock_table = os.environ.get("LOCKS_TABLE_NAME") or ""
         self.lock_ttl = _as_int(os.environ.get("LOCK_TTL_SECONDS"), 180)
         self._lock_tokens: Dict[str, str] = {}
+        # Processed-message records, stored in the locks table so that a message delivered twice is
+        # processed once. MAWS_DEDUP_RETENTION_DAYS=0 turns them off.
+        self.dedup_retention_days = _as_float(
+            os.environ.get("MAWS_DEDUP_RETENTION_DAYS"), DEFAULT_DEDUP_RETENTION_DAYS
+        )
+        self._claim_tokens: Dict[str, str] = {}
 
         # Provider webhook authentication is mandatory. MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS=true
         # (params.json webhook_security.allow_unauthenticated) is the explicit opt-out.
@@ -978,6 +990,136 @@ class MawsRuntime:
         )
 
     # -------------------------
+    # Processed-message records
+    # -------------------------
+    # The same message can reach a worker more than once: the provider retries a whole webhook when
+    # one chat's hand-off failed after another chat's succeeded, Lambda can deliver an async
+    # invocation twice, and SQS redelivers a message whose worker failed after processing it. Each
+    # message is claimed in the locks table before it is processed (the same conditional write as
+    # the user lock) and recorded as processed afterwards, so a second delivery is skipped.
+    def _dedup_retention_seconds(self) -> int:
+        days = _as_float(
+            getattr(self, "dedup_retention_days", DEFAULT_DEDUP_RETENTION_DAYS), DEFAULT_DEDUP_RETENTION_DAYS
+        )
+        if days is None or not math.isfinite(days) or days <= 0:
+            return 0
+        return int(days * 86400)
+
+    def _dedup_enabled(self) -> bool:
+        return bool(getattr(self, "lock_table", "") and self._dedup_retention_seconds() > 0 and self.dynamodb)
+
+    def _dedup_key_for(self, job: dict) -> str:
+        provider = str(job.get("provider") or getattr(self, "bot_type", "whatsapp"))
+        event_id = str(job.get("event_id") or _stable_hash(job.get("payload"))[:24])
+        return f"{DEDUP_KEY_PREFIX}{provider}#{job.get('chat_id') or ''}#{event_id}"
+
+    def _held_claim_tokens(self) -> Dict[str, str]:
+        tokens = getattr(self, "_claim_tokens", None)
+        if tokens is None:
+            tokens = self._claim_tokens = {}
+        return tokens
+
+    def _try_claim_job(self, job: dict, context=None) -> bool:
+        """Claim a message until this invocation's deadline. False if it was or is being processed."""
+        key = self._dedup_key_for(job)
+        now = self._lock_now_epoch()
+        token = uuid.uuid4().hex
+        try:
+            self.dynamodb.put_item(
+                TableName=self.lock_table,
+                Item={
+                    "user_id": {"S": key},
+                    "expiresAt": {"N": str(now + self._lock_ttl_seconds(context))},
+                    "lockToken": {"S": token},
+                    "status": {"S": "processing"},
+                },
+                # A crashed worker's claim expires like its lock, so a retry can process the message;
+                # a processed record expires after the retention period.
+                ConditionExpression="attribute_not_exists(user_id) OR expiresAt < :now",
+                ExpressionAttributeValues={":now": {"N": str(now)}},
+            )
+        except self.dynamodb.exceptions.ConditionalCheckFailedException:
+            return False
+        self._held_claim_tokens()[key] = token
+        return True
+
+    def _claim_jobs(self, jobs: List[dict], context=None) -> List[dict]:
+        """Return the jobs this worker should process, skipping (and counting) repeated deliveries."""
+        if not self._dedup_enabled():
+            return list(jobs)
+        claimed: List[dict] = []
+        duplicates: List[dict] = []
+        try:
+            for job in jobs:
+                # History appends are deduplicated by their event id inside the history itself.
+                if self._is_history_append_job(job) or self._try_claim_job(job, context):
+                    claimed.append(job)
+                else:
+                    duplicates.append(job)
+        except BaseException:
+            self._release_job_claims(claimed)
+            raise
+        if duplicates:
+            self._report_duplicate_jobs(duplicates)
+        return claimed
+
+    def _release_job_claims(self, jobs: List[dict]):
+        """Give up the claims of jobs that were not processed, so a retry or redelivery processes them."""
+        for job in jobs:
+            key = self._dedup_key_for(job)
+            token = self._held_claim_tokens().pop(key, None)
+            if token is None:
+                continue
+            try:
+                self.dynamodb.delete_item(
+                    TableName=self.lock_table,
+                    Key={"user_id": {"S": key}},
+                    ConditionExpression="lockToken = :token",
+                    ExpressionAttributeValues={":token": {"S": token}},
+                )
+            except Exception as e:
+                # The claim still expires with this invocation's deadline.
+                print(f"[maws][dedup][WARN] Could not release the claim on {key}: {e}")
+
+    def _mark_job_processed(self, job: dict):
+        key = self._dedup_key_for(job)
+        token = self._held_claim_tokens().pop(key, None)
+        if token is None:
+            return
+        now = self._lock_now_epoch()
+        try:
+            self.dynamodb.put_item(
+                TableName=self.lock_table,
+                Item={
+                    "user_id": {"S": key},
+                    "expiresAt": {"N": str(now + self._dedup_retention_seconds())},
+                    "lockToken": {"S": token},
+                    "status": {"S": "processed"},
+                },
+                ConditionExpression="lockToken = :token",
+                ExpressionAttributeValues={":token": {"S": token}},
+            )
+        except Exception as e:
+            # The claim stays until this invocation's deadline; after that a redelivery of this
+            # message would be processed again.
+            logger.warning("[maws][dedup] Could not record %s as processed: %s", key, e)
+
+    def _report_duplicate_jobs(self, jobs: List[dict]):
+        """Skipped repeated deliveries are logged and counted in the MAWS/DuplicateMessages metric."""
+        for job in jobs:
+            print(
+                f"[maws][dedup] Skipping {job.get('provider') or getattr(self, 'bot_type', '')} update "
+                f"{job.get('event_id') or '?'} for chat {job.get('chat_id') or '?'}: it was already "
+                "processed, or another worker is processing it."
+            )
+        self._emit_metric(
+            "DuplicateMessages",
+            len(jobs),
+            busy_policy=getattr(self, "busy_policy", "drop"),
+            event_ids=[str(job.get("event_id") or "") for job in jobs],
+        )
+
+    # -------------------------
     # MAS initialization + bots
     # -------------------------
     def initialize_system(self):
@@ -1505,8 +1647,8 @@ class MawsRuntime:
                 for job in group:
                     self._capture_failed_event(job, "self_invoke_failed", e)
         if failed:
-            # The provider retries the whole webhook. A group that was handed off before the failure
-            # is then processed again (at-least-once delivery).
+            # The provider retries the whole webhook. Groups that were handed off before the failure
+            # are handed off again, and their workers skip the messages already processed.
             return {"statusCode": 502, "body": json.dumps("Webhook could not be processed; retry later.")}
         return {"statusCode": 200, "body": json.dumps("Webhook received.")}
 
@@ -1615,30 +1757,49 @@ class MawsRuntime:
             return {"statusCode": 200, "body": json.dumps("Error: Initialization failed.")}
 
         start = time.time()
+        # Repeated deliveries are skipped before waiting for the lock: the worker that has the
+        # message may be the one holding it.
+        claimed = self._claim_jobs(jobs, context)
+        if len(claimed) < len(jobs):
+            self._log_jobs_finished(
+                [job for job in jobs if job not in claimed], "Duplicate; already processed.", start
+            )
+        if not claimed:
+            return {"statusCode": 200, "body": json.dumps("Duplicate update ignored.")}
+        jobs = claimed
+
         # Lock. In shared history mode this becomes a global lock/group.
-        if is_history_append:
-            self._wait_for_history_append_lock(chat_id, context)
-        elif retry_when_busy:
-            if not self.try_acquire_user_lock(chat_id, context=context):
-                # SQS (busy_policy=fifo): fail the invocation so the message is redelivered after
-                # the visibility timeout instead of being deleted.
-                print(f"[maws] Another worker is processing {chat_id}. Leaving the SQS message for retry.")
-                self._log_jobs_finished(jobs, "Already processing; will retry.", start)
-                raise UserLockBusy(f"User lock for {chat_id} is held by another worker; SQS will retry.")
-        else:
-            acquired, waited = self._acquire_user_lock_with_wait(chat_id, context)
-            if not acquired:
-                # busy_policy=drop: acknowledge and drop, loudly.
-                self._report_dropped_jobs(jobs, "user_busy", waited)
-                result = {"statusCode": 200, "body": json.dumps("Already processing; update ignored.")}
-                self._log_jobs_finished(jobs, "Already processing; update ignored.", start)
-                return result
+        try:
+            if is_history_append:
+                self._wait_for_history_append_lock(chat_id, context)
+            elif retry_when_busy:
+                if not self.try_acquire_user_lock(chat_id, context=context):
+                    # SQS (busy_policy=fifo): fail the invocation so the message is redelivered after
+                    # the visibility timeout instead of being deleted.
+                    print(f"[maws] Another worker is processing {chat_id}. Leaving the SQS message for retry.")
+                    self._log_jobs_finished(jobs, "Already processing; will retry.", start)
+                    raise UserLockBusy(f"User lock for {chat_id} is held by another worker; SQS will retry.")
+            else:
+                acquired, waited = self._acquire_user_lock_with_wait(chat_id, context)
+                if not acquired:
+                    # busy_policy=drop: acknowledge and drop, loudly.
+                    self._release_job_claims(jobs)
+                    self._report_dropped_jobs(jobs, "user_busy", waited)
+                    result = {"statusCode": 200, "body": json.dumps("Already processing; update ignored.")}
+                    self._log_jobs_finished(jobs, "Already processing; update ignored.", start)
+                    return result
+        except BaseException:
+            # Not processed: the retry or redelivery must be able to claim these messages.
+            self._release_job_claims(jobs)
+            raise
 
         result = {"statusCode": 200, "body": json.dumps("Processed.")}
         try:
             for job in jobs:
                 result = self._run_locked_job(job, context=context, raise_on_error=raise_on_error)
         finally:
+            # Jobs after one that raised were never run.
+            self._release_job_claims(jobs)
             # Always release, even when a job failed and the error is re-raised for a retry;
             # otherwise the retry would find the user busy until the lock expires.
             try:
@@ -1718,7 +1879,12 @@ class MawsRuntime:
                 # Process
                 loop = self.get_event_loop()
                 loop.run_until_complete(self.bot_instance.process_webhook_update(job.get("payload") or {}))
+            # Recorded before the history is saved: the replies have been sent, so a redelivery
+            # must not process this message again, even if saving fails below.
+            self._mark_job_processed(job)
         except Exception as e:
+            # Not processed (or failed half-way): let a retry or redelivery process it.
+            self._release_job_claims([job])
             print(f"[maws][process][ERR] {e}")
             traceback.print_exc()
             self._capture_failed_event(job, "worker_processing_failed", e)

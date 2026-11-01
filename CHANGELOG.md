@@ -64,6 +64,7 @@ Behaviour changes for Telegram and WhatsApp:
 - **Admin commands are checked against the sender, also in Telegram groups.**
 - **Invalid custom command names raise `ValueError`.** A valid name is `/` followed by 1-32 letters, digits or underscores.
 - **Direct send methods raise when the platform rejects the request**: `TelegramError` or `mas.bots.WhatsappAPIError`.
+- **`python-telegram-bot` must be 22.x** (`>=22,<23`), the series the bot was tested with. Before, any version was accepted, so a new major release could break the bot on the next deploy.
 
 #### Standard library, dashboard and CLI
 
@@ -96,7 +97,8 @@ Behaviour changes for Telegram and WhatsApp:
 - Bots split texts over 4096 characters and captions over 1024. Duplicate deliveries are ignored for an hour, and each user's replies are sent in order.
 - maws:
   - Drop mode waits up to `runtime.busy_wait_seconds` (default 30 s) for a busy user before dropping the update; `0` restores the immediate drop.
-  - CloudWatch metrics `MAWS/DroppedMessages` and `MAWS/FailedMessages`.
+  - Each message is processed once. Workers record processed messages in the locks table for `runtime.dedup_retention_days` days (default 8; `0` turns it off) and skip repeated deliveries. No new AWS resources or permissions; see "Repeated deliveries" in `maws/README.md`.
+  - CloudWatch metrics `MAWS/DroppedMessages`, `MAWS/FailedMessages` and `MAWS/DuplicateMessages`.
   - `infra.log_retention_days` and `infra.s3_noncurrent_version_days`.
 - `add_message(..., user_id=...)`.
 
@@ -114,7 +116,7 @@ Behaviour changes for Telegram and WhatsApp:
 - maws:
   - FIFO retries a busy job instead of deleting it.
   - Locks belong to their worker and are sized from the Lambda timeout.
-  - A failed hand-off answers `5xx`, so the platform retries.
+  - A failed hand-off answers `5xx`, so the platform retries. The chats of that webhook that had already been handed off are no longer processed, and answered, a second time.
   - A history deleted in S3 is no longer brought back by a warm container.
   - Token files are written back only when changed, with a conditional write.
   - A rejected Telegram `setWebhook` makes `maws update` fail and prints Telegram's error.
