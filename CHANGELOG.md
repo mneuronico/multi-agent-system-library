@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - Unreleased
 
 Changes since 0.3.5 (`00ea15b`) from a production-readiness review. Several defaults and behaviours changed on purpose because the old ones were unsafe or surprising, so read **Upgrading** before you deploy.
 
