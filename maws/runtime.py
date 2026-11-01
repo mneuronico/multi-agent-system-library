@@ -1376,6 +1376,16 @@ class MawsRuntime:
             return {"statusCode": 403, "body": json.dumps("Forbidden")}
         return None
 
+    def _whatsapp_verify_token(self) -> str:
+        """The verify token WhatsappBot would use, read without building the manager ("" if unknown)."""
+        token = (getattr(self, "bot_kwargs", {}) or {}).get("webhook_verify_token")
+        if token:
+            return str(token)
+        for name in ("webhook_verify_token", "WEBHOOK_VERIFY_TOKEN", "whatsapp_verify_token", "WHATSAPP_VERIFY_TOKEN"):
+            if os.environ.get(name):
+                return os.environ[name]
+        return ""
+
     # -------------------------
     # Main handler
     # -------------------------
@@ -1393,8 +1403,17 @@ class MawsRuntime:
                 return self._handle_history_append(event, context)
             return self._handle_http_post(event, context)
 
-        # GET verification (WhatsApp)
+        # GET verification (WhatsApp). Meta gives up after about 6 s, and building the manager on a
+        # cold start can take longer, so the token is checked without it when the env has one.
         if http_method == "GET" and getattr(self, "bot_type", "whatsapp") == "whatsapp":
+            expected = self._whatsapp_verify_token()
+            if expected:
+                print("[maws] WhatsApp verification (GET).")
+                query_params = event.get("queryStringParameters", {}) or {}
+                provided = str(query_params.get("hub.verify_token") or "")
+                if hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+                    return {"statusCode": 200, "body": query_params.get("hub.challenge", "")}
+                return {"statusCode": 403, "body": "Forbidden"}
             self.initialize_system()
             if not self.bot_instance:
                 return {"statusCode": 200, "body": json.dumps("Error: Initialization failed.")}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import types
 
 import pytest
 
@@ -293,3 +294,67 @@ def test_httpx_request_logs_redact_the_telegram_bot_token(caplog):
 
     assert token not in caplog.text
     assert 'HTTP Request: POST https://api.telegram.org/bot[REDACTED]/sendMessage "HTTP/1.1 200 OK"' in caplog.text
+
+
+# --- WhatsApp's verification GET answers without building the manager -------------------
+
+def _verify_get(token):
+    params = {"hub.mode": "subscribe", "hub.challenge": "4242"}
+    if token is not None:
+        params["hub.verify_token"] = token
+    return {"httpMethod": "GET", "queryStringParameters": params}
+
+
+def _whatsapp_runtime_that_must_not_initialize(**attrs):
+    runtime = object.__new__(MawsRuntime)
+    runtime.bot_type = "whatsapp"
+    runtime.bot_kwargs = {}
+    runtime.initialize_system = lambda: pytest.fail("Meta waits ~6 s; the GET must not build the manager")
+    for name, value in attrs.items():
+        setattr(runtime, name, value)
+    return runtime
+
+
+@pytest.mark.parametrize("env_key", ["WEBHOOK_VERIFY_TOKEN", "WHATSAPP_VERIFY_TOKEN", "webhook_verify_token"])
+def test_verification_get_uses_the_env_token_without_initializing(monkeypatch, env_key):
+    for key in ("WEBHOOK_VERIFY_TOKEN", "WHATSAPP_VERIFY_TOKEN", "webhook_verify_token", "whatsapp_verify_token"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(env_key, "verify-me")
+    runtime = _whatsapp_runtime_that_must_not_initialize()
+
+    assert MawsRuntime.handle_apigw_event(runtime, _verify_get("verify-me"), None) == {"statusCode": 200, "body": "4242"}
+    assert MawsRuntime.handle_apigw_event(runtime, _verify_get("wrong"), None)["statusCode"] == 403
+    assert MawsRuntime.handle_apigw_event(runtime, _verify_get(None), None)["statusCode"] == 403
+
+
+def test_verification_get_prefers_the_token_the_bot_would_use(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_VERIFY_TOKEN", "from-webhook-key")
+    monkeypatch.setenv("WHATSAPP_VERIFY_TOKEN", "from-whatsapp-key")
+    runtime = _whatsapp_runtime_that_must_not_initialize()
+    assert MawsRuntime.handle_apigw_event(runtime, _verify_get("from-webhook-key"), None)["statusCode"] == 200
+    assert MawsRuntime.handle_apigw_event(runtime, _verify_get("from-whatsapp-key"), None)["statusCode"] == 403
+
+    runtime.bot_kwargs = {"webhook_verify_token": "from-bot-kwargs"}
+    assert MawsRuntime.handle_apigw_event(runtime, _verify_get("from-bot-kwargs"), None)["statusCode"] == 200
+    assert MawsRuntime.handle_apigw_event(runtime, _verify_get("from-webhook-key"), None)["statusCode"] == 403
+
+
+def test_verification_get_without_an_env_token_still_asks_the_bot(monkeypatch):
+    for key in ("WEBHOOK_VERIFY_TOKEN", "WHATSAPP_VERIFY_TOKEN", "webhook_verify_token", "whatsapp_verify_token"):
+        monkeypatch.delenv(key, raising=False)
+    runtime = object.__new__(MawsRuntime)
+    runtime.bot_type = "whatsapp"
+    runtime.bot_kwargs = {}
+    initialized = []
+
+    def initialize_system():
+        initialized.append(True)
+        runtime.bot_instance = types.SimpleNamespace(
+            handle_webhook_verification=lambda q: ("4242", 200) if q.get("hub.verify_token") == "from-a-key-file" else ("Forbidden", 403)
+        )
+
+    runtime.bot_instance = None
+    runtime.initialize_system = initialize_system
+
+    assert MawsRuntime.handle_apigw_event(runtime, _verify_get("from-a-key-file"), None) == {"statusCode": 200, "body": "4242"}
+    assert initialized == [True]

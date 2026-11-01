@@ -122,6 +122,7 @@ Behaviour changes for Telegram and WhatsApp:
   - A history deleted in S3 is no longer brought back by a warm container.
   - Token files are written back only when changed, with a conditional write.
   - A rejected Telegram `setWebhook` makes `maws update` fail and prints Telegram's error.
+  - WhatsApp's verification GET is answered from the verify token in the environment without building the manager. On a cold start, building it could take longer than the ~6 s Meta waits, so setting or changing the callback URL failed.
   - `requirements_source: "local"` with a path to a wheel, sdist or folder installs the Lambda extras, so Telegram bots no longer fail with `ImportError: python-telegram-bot is required`.
 - `mas start` never overwrites files; `mas` and `maws` commands return proper exit codes; API keys are typed without echo.
 - `youtube_search` works with `youtube-transcript-api` 1.x.
