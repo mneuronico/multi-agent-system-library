@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mas"
-version = "0.3.5"
+version = "0.4.0"
 description = "A powerful and flexible framework for creating and managing multi-agent systems."
 readme = "README.md"
 license = { text = "MIT" }
@@ -33,9 +33,9 @@ audio = ["mutagen>=1.46"]
 env = ["python-dotenv"]
 ffmpeg = ["ffmpeg-python>=0.2.0"]
 maws = ["boto3"]
-telegram = ["python-telegram-bot"]
+telegram = ["python-telegram-bot>=22,<23"]
 whatsapp = ["Flask>=3,<4"]
-bots = ["python-telegram-bot", "Flask>=3,<4"]
+bots = ["python-telegram-bot>=22,<23", "Flask>=3,<4"]
 data = ["pandas>=2,<3"]
 dev = ["pytest>=8,<10", "build>=1,<2", "tomli>=2,<3; python_version < '3.11'"]
 all = [
@@ -44,7 +44,7 @@ all = [
     "mutagen>=1.46",
     "pandas>=2,<3",
     "python-dotenv",
-    "python-telegram-bot",
+    "python-telegram-bot>=22,<23",
 ]
 
 [project.urls]

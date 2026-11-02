@@ -15,7 +15,10 @@
                 "search_response": "List of places found by Google Places. Each element is an object with the following fields: 'name', 'formatted_address', 'rating' (average rating), 'user_ratings_total' (number of user ratings), 'price_level', 'opening_hours', 'open_now', 'phone_number', 'website', 'editorial_summary' (a general summary of the place) and 'reviews'. Some of these fields might not be available."
             },
             "function": "fn:find_food_places",
-            "description": "Find places using Google Places. Requiers 'PLACES_API_KEY'."
+            "default_output": {
+                "search_response": "Error: Google Places could not be searched."
+            },
+            "description": "Find places using Google Places. Requires 'PLACES_API_KEY'."
         },
 
         {
@@ -26,32 +29,38 @@
                 "n_results": "Number of videos to search for, the default is 3 unless otherwise specified."
                 },
             "outputs": {
-                "video_list": "List of videos found. Each element in the list is a JSON with the fields 'title', 'description', and 'url'."
+                "video_list": "List of videos found. Each element in the list is a JSON with the fields 'title', 'description', 'url' and 'transcript' (null when the video has no transcript or it could not be retrieved)."
                 },
             "function": "fn:youtube_search",
-            "description": "Find YouTube videos and their transcripts. Requiers 'YOUTUBE_API_KEY', and installing 'googleapiclient' and 'youtube_transcript_api'."
+            "default_output": {
+                "video_list": "Error: YouTube could not be searched."
+            },
+            "description": "Find YouTube videos and their transcripts. Requires 'YOUTUBE_API_KEY', and installing 'google-api-python-client' and 'youtube-transcript-api'."
         },
 
         {
             "type": "process",
             "name": "current_date",
             "function": "fn:get_current_date",
-            "description": "Get the current date."
+            "description": "Get the current date and time in the system's timezone (general_parameters.timezone, UTC by default). Returns current_date."
         },
 
         {
             "type": "tool",
             "name": "calendar_search",
             "inputs": {
-                "start_date": "Start date of the search in YYYY-MM-DD format.",
-                "end_date": "End date of the search in YYYY-MM-DD format.",
+                "start_date": "First day of the search in YYYY-MM-DD format.",
+                "end_date": "Last day of the search in YYYY-MM-DD format (included). Use the same date as start_date to search a single day.",
                 "calendar_id": "ID of the specific calendar that will be searched."
             },
             "outputs": {
-                "event_list": "List of events found within the searched time period."
+                "event_list": "List of events found within the searched days."
             },
             "function": "fn:get_calendar",
-            "description": "Find events in a specific calendar and in a specific time range. Requiers 'CALENDAR_API_KEY' and installing 'googleapiclient'."
+            "default_output": {
+                "event_list": "Error: the calendar could not be searched."
+            },
+            "description": "Find events in a specific calendar between two dates (both included, as days in the system's timezone). Requires 'CALENDAR_API_KEY' and installing 'google-api-python-client'."
         },
 
         {
@@ -70,13 +79,13 @@
             "default_output": {
               "payment_url": "There was an error creating the URL."
             },
-            "description": "Create Mercadopago payment links. Requiers 'MERCADOPAGO_ACCESS_TOKEN' and installing 'mercadopago'."
+            "description": "Create Mercadopago payment links. Requires 'MERCADOPAGO_ACCESS_TOKEN' and installing 'mercadopago'."
         },
 
         {   "type": "process",
             "name": "markdown_to_pdf",
             "function": "fn:markdown_to_pdf",
-            "description": "Turn markdown to PDF format. Requires 'wkhtmltopdf' and 'pdfkit' to be installed. The latest message must include a text block with JSON containing 'markdown' and 'title'. Returns pdf_file_path."
+            "description": "Turn markdown into a PDF file. Requires 'markdown' and the 'wkhtmltopdf' program (on PATH, or set 'WKHTMLTOPDF_PATH'). The latest message must include a text block with JSON containing 'markdown' and 'title'. Raw HTML in the markdown is shown as text. The PDF is saved in the files folder; returns a text block with pdf_file_path and a document block that bots send as a file."
         },
 
         {
@@ -93,16 +102,20 @@
                 "location_name": "Resolved name of the location."
               },
             "function": "fn:weather_query",
-            "description": "Get weather data for a specified location. Requires 'WEATHER_API_KEY' for 'http://api.weatherapi.com'."
+            "default_output": {
+                "temperature": null,
+                "condition": "Error: the weather could not be retrieved.",
+                "wind_speed": null,
+                "location_name": null
+            },
+            "description": "Get weather data for a specified location. Requires 'WEATHER_API_KEY' for 'https://api.weatherapi.com'."
         },
 
         {
             "type": "process",
             "name": "get_google_doc",
             "function": "fn:read_google_doc",
-            "description": "Retrieve full text from a specified Google Document. Requires 'GOOGLE_DRIVE_API' and the 'GOOGLE_DOC_ID'."
+            "description": "Retrieve full text from a specified Google Document. Requires 'GOOGLE_DRIVE_API' and the 'GOOGLE_DOC_ID'. Returns doc_text."
         }
-        
-
     ]
 }

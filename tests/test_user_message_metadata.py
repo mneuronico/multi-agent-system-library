@@ -49,36 +49,57 @@ def test_bot_constructor_does_not_require_an_asyncio_event_loop(monkeypatch, wor
     _Bot(manager=manager)
 
 
+def _parsed_message(timestamp):
+    return {
+        "user_id": "chat-1",
+        "sender_id": "user-7",
+        "message_id": 123,
+        "message_type": "text",
+        "text": "hello",
+        "media_info": _Media(),
+        "is_voice_note": False,
+        "timestamp": timestamp,
+        "metadata": {"transport": "webhook", "retry": 0},
+        "original_payload": _Payload(),
+    }
+
+
 def test_bot_user_message_metadata_is_attached_and_persisted(workspace_tmp_path):
     manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
     bot = _Bot(manager=manager)
     timestamp = datetime(2026, 5, 2, 12, 30, tzinfo=timezone.utc)
 
-    blocks = asyncio.run(
-        bot._build_mas_blocks(
-            {
-                "user_id": "chat-1",
-                "message_type": "text",
-                "text": "hello",
-                "media_info": _Media(),
-                "is_voice_note": False,
-                "timestamp": timestamp,
-                "metadata": {"transport": "webhook", "retry": 0},
-                "original_payload": _Payload(),
-            }
-        )
-    )
+    blocks = asyncio.run(bot._build_mas_blocks(_parsed_message(timestamp)))
 
     metadata = blocks[0]["metadata"]["user_message"]
     assert metadata["channel"] == "_Bot"
     assert metadata["user_id"] == "chat-1"
+    assert metadata["sender_id"] == "user-7"
+    assert metadata["message_id"] == "123"
     assert metadata["message_type"] == "text"
     assert metadata["timestamp"] == "2026-05-02T12:30:00+00:00"
     assert metadata["metadata"] == {"transport": "webhook", "retry": 0}
     assert metadata["media_info"]["file_id"] == "file-1"
-    assert metadata["original_payload"]["message_id"] == 123
+    # The raw platform payload (names, usernames, phone numbers) is not persisted by default.
+    assert "original_payload" not in metadata
 
     manager.add_blocks(blocks, role="user", msg_type="user", user_id="chat-1")
     stored = manager.get_messages("chat-1")[0]["message"][0]["metadata"]["user_message"]
 
     assert stored == metadata
+
+
+def test_bot_stores_the_raw_payload_only_when_asked(workspace_tmp_path):
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path))
+    bot = _Bot(manager=manager, store_original_payload=True)
+    timestamp = datetime(2026, 5, 2, 12, 30, tzinfo=timezone.utc)
+
+    blocks = asyncio.run(bot._build_mas_blocks(_parsed_message(timestamp)))
+
+    metadata = blocks[0]["metadata"]["user_message"]
+    assert metadata["original_payload"]["message_id"] == 123
+
+    manager.add_blocks(blocks, role="user", msg_type="user", user_id="chat-1")
+    stored = manager.get_messages("chat-1")[0]["message"][0]["metadata"]["user_message"]
+
+    assert stored["original_payload"] == {"message_id": 123, "chat": {"id": "chat-1"}, "text": "hello"}

@@ -33,13 +33,20 @@ try:
     from dotenv import load_dotenv
 except ImportError:
     def load_dotenv(*args, **kwargs):
-        raise ImportError("python-dotenv is required to load .env files. Install mas[env].")
+        raise ImportError("python-dotenv is required to load .env files: pip install python-dotenv")
+try:
+    from dotenv import dotenv_values
+except ImportError:
+    def dotenv_values(*args, **kwargs):
+        raise ImportError("python-dotenv is required to load .env files: pip install python-dotenv")
 import inspect
 from datetime import datetime, timezone, timedelta
 import mimetypes, shutil
 from importlib import resources
 import logging
 import base64
+import hashlib
+import hmac
 import collections
 import textwrap
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -117,6 +124,29 @@ def what(file: Union[str, bytes, None] = None, h: Optional[bytes] = None) -> Opt
             return "avif"
 
     return None
+
+def safe_path_component(value: Any) -> str:
+    """A user or chat id as one file name / S3 key component: kept when plain, encoded otherwise.
+
+    The history, the files folder and maws's S3 keys all name a user's data with it, so they agree.
+    """
+    raw = str(value)
+    if raw and raw not in {".", ".."} and ".." not in raw and re.fullmatch(r"[A-Za-z0-9_.-]+", raw):
+        return raw
+    encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"u_{encoded or 'empty'}"
+
+
+def is_path_inside(root: Any, path: Any) -> bool:
+    """True when ``path`` resolves (symlinks and ``..`` included) to something strictly inside ``root``."""
+    try:
+        real_root = os.path.normcase(os.path.realpath(root))
+        target = os.path.normcase(os.path.realpath(path))
+        return target != real_root and os.path.commonpath([real_root, target]) == real_root
+    except (TypeError, ValueError, OSError):
+        # For example a path on another Windows drive.
+        return False
+
 
 def get_readme(owner: str, repo: str, branch: str = None,
                token: str = None) -> str:

@@ -43,6 +43,14 @@ echo ">> Bucket: ${HISTORY_BUCKET}"
 echo ">> S3 prefix: ${PREFIX}/"
 echo ">> Local destination: ${DEST}/"
 
+# Bucket names are global: only download from a bucket owned by the current AWS account.
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+if ! HEAD_OUT=$(aws s3api head-bucket --bucket "${HISTORY_BUCKET}" --expected-bucket-owner "${ACCOUNT_ID}" 2>&1); then
+  echo "[ERR] History bucket ${HISTORY_BUCKET} is missing, not accessible or not owned by account ${ACCOUNT_ID}:" >&2
+  echo "      ${HEAD_OUT}" >&2
+  exit 1
+fi
+
 # Create destination folder
 mkdir -p "${DEST}"
 

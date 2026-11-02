@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from ._shared import *
 
+
+class ResponseTruncatedError(ValueError):
+    """A model response cut off by the output token limit (incomplete, so it is not used)."""
+
+
 class Component:
     def __init__(self, name: str):
         self.name = name 
@@ -180,7 +185,8 @@ class Agent(Component):
         model_params: Optional[Dict[str, Any]] = None,
         include_timestamp: bool = False,
         description: str = None,
-        timeout: int = 120
+        timeout: int = 120,
+        max_context_messages: Optional[int] = None
     ):
         super().__init__(name)
         self.system_prompt = system_prompt
@@ -199,6 +205,7 @@ class Agent(Component):
         self.include_timestamp = include_timestamp
         self.description = description if description else "Agent"
         self.timeout = timeout
+        self.max_context_messages = max_context_messages
 
     def to_string(self) -> str:
         return (
@@ -261,6 +268,9 @@ class Agent(Component):
 
     def _runtime_include_timestamp(self) -> bool:
         return bool(self._runtime_attr("include_timestamp", self.include_timestamp))
+
+    def _runtime_max_context_messages(self) -> Optional[int]:
+        return self._runtime_attr("max_context_messages", getattr(self, "max_context_messages", None))
 
     @staticmethod
     def _runtime_model_params_for_call(instance) -> Dict[str, Any]:
@@ -359,6 +369,8 @@ class Agent(Component):
         if verbose:
             logger.debug(f"[Agent:{self.name}] Final conversation for model input:\n\n{json.dumps(conversation, indent=2, ensure_ascii=False)}\n")
 
+        self._warn_unsupported_model_params()
+
         provider_attempts = []
         runtime_models = self._runtime_models()
         if hasattr(self.manager, "prepare_model_attempts"):
@@ -406,8 +418,7 @@ class Agent(Component):
                 )
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.warning(f"[Agent:{self.name}] No API key for '{provider}'. Skipping.")
+                logger.warning(f"[Agent:{self.name}] No API key for provider '{provider}'; skipping model {model_name}.")
                 continue
             
             formatted_conversation = self._provider_format_messages(provider, conversation)
@@ -511,15 +522,11 @@ class Agent(Component):
                 self._record_manager_model_success(provider, model_name, model_info, provider_metadata)
 
                 response_dict = self._extract_and_parse_json(response_str)
-
                 if response_dict is None:
-                    response_dict = {"response": response_str}
+                    response_dict = response_str
 
-                response_blocks = self.manager._to_blocks(
-                    response_dict, self.manager._active_user_id()
-                )
+                response_blocks = self._model_output_blocks(response_dict)
 
-                self._last_used_model = {"provider": provider, "model": model_name}
                 if verbose:
                     logger.debug(f"[Agent:{self.name}] => success from provider={provider}\n{response_dict}")
                 
@@ -538,38 +545,90 @@ class Agent(Component):
                 failure_metadata = self._provider_exception_metadata(provider, model_name, req_err)
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.error(f"[Agent:{self.name}] HTTP error with provider={provider}, model={model_name}: {req_err}")
+                logger.warning(f"[Agent:{self.name}] HTTP error with provider={provider}, model={model_name}: {req_err}")
             except json.JSONDecodeError as json_err:
                 failure_metadata = self._provider_exception_metadata(provider, model_name, json_err)
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.error(f"[Agent:{self.name}] JSON decoding error with provider={provider}, model={model_name}: {json_err}")
+                logger.warning(f"[Agent:{self.name}] JSON decoding error with provider={provider}, model={model_name}: {json_err}")
+            except ResponseTruncatedError as truncated:
+                # The next model is tried, but the model itself is healthy: the limit was too low for
+                # this request. Recording it as a model failure would put the model in cooldown and
+                # route every other user to the fallbacks.
+                failure_metadata = self._provider_exception_metadata(provider, model_name, truncated)
+                failure_metadata["truncated"] = True
+                provider_attempts.append(failure_metadata)
+                logger.warning(f"[Agent:{self.name}] Response truncated with provider={provider}, model={model_name}: {truncated}")
             except ValueError as val_err:
                 failure_metadata = self._provider_exception_metadata(provider, model_name, val_err)
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.error(f"[Agent:{self.name}] Value error with provider={provider}, model={model_name}: {val_err}")
+                logger.warning(f"[Agent:{self.name}] Value error with provider={provider}, model={model_name}: {val_err}")
             except (KeyError, IndexError, TypeError) as parse_err:
                 failure_metadata = self._provider_exception_metadata(provider, model_name, parse_err)
                 provider_attempts.append(failure_metadata)
                 self._record_manager_model_failure(provider, model_name, model_info, failure_metadata)
-                if verbose:
-                    logger.error(
-                        f"[Agent:{self.name}] Invalid response shape with provider={provider}, "
-                        f"model={model_name}: {parse_err}"
-                    )
+                logger.warning(
+                    f"[Agent:{self.name}] Invalid response shape with provider={provider}, "
+                    f"model={model_name}: {parse_err}"
+                )
 
-        if verbose:
-            logger.warning(f"[Agent:{self.name}] => All providers failed. Returning default:\n{self._runtime_default_output()}")
+        logger.error(
+            f"[Agent:{self.name}] All configured models failed or were skipped; returning default_output. "
+            "Errors are in the message metadata under 'provider_errors'."
+        )
         default_blocks = self.manager._to_blocks(
             self._runtime_default_output(),
             self.manager._active_user_id()
         )
         self._attach_provider_metadata(default_blocks, None, provider_attempts)
         return default_blocks
+
+    SUPPORTED_MODEL_PARAMS = frozenset({"temperature", "max_tokens", "top_p", "base_url"})
+
+    def _warn_unsupported_model_params(self) -> None:
+        # Providers only receive the parameters above; say so once instead of dropping others silently.
+        unsupported = set(self._runtime_model_params()) - self.SUPPORTED_MODEL_PARAMS
+        warned = self.__dict__.setdefault("_warned_model_params", set())
+        new = sorted(unsupported - warned)
+        if new:
+            warned.update(new)
+            logger.warning(
+                f"[Agent:{self.name}] model_params {new} are not sent to any provider; supported: "
+                f"{sorted(self.SUPPORTED_MODEL_PARAMS)}."
+            )
+
+    def _model_output_blocks(self, parsed: Any) -> List[Dict[str, Any]]:
+        # Model output is untrusted data. The only blocks it may produce are variable blocks for
+        # variables declared in general_parameters.variables. Anything else (component overrides
+        # such as "agent:system_prompt" or "agent:base_url", image/document blocks pointing at
+        # local paths, unknown block types) is stored as plain text content. A JSON array gives one
+        # block per item, as it always did.
+        if isinstance(parsed, list):
+            blocks = self._model_output_item_blocks(parsed)
+            if blocks:
+                return blocks
+        elif self._is_declared_variable_block(parsed):
+            return self.manager._to_blocks([parsed], self.manager._active_user_id())
+        if not isinstance(parsed, dict):
+            parsed = {"response": parsed}
+        return [{"type": "text", "content": parsed}]
+
+    def _model_output_item_blocks(self, item: Any) -> List[Dict[str, Any]]:
+        if isinstance(item, list):
+            return [block for sub_item in item for block in self._model_output_item_blocks(sub_item)]
+        if self._is_declared_variable_block(item):
+            return self.manager._to_blocks([item], self.manager._active_user_id())
+        if isinstance(item, dict):
+            return [{"type": "text", "content": item}]
+        return [{"type": "text", "content": str(item)}]
+
+    def _is_declared_variable_block(self, value: Any) -> bool:
+        if not (isinstance(value, dict) and value.get("type") == "variable" and "value" in value):
+            return False
+        key = value.get("key")
+        declared = getattr(self.manager, "variable_definitions", None) or {}
+        return isinstance(key, str) and key.strip() in declared
 
     def _as_blocks(self, value):
         is_block = getattr(self.manager, "_is_block", None)
@@ -745,8 +804,35 @@ class Agent(Component):
             response=response,
         )
 
+    def _raise_if_truncated(self, finish_reason: Any, truncated_value: str) -> None:
+        # A response cut by the token limit is incomplete JSON that the lenient parser would
+        # "repair" into partial output. Fail the attempt instead so the next model is tried.
+        if finish_reason == truncated_value:
+            raise ResponseTruncatedError(
+                f"Response truncated by the output token limit (finish reason '{finish_reason}'). "
+                "Raise model_params.max_tokens or shorten the required outputs."
+            )
+
     def _remember_provider_response(self, metadata: Dict[str, Any]) -> None:
         self._last_provider_response_metadata = metadata
+
+    _call_state_lock = threading.Lock()
+
+    def _call_state(self):
+        # One Agent instance serves every user concurrently, so per-call data must be per thread.
+        state = self.__dict__.get("_thread_call_state")
+        if state is None:
+            with Agent._call_state_lock:
+                state = self.__dict__.setdefault("_thread_call_state", threading.local())
+        return state
+
+    @property
+    def _last_provider_response_metadata(self) -> Optional[Dict[str, Any]]:
+        return getattr(self._call_state(), "provider_response", None)
+
+    @_last_provider_response_metadata.setter
+    def _last_provider_response_metadata(self, metadata: Optional[Dict[str, Any]]) -> None:
+        self._call_state().provider_response = metadata
 
     def _record_manager_model_failure(
         self,
@@ -1168,6 +1254,18 @@ class Agent(Component):
         filtered_msgs: List[tuple],
         verbose: bool
     ) -> List[Dict[str, Any]]:
+        # Without an explicit input selection the agent reads the whole (filtered) history, so
+        # max_context_messages caps how much of it is sent on every call.
+        limit = self._runtime_max_context_messages()
+        if limit:
+            filtered_msgs = filtered_msgs[-int(limit):]
+            # The cut can land on this agent's own reply, which would make the conversation start
+            # with an assistant turn; providers such as Anthropic require a user turn first.
+            first_user_turn = next(
+                (i for i, msg in enumerate(filtered_msgs) if msg[0] != self.name), None
+            )
+            if first_user_turn:
+                filtered_msgs = filtered_msgs[first_user_turn:]
         conversation = self._transform_to_conversation(filtered_msgs)
         conversation = [{"role": "system", "content": self._runtime_system_prompt()}] + conversation
         return conversation
@@ -1406,14 +1504,15 @@ class Agent(Component):
         return_token_count: bool = False
     ) -> str:
         schema_for_response = self._build_json_schema()
-        
+
         mp = Agent._runtime_model_params_for_call(self)
         params = {
             "temperature": mp.get("temperature"),
-            "max_tokens": mp.get("max_tokens"),
+            # OpenAI deprecated max_tokens; reasoning models (o-series, gpt-5) reject it.
+            "max_completion_tokens": mp.get("max_tokens"),
             "top_p": mp.get("top_p")
         }
-        
+
         params = {k: v for k, v in params.items() if v is not None}
 
         
@@ -1480,6 +1579,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, json_response["choices"][0].get("finish_reason"), "length")
         content = json_response["choices"][0]["message"]["content"]
         Agent._remember_provider_response(
             self,
@@ -1575,6 +1675,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, json_response["choices"][0].get("finish_reason"), "length")
         content = json_response["choices"][0]["message"]["content"]
         Agent._remember_provider_response(
             self,
@@ -1672,6 +1773,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, json_response["choices"][0].get("finish_reason"), "length")
         content = json_response["choices"][0]["message"]["content"]
         Agent._remember_provider_response(
             self,
@@ -1767,6 +1869,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, json_response["choices"][0].get("finish_reason"), "length")
         content = json_response["choices"][0]["message"]["content"]
         Agent._remember_provider_response(
             self,
@@ -1920,6 +2023,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, data["candidates"][0].get("finishReason"), "MAX_TOKENS")
         content = data["candidates"][0]["content"]["parts"][0]["text"]
         Agent._remember_provider_response(
             self,
@@ -2014,6 +2118,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, json_response.get("stop_reason"), "max_tokens")
         content = json_response["content"][0]["text"]
         Agent._remember_provider_response(
             self,
@@ -2114,6 +2219,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, json_response["choices"][0].get("finish_reason"), "length")
         content = json_response["choices"][0]["message"]["content"]
         Agent._remember_provider_response(
             self,
@@ -2232,6 +2338,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, json_response["choices"][0].get("finish_reason"), "length")
         content = json_response["choices"][0]["message"]["content"]
         Agent._remember_provider_response(
             self,
@@ -2326,6 +2433,7 @@ class Agent(Component):
                 usage=usage
             )
         )
+        Agent._raise_if_truncated(self, json_response["choices"][0].get("finish_reason"), "length")
         message = json_response["choices"][0]["message"]
         content = message.get("content")
         if content is None:
@@ -2454,27 +2562,34 @@ class Tool(Component):
             pos_or_kw = [p for p in fparams if p.kind == POS_OR_KW]
             kw_only   = [p for p in fparams if p.kind == KW_ONLY]
 
-            def _coerce(v):
-                if isinstance(v, str):
-                    s = v.strip().lower()
-                    if s in ("null", "none", ""):
-                        return None
-                    if s == "true":
-                        return True
-                    if s == "false":
-                        return False
+            params_by_name = {p.name: p for p in fparams}
+
+            def _coerce(name, v):
+                # Models often write booleans and null as text. Parameters annotated as str get
+                # the text verbatim, and an empty string always stays an empty string.
+                if not isinstance(v, str):
+                    return v
+                param = params_by_name.get(name)
+                if param is not None and param.annotation in (str, "str"):
+                    return v
+                s = v.strip().lower()
+                if s in ("null", "none"):
+                    return None
+                if s == "true":
+                    return True
+                if s == "false":
+                    return False
                 return v
 
             if isinstance(input_dict, dict):
-                input_dict = {k: _coerce(v) for k, v in input_dict.items()}
+                input_dict = {k: _coerce(k, v) for k, v in input_dict.items()}
 
             missing = []
             missing += [p.name for p in pos_only  if p.default is inspect._empty and p.name not in input_dict]
             missing += [p.name for p in pos_or_kw if p.default is inspect._empty and p.name not in input_dict]
             missing += [p.name for p in kw_only   if p.default is inspect._empty and p.name not in input_dict]
             if missing:
-                if verbose:
-                    logger.error(f"[Tool:{self.name}] Required arguments are missing: {missing}")
+                logger.error(f"[Tool:{self.name}] Required arguments are missing: {missing}; returning default_output.")
                 return self._runtime_default_output()
 
             pos_args = []
@@ -2823,9 +2938,8 @@ class Process(Component):
                 logger.debug(f"[Process:{self.name}] => {output}")
 
             return output
-        except (TypeError, ValueError) as e:
-            if verbose:
-                logger.exception(f"[Process:{self.name}] => error: {e}")
+        except Exception as e:
+            logger.exception(f"[Process:{self.name}] => error: {e}")
             return {}
 
 
@@ -3417,12 +3531,10 @@ class Automation(Component):
             self.manager.set_current_user(active_user_id)
         comp = node["component"]
         if comp is None:
-            if verbose:
-                logger.warning(
-                    f"[Automation:{self.name}] => no such component "
-                    f"'{node['component_name']}'. Skipping."
-                )
-            return {"node": node, "component": None, "output": None, "skipped": True}
+            raise ValueError(
+                f"[Automation:{self.name}] Step '{node['step']}' refers to unknown component "
+                f"'{node['component_name']}'."
+            )
 
         output = self._run_component_step(
             comp,
@@ -3506,9 +3618,7 @@ class Automation(Component):
 
             comp = self.manager._get_component(comp_name)
             if not comp:
-                if verbose:
-                    logger.warning(f"[Automation:{self.name}] => no such component '{comp_name}'. Skipping.")
-                return current_output
+                raise ValueError(f"[Automation:{self.name}] Step '{step}' refers to unknown component '{comp_name}'.")
 
             if verbose:
                 logger.debug(f"[Automation:{self.name}] => running component '{comp_name}'")
@@ -3554,31 +3664,41 @@ class Automation(Component):
                 )
 
             elif control_flow_type == "while":
-                run_first_pass = step.get("run_first_pass", True)
-                start_condition = step.get("start_condition", step.get("condition", run_first_pass))
-                end_condition = step.get("end_condition", step.get("condition"))
                 body = step.get("body", [])
+                max_iterations = step.get("max_iterations", self.DEFAULT_MAX_WHILE_ITERATIONS)
+                iterations = 0
 
-                if (isinstance(start_condition, bool) and start_condition) or \
-                (isinstance(start_condition, (str, dict)) and self._evaluate_condition(start_condition, current_output)):
-                    while True:
-                        if verbose:
-                            logger.debug(f"[Automation:{self.name}] => executing while loop body.")
-                        current_output = self._execute_sequence(
-                            body,
-                            current_output,
-                            db_conn,
-                            verbose,
-                            on_update,
-                            on_update_params,
-                            return_token_count
+                def run_body(output):
+                    nonlocal iterations
+                    if max_iterations is not None and iterations >= max_iterations:
+                        raise RuntimeError(
+                            f"[Automation:{self.name}] while loop reached max_iterations={max_iterations} "
+                            "without meeting its exit condition."
                         )
+                    iterations += 1
+                    if verbose:
+                        logger.debug(f"[Automation:{self.name}] => executing while loop body (pass {iterations}).")
+                    return self._execute_sequence(
+                        body, output, db_conn, verbose, on_update, on_update_params, return_token_count
+                    )
 
-                        if (isinstance(end_condition, bool) and end_condition) or \
-                        (isinstance(end_condition, (str, dict)) and self._evaluate_condition(end_condition, current_output)):
-                            break
-                        if verbose:
-                            logger.debug(f"[Automation:{self.name}] => while loop iteration complete.")
+                if "condition" in step and "start_condition" not in step and "end_condition" not in step:
+                    # A plain "condition" means what it says: run the body while it holds,
+                    # checking it before every pass (including the first).
+                    while self._condition_holds(step["condition"], current_output):
+                        current_output = run_body(current_output)
+                else:
+                    # start_condition decides the first pass; end_condition is checked after
+                    # every pass and stops the loop when it holds.
+                    start_condition = step.get(
+                        "start_condition", step.get("condition", step.get("run_first_pass", True))
+                    )
+                    end_condition = step.get("end_condition", step.get("condition"))
+                    if self._condition_holds(start_condition, current_output):
+                        while True:
+                            current_output = run_body(current_output)
+                            if self._condition_holds(end_condition, current_output):
+                                break
 
             elif control_flow_type == "for":
                 items_spec = step.get("items")
@@ -3741,9 +3861,36 @@ class Automation(Component):
         
         return [items_data]
 
+    DEFAULT_MAX_WHILE_ITERATIONS = 100
+
+    def _condition_holds(self, condition, current_output) -> bool:
+        if condition is None:
+            return False
+        if isinstance(condition, bool):
+            return condition
+        return bool(self._evaluate_condition(condition, current_output))
+
+    def _latest_message_data(self, db_conn) -> Any:
+        messages = self.manager._get_all_messages(db_conn)
+        if not messages:
+            return {}
+        return self.manager._blocks_as_tool_input(messages[-1][1])
+
+    def _condition_function_input(self, parsed: dict, db_conn) -> Any:
+        # Without an input spec a condition function receives the latest message's data.
+        if parsed.get("selection") or parsed.get("multiple_sources") or parsed.get("single_source"):
+            return self._gather_data_for_parser_result(parsed, db_conn)
+        return self._latest_message_data(db_conn)
+
     def _evaluate_condition(self, condition, current_output) -> bool:
 
         db_conn = self.manager._get_user_db()
+
+        if callable(condition):
+            result = condition(self._latest_message_data(db_conn))
+            if not isinstance(result, bool):
+                raise ValueError(f"[Automation:{self.name}] Condition callable did not return a bool.")
+            return result
 
         def _truthy(value) -> bool:
             if isinstance(value, str):
@@ -3758,7 +3905,7 @@ class Automation(Component):
             parsed = self.manager.parser.parse_input_string(condition)
 
             if parsed["is_function"] and parsed["function_name"]:
-                input_data = self._gather_data_for_parser_result(parsed, db_conn)
+                input_data = self._condition_function_input(parsed, db_conn)
                 fn = self.manager._get_function_from_string(parsed["function_name"])
                 result = fn(input_data)
                 if not isinstance(result, bool):
@@ -3785,7 +3932,7 @@ class Automation(Component):
             parsed = self.manager.parser.parse_input_string(input_spec)
 
             if parsed["is_function"] and parsed["function_name"]:
-                input_data = self._gather_data_for_parser_result(parsed, db_conn)
+                input_data = self._condition_function_input(parsed, db_conn)
                 fn = self.manager._get_function_from_string(parsed["function_name"])
                 result = fn(input_data)
                 return (result == target_value)

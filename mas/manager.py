@@ -4,7 +4,95 @@ from ._shared import *
 from .components import Agent, Automation, Component, Process, Tool
 from .parser import Parser
 from .bots import TelegramBot, WhatsappBot
+import contextlib
+import functools
 import math
+
+
+def _scoped_to_user_id(method):
+    # Public methods that take a user_id act on that user for the call only (see _user_scope).
+    parameters = list(inspect.signature(method).parameters.values())
+    user_param = next(p for p in parameters if p.name == "user_id")
+    # Position of user_id among the arguments after self, when it can be passed positionally.
+    position = (
+        parameters.index(user_param) - 1
+        if user_param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        else None
+    )
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if "user_id" in kwargs:
+            user_id = kwargs["user_id"]
+        elif position is not None and len(args) > position:
+            user_id = args[position]
+        else:
+            user_id = None
+        with self._user_scope(user_id):
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+class _BoundedFileCache(collections.OrderedDict):
+    # Loaded history files are cached to avoid re-reading them, but a long-running bot sees an
+    # unbounded number of files: keep the most recent ones within an entry and byte budget.
+    max_items = 256
+    max_bytes = 64 * 1024 * 1024
+
+    def __init__(self):
+        super().__init__()
+        self._sizes = {}
+        self._total = 0
+        self._lock = threading.Lock()
+
+    def __setitem__(self, key, value):
+        size = len(value) if isinstance(value, (bytes, bytearray)) else 0
+        if size > self.max_bytes // 4:
+            # Too big to keep in memory (it is read from disk when needed); drop any older value
+            # cached under this key so it is not served instead.
+            self.pop(key, None)
+            return
+        with self._lock:
+            if key in self:
+                super().__delitem__(key)
+                self._total -= self._sizes.pop(key, 0)
+            super().__setitem__(key, value)
+            self._sizes[key] = size
+            self._total += size
+            while len(self) > self.max_items or self._total > self.max_bytes:
+                oldest, _ = self.popitem(last=False)
+                self._total -= self._sizes.pop(oldest, 0)
+
+    def pop(self, key, *default):
+        with self._lock:
+            self._total -= self._sizes.pop(key, 0)
+            return super().pop(key, *default)
+
+
+_PACKAGED_LIB_COPIES: Dict[str, str] = {}
+
+
+def _packaged_lib_file(filename: str) -> Optional[str]:
+    # Path to a file shipped in mas/lib. Regular installs return the installed file itself; only a
+    # zipped install needs a copy on disk, made once per process.
+    try:
+        ref = resources.files("mas.lib").joinpath(filename)
+        if not ref.is_file():
+            return None
+    except (FileNotFoundError, ModuleNotFoundError):
+        return None
+    try:
+        return os.fspath(ref)
+    except TypeError:
+        cached = _PACKAGED_LIB_COPIES.get(filename)
+        if cached is None or not os.path.exists(cached):
+            cached = os.path.join(tempfile.mkdtemp(prefix="mas_lib_"), filename)
+            with open(cached, "wb") as fp:
+                fp.write(ref.read_bytes())
+            _PACKAGED_LIB_COPIES[filename] = cached
+        return cached
+
 
 class AgentSystemManager:
 
@@ -12,35 +100,67 @@ class AgentSystemManager:
         self,
         config: str = None,
         imports: List[str] = None,
-        base_directory: str = os.getcwd(),
+        base_directory: Optional[str] = None,
         verbose: bool = False,
         bootstrap_models: Optional[List[Dict[str, str]]] = None,
         api_keys_path: Optional[str] = None,
         costs_path: str = None,
         history_folder: Optional[str] = None,
         files_folder: Optional[str] = None,
-        general_system_description: str = "This is a multi agent system.",
-        functions: Union[str, List[str]] = "fns.py",
+        general_system_description: Optional[str] = None,
+        functions: Optional[Union[str, List[str]]] = None,
         default_models: Optional[List[Dict[str, str]]] = None,
         on_update: Optional[Callable] = None,
         on_complete: Optional[Callable] = None,
-        include_timestamp: bool = False,
-        timezone: str = "UTC",
+        include_timestamp: Optional[bool] = None,
+        max_context_messages: Optional[int] = None,
+        timezone: Optional[str] = None,
         log_level=None,
         admin_user_id: Optional[str] = None,
-        usage_logging: bool = False,
+        usage_logging: Optional[bool] = None,
         timeout: Optional[int] = None,
         model_failure_policy: Optional[Union[bool, Dict[str, Any]]] = None,
-        history_mode: str = "per_user",
-        history_rotation: str = "message_count",
-        history_max_messages: int = 1000,
-        history_period: Union[str, int, float, timedelta] = "1w"
+        history_mode: Optional[str] = None,
+        history_rotation: Optional[str] = None,
+        history_max_messages: Optional[int] = None,
+        history_period: Optional[Union[str, int, float, timedelta]] = None
     ):
+        # Arguments passed explicitly always win over general_parameters in a JSON config, which in
+        # turn win over the library defaults. None means "not passed".
+        self._explicit_args = {
+            name: value for name, value in {
+                "imports": imports,
+                "base_directory": base_directory,
+                "api_keys_path": api_keys_path,
+                "costs_path": costs_path,
+                "general_system_description": general_system_description,
+                "functions": functions,
+                "default_models": default_models,
+                "on_update": on_update,
+                "on_complete": on_complete,
+                "include_timestamp": include_timestamp,
+                "max_context_messages": max_context_messages,
+                "timezone": timezone,
+                "admin_user_id": admin_user_id,
+                "usage_logging": usage_logging,
+                "timeout": timeout,
+                "model_failure_policy": model_failure_policy,
+                "history_mode": history_mode,
+                "history_rotation": history_rotation,
+                "history_max_messages": history_max_messages,
+                "history_period": history_period,
+            }.items()
+            if value is not None
+        }
 
         self._tls = threading.local()
         self._db_pool = {}
         self._db_locks = {}
+        # Bumped whenever pooled connections are closed (import_history, reset_system,
+        # clear_global_history) so every thread reconnects instead of using a closed handle.
+        self._db_generation = 0
         self._db_write_lock = threading.RLock()
+        self._usage_log_lock = threading.Lock()
         self._shared_history_lock = threading.RLock()
         self._variable_lock = threading.RLock()
         self._model_health_lock = threading.RLock()
@@ -48,7 +168,7 @@ class AgentSystemManager:
         self.variable_definitions: Dict[str, Dict[str, Any]] = {}
         self._model_failure_policy = self._default_model_failure_policy()
         self._configure_model_failure_policy(model_failure_policy)
-        self.base_directory = os.path.abspath(base_directory)
+        self.base_directory = os.path.abspath(base_directory or os.getcwd())
         self._shared_history_prefix = "shared_history"
         self._configure_history_storage(
             mode=history_mode,
@@ -57,18 +177,22 @@ class AgentSystemManager:
             period=history_period,
         )
         self._usage_logging_enabled = bool(usage_logging)
-        self.general_system_description = general_system_description
+        self.general_system_description = (
+            general_system_description if general_system_description is not None else "This is a multi-agent system."
+        )
         self.on_update = self._resolve_callable(on_update)
         self.on_complete = self._resolve_callable(on_complete)
         self.api_keys_path = None
 
         self.timeout = timeout
-        
-        description_mode = (
-            isinstance(config, str)
-            and not config.lower().endswith(".json")
-            and not os.path.exists(config)
-        )
+
+        if isinstance(config, str) and not os.path.exists(config) and self._looks_like_config_path(config):
+            raise FileNotFoundError(
+                f"MAS config file not found: '{config}'. Plain-text descriptions are only used to "
+                "bootstrap a new system when they contain spaces and do not look like a file path."
+            )
+
+        description_mode = isinstance(config, str) and not os.path.exists(config)
 
         if description_mode:
             self._resolve_api_keys_path(api_keys_path)
@@ -76,7 +200,7 @@ class AgentSystemManager:
 
             config = self._bootstrap_from_description(
                 description       = config,
-                base_directory    = base_directory,
+                base_directory    = self.base_directory,
                 default_models    = bootstrap_models,
                 verbose           = verbose,
                 api_keys_path     = api_keys_path
@@ -85,8 +209,9 @@ class AgentSystemManager:
         if log_level is not None:
             logger.setLevel(log_level)
 
-        self._file_cache = {}
+        self._file_cache = _BoundedFileCache()
         self._component_order: List[str] = []
+        self._imported_component_names = set()
 
         self.agents: Dict[str, Agent] = {}
         self.tools: Dict[str, Tool] = {}
@@ -103,24 +228,17 @@ class AgentSystemManager:
         self.default_models = default_models
         self._register_model_infos(self.default_models)
 
-        if not imports:
-            self.imports = []
-        elif isinstance(imports, str):
-            self.imports = [imports]
-        elif isinstance(imports, list):
-            self.imports = imports
-        else:
-            raise ValueError(f"Imports must be list or string")
-
+        self.imports = self._normalize_imports(imports)
         self._processed_imports = set()
 
         self.admin_user_id = str(admin_user_id) if admin_user_id is not None else None
 
-        self.include_timestamp = include_timestamp
-        self.timezone = timezone
+        self.include_timestamp = bool(include_timestamp)
+        self.max_context_messages = self._validate_max_context_messages(max_context_messages)
+        self.timezone = timezone or "UTC"
 
         self._function_cache = {}
-        self.functions = functions
+        self.functions = functions if functions is not None else "fns.py"
 
         self.costs_path = costs_path
         self.costs = {}
@@ -130,7 +248,9 @@ class AgentSystemManager:
         else:
             self.functions = self.functions
         
-        if config and config.endswith(".json"):
+        if config:
+            if not os.path.isfile(config):
+                raise ValueError(f"MAS config must be a path to a JSON file; '{config}' is not a file.")
             try:
                 self.build_from_json(config)
             except (FileNotFoundError, json.JSONDecodeError) as e:
@@ -161,6 +281,8 @@ class AgentSystemManager:
                     self.link(agent_name, tool_name)
                 except ValueError as e:
                     logger.error(f"Warning: Could not link agent '{agent_name}' to tool '{tool_name}'. Error: {e}")
+
+        self._validate_automation_steps()
 
         self._last_known_update = None
 
@@ -209,11 +331,32 @@ class AgentSystemManager:
         return data
 
 
+    @staticmethod
+    def _looks_like_config_path(text: str) -> bool:
+        # A missing path (or a typo in one) must never be mistaken for a plain-text system description.
+        s = text.strip()
+        if not s or s.lower().endswith(".json"):
+            return True
+        if not any(ch.isspace() for ch in s):
+            return True
+        return bool(re.match(r"^(~|\.{1,2}[\\/]|[\\/]|[A-Za-z]:[\\/])", s))
+
     def _bootstrap_from_description(self, *, description: str,
                                     base_directory: str,
                                     default_models: Optional[List[Dict[str, str]]],
                                     verbose: bool = False,
                                     api_keys_path: Optional[str] = None) -> str:
+
+        base_directory = os.path.abspath(base_directory)
+        final_cfg_path = os.path.join(base_directory, "config.json")
+        final_fns_path = os.path.join(base_directory, "fns.py")
+        existing = [p for p in (final_cfg_path, final_fns_path) if os.path.exists(p)]
+        if existing:
+            raise FileExistsError(
+                "Bootstrapping a system from a description would overwrite "
+                f"{', '.join(existing)}. To load the existing system pass config='{final_cfg_path}'; "
+                "to regenerate it, move or delete those files first."
+            )
 
         readme_text = get_readme("mneuronico", "multi-agent-system-library")
 
@@ -265,7 +408,7 @@ class AgentSystemManager:
             - groq: {recommended_models['groq']}
             - wavespeed: {recommended_models['wavespeed']}
             - nvidia: {recommended_models['nvidia']}
-        3.  **Functions File:** If your configuration requires custom functions, include them in the `fns` list as full Python source code strings. Ensure that any function you reference in the components is defined here. If those functions rely on external libraries, you must include the necessary import statements at the top of the `fns.py` file, and attempt to install them via pip if the import fails.
+        3.  **Functions File:** If your configuration requires custom functions, include them in the `fns` list as full Python source code strings. Ensure that any function you reference in the components is defined here. If those functions rely on external libraries, include the necessary import statements at the top of the `fns.py` file and list the required pip packages in a comment. Never install packages or run shell commands from the generated code.
         4.  **Processes and Tools:** Remember that ALL Tool components require that a previous component's outputs have keys that match the inputs required by that tool. Sometimes this means requiring outputs for an agent that produces those tool inputs. Sometimes that means building a Process that converts something (for example, the user message) into the correct tool input format. Inside process or tool functions, you can use the manager passed as an argument, and in particular manager.read() might be useful to get info out of messages and blocks (check the docs).
         """)
 
@@ -299,16 +442,20 @@ class AgentSystemManager:
         }
 
         sub_mgr = None
-        bootstrap_cfg_path = os.path.join(base_directory,
-                                          "_bootstrap_config.json")
-        
+        # The bootstrap agent keeps its config, history and files in a private temp dir so it
+        # never touches (or deletes) anything that already lives under base_directory.
+        bootstrap_dir = tempfile.mkdtemp(prefix="mas_bootstrap_")
+        bootstrap_cfg_path = os.path.join(bootstrap_dir, "_bootstrap_config.json")
 
         try:
             with open(bootstrap_cfg_path, "w", encoding="utf-8") as fp:
                 json.dump(bootstrap_cfg, fp, indent=2)
 
             sub_mgr = AgentSystemManager(config=bootstrap_cfg_path,
-                                        base_directory=base_directory)
+                                        base_directory=base_directory,
+                                        api_keys_path=self.api_keys_path,
+                                        history_folder=os.path.join(bootstrap_dir, "history"),
+                                        files_folder=os.path.join(bootstrap_dir, "files"))
 
             blocks = sub_mgr.run(
                 input=combined_input,
@@ -357,15 +504,21 @@ class AgentSystemManager:
             comps    = cleaned_payload["components"]
             fns_list = cleaned_payload["fns"]
 
-            final_cfg_path = os.path.join(base_directory, "config.json")
-            with open(final_cfg_path, "w", encoding="utf-8") as fp:
+            if isinstance(gp, dict):
+                # Generated files must stay where the user asked for them.
+                gp.pop("base_directory", None)
+
+            with open(final_cfg_path, "x", encoding="utf-8") as fp:
                 json.dump({"general_parameters": gp, "components": comps}, fp, indent=2)
 
-            final_fns_path = os.path.join(base_directory, "fns.py")
             if isinstance(fns_list, list):
-                with open(final_fns_path, "w", encoding="utf-8") as fp:
+                with open(final_fns_path, "x", encoding="utf-8") as fp:
                     fp.write("\n\n".join(map(str, fns_list)))
 
+            logger.warning(
+                f"[Manager] Generated {final_cfg_path} and {final_fns_path} from a description. "
+                "Review them: fns.py is LLM-written code and runs when the system loads."
+            )
             return final_cfg_path
 
         finally:
@@ -374,19 +527,7 @@ class AgentSystemManager:
                     sub_mgr._close_all_db_conns()
                 except Exception:
                     pass
-
-            # Borrar las carpetas temporales creadas por el sub_mgr
-            for folder in ("history", "files"):
-                path = os.path.join(base_directory, folder)
-                if os.path.isdir(path):
-                    shutil.rmtree(path, ignore_errors=True)
-
-            # Borrar el archivo de config temporal
-            if os.path.exists(bootstrap_cfg_path):
-                try:
-                    os.remove(bootstrap_cfg_path)
-                except OSError:
-                    pass
+            shutil.rmtree(bootstrap_dir, ignore_errors=True)
 
     def _resolve_api_keys_path(self, api_keys_path):
         if api_keys_path is None:
@@ -459,35 +600,38 @@ class AgentSystemManager:
             raise FileNotFoundError(f"Could not locate JSON file for '{file_part}' "
                                     f"locally or in GitHub 'lib' folder.")
 
-        temp_manager = AgentSystemManager(config=resolved_json_path)
-        self._merge_imported_components(temp_manager, components)
+        # The imported config is loaded by a throwaway manager. It resolves relative function paths
+        # against this manager's base directory and keeps its (unused) history folders private.
+        scratch_dir = tempfile.mkdtemp(prefix="mas_import_")
+        try:
+            temp_manager = AgentSystemManager(
+                config=resolved_json_path,
+                base_directory=self.base_directory,
+                history_folder=os.path.join(scratch_dir, "history"),
+                files_folder=os.path.join(scratch_dir, "files"),
+            )
+            self._merge_imported_components(temp_manager, components)
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
     def _load_local_json_if_exists(self, filename_no_ext: str) -> str:
-        json_file_name = f"{filename_no_ext}.json"
-
-        try:
-            file_text = resources.read_text("mas.lib", json_file_name)
-        except FileNotFoundError:
-            return None
-        
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-        tmp_file.write(file_text.encode("utf-8"))
-        tmp_file.flush()
-        tmp_file.close()
-        return tmp_file.name
+        return _packaged_lib_file(f"{filename_no_ext}.json")
     
     def _merge_imported_components(self, other_mgr, only_names):
         for key, definition in getattr(other_mgr, "variable_definitions", {}).items():
             if key not in self.variable_definitions:
                 self.variable_definitions[key] = copy.deepcopy(definition)
 
+        imported_general = getattr(other_mgr, "_json_general_parameters", set())
         for name, agent_obj in other_mgr.agents.items():
             if only_names and name not in only_names:
                 continue
             if name not in self.agents:
+                self._adopt_imported_agent(other_mgr, agent_obj, imported_general)
                 agent_obj.manager = self
                 self.agents[name] = agent_obj
                 self._component_order.append(name)
+                self._imported_component_names.add(name)
 
         for name, tool_obj in other_mgr.tools.items():
             if only_names and name not in only_names:
@@ -496,6 +640,7 @@ class AgentSystemManager:
                 tool_obj.manager = self
                 self.tools[name] = tool_obj
                 self._component_order.append(name)
+                self._imported_component_names.add(name)
 
         for name, proc_obj in other_mgr.processes.items():
             if only_names and name not in only_names:
@@ -504,6 +649,7 @@ class AgentSystemManager:
                 proc_obj.manager = self
                 self.processes[name] = proc_obj
                 self._component_order.append(name)
+                self._imported_component_names.add(name)
 
         for name, auto_obj in other_mgr.automations.items():
             if only_names and name not in only_names:
@@ -512,6 +658,31 @@ class AgentSystemManager:
                 auto_obj.manager = self
                 self.automations[name] = auto_obj
                 self._component_order.append(name)
+                self._imported_component_names.add(name)
+
+    def _adopt_imported_agent(self, other_mgr, agent, imported_general) -> None:
+        # Settings the imported agent only got from its loader's defaults follow this manager's
+        # configuration (models, timeout, timestamps, system description), unless the imported
+        # file set them in its own general_parameters.
+        inherited = getattr(agent, "_inherited_settings", set())
+        if "models" in inherited and "default_models" not in imported_general:
+            agent.models = copy.deepcopy(self.default_models)
+            self._register_model_infos(agent.models)
+        if "timeout" in inherited and "timeout" not in imported_general and self.timeout is not None:
+            agent.timeout = self.timeout
+        if "include_timestamp" in inherited and "include_timestamp" not in imported_general:
+            agent.include_timestamp = self.include_timestamp
+        if "max_context_messages" in inherited and "max_context_messages" not in imported_general:
+            agent.max_context_messages = self.max_context_messages
+        if "general_system_description" not in imported_general:
+            suffix = other_mgr._agent_prompt_suffix(agent)
+            agent.general_system_description = self.general_system_description
+            agent.system_prompt = self._build_agent_prompt(
+                self.general_system_description,
+                agent.name,
+                agent.system_prompt_original,
+                agent.required_outputs,
+            ) + suffix
 
     def _component_exists(self, name: str) -> bool:
         return any(
@@ -565,7 +736,7 @@ class AgentSystemManager:
         return callback()
         
     def clear_file_cache(self):
-        self._file_cache = {}
+        self._file_cache = _BoundedFileCache()
         
     def to_string(self) -> str:
         components_details = []
@@ -609,7 +780,14 @@ class AgentSystemManager:
                 logger.error(f"Error decoding JSON from {self.api_keys_path}: {e}")
 
         elif '.env' in self.api_keys_path:
-            load_dotenv(self.api_keys_path, override=True)
+            # Keys stay with this manager (get_key() prefers them over the environment), so two
+            # managers with different .env files no longer overwrite each other's keys. They are
+            # also exported for user code that reads os.environ, without replacing variables the
+            # process already has.
+            values = dotenv_values(self.api_keys_path)
+            self.api_keys = {key: value for key, value in values.items() if value is not None}
+            for key, value in self.api_keys.items():
+                os.environ.setdefault(key, value)
         else:
             raise ValueError(f"Unsupported API keys format: {self.api_keys_path}")
         
@@ -1182,15 +1360,18 @@ class AgentSystemManager:
 
     def _write_usage_entry(self, entry: dict, force_summary: bool = False):
         entry["ts"] = self._now_iso()
-        with open(self._usage_log_path, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with self._usage_log_lock:
+            with open(self._usage_log_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-        lines_since = getattr(self, "_lines_since_refresh", 0) + 1
-        self._lines_since_refresh = lines_since
+            lines_since = getattr(self, "_lines_since_refresh", 0) + 1
+            self._lines_since_refresh = lines_since
+            refresh = force_summary or lines_since >= 100
+            if refresh:
+                self._lines_since_refresh = 0
 
-        if force_summary or lines_since >= 100:
+        if refresh:
             self._refresh_cost_summary()
-            self._lines_since_refresh = 0
 
     def _iter_usage_rows(self):
         if not os.path.isfile(self._usage_log_path):
@@ -1253,8 +1434,9 @@ class AgentSystemManager:
             self._write_usage_entry(entry)
 
     def get_cost_report(self, span="lifetime", user=None, model_or_tool=None):
-        if not os.path.isfile(self._summary_log_path):
-            self._refresh_cost_summary()
+        if not self._usage_logging_enabled or not hasattr(self, "_summary_log_path"):
+            raise RuntimeError("Cost reports need usage logging: create the manager with usage_logging=True.")
+        self._refresh_cost_summary()
         with open(self._summary_log_path, encoding="utf-8") as fp:
             data = json.load(fp)
         span_data = data.get(span, {})
@@ -1483,8 +1665,19 @@ class AgentSystemManager:
         except Exception:
             pass
         self._db_pool[pool_key] = conn
-        self._db_locks.setdefault(pool_key, threading.RLock())
+        lock = self._db_locks.setdefault(pool_key, threading.RLock())
+        if not hasattr(self, "_conn_locks"):
+            self._conn_locks = {}
+        self._conn_locks[conn] = lock
         return conn
+
+    def _conn_lock(self, conn):
+        # Pooled connections are shared by every thread serving that user (concurrent requests,
+        # parallel automation steps). sqlite3 shares prepared statements between cursors of one
+        # connection, so concurrent queries can cut each other's results short: every use of a
+        # pooled connection holds its lock. Private read connections need none.
+        lock = getattr(self, "_conn_locks", {}).get(conn)
+        return lock if lock is not None else contextlib.nullcontext()
 
     def _get_latest_shared_history_db_path(self) -> str:
         paths = self._list_shared_history_db_paths()
@@ -1600,9 +1793,10 @@ class AgentSystemManager:
             conn = current_conn
             if conn is None:
                 conn = self._ensure_user_db(user_id)
-            cur = conn.cursor()
-            cur.execute("SELECT COALESCE(MAX(msg_number), 0) FROM message_history")
-            return int(cur.fetchone()[0] or 0)
+            with self._conn_lock(conn):
+                cur = conn.cursor()
+                cur.execute("SELECT COALESCE(MAX(msg_number), 0) FROM message_history")
+                return int(cur.fetchone()[0] or 0)
 
         max_num = 0
         for db_path in self._list_shared_history_db_paths():
@@ -1630,16 +1824,7 @@ class AgentSystemManager:
         return os.path.join(self.history_folder, f"{self._safe_user_id(user_id)}.sqlite")
 
     def _safe_user_id(self, user_id: Any) -> str:
-        raw = str(user_id)
-        if (
-            raw
-            and raw not in {".", ".."}
-            and ".." not in raw
-            and re.fullmatch(r"[A-Za-z0-9_.-]+", raw)
-        ):
-            return raw
-        encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
-        return f"u_{encoded or 'empty'}"
+        return safe_path_component(user_id)
 
     def _ensure_user_db(self, user_id: str) -> sqlite3.Connection:
         if self._history_mode_is_shared():
@@ -1687,7 +1872,9 @@ class AgentSystemManager:
                 self._db_pool[user_id].close()
             except Exception as e:
                 logger.warning(f"Error closing existing connection for user {user_id} before import: {e}")
+            getattr(self, "_conn_locks", {}).pop(self._db_pool[user_id], None)
             del self._db_pool[user_id]
+            self._db_generation = getattr(self, "_db_generation", 0) + 1
 
         if hasattr(self, "_tls") and getattr(self._tls, "current_user_id", None) == user_id:
             if hasattr(self._tls, "db_conn") and self._tls.db_conn is not None:
@@ -1697,8 +1884,11 @@ class AgentSystemManager:
             self._tls.db_conn = None
                     
         db_path = self._get_db_path_for_user(user_id)
-        #if os.path.exists(db_path):
-        #    logger.warning(f"Overwriting existing history for user {user_id}")
+        # A leftover write-ahead log belongs to the old database; SQLite would replay it onto
+        # the imported one.
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(db_path + suffix):
+                os.remove(db_path + suffix)
         with open(db_path, "wb") as f:
             f.write(sqlite_bytes)
 
@@ -1836,14 +2026,13 @@ class AgentSystemManager:
                     conn.rollback()
                     raise
 
+    @_scoped_to_user_id
     def _import_shared_user_history(self, user_id: str, sqlite_bytes: bytes) -> None:
         self.clear_message_history(user_id)
         if not sqlite_bytes:
-            self.set_current_user(user_id)
             return
 
         rows = self._read_history_rows_from_bytes(sqlite_bytes)
-        self.set_current_user(user_id)
         for row in rows:
             self._insert_shared_history_row(
                 user_id=user_id,
@@ -1940,12 +2129,13 @@ class AgentSystemManager:
                 for db_path in self._list_shared_history_db_paths():
                     conn, should_close = self._open_history_db_for_read(db_path)
                     try:
-                        cur = conn.cursor()
-                        cur.execute(
-                            "SELECT MAX(timestamp) FROM message_history WHERE user_id = ?",
-                            (str(uid),),
-                        )
-                        row_timestamp = cur.fetchone()[0]
+                        with self._conn_lock(conn):
+                            cur = conn.cursor()
+                            cur.execute(
+                                "SELECT MAX(timestamp) FROM message_history WHERE user_id = ?",
+                                (str(uid),),
+                            )
+                            row_timestamp = cur.fetchone()[0]
                         if row_timestamp and (latest_timestamp is None or row_timestamp > latest_timestamp):
                             latest_timestamp = row_timestamp
                     finally:
@@ -1953,9 +2143,10 @@ class AgentSystemManager:
                             conn.close()
         else:
             db_conn = self._get_user_db()
-            cur = db_conn.cursor()
-            cur.execute("SELECT MAX(timestamp) FROM message_history")
-            latest_timestamp = cur.fetchone()[0]
+            with self._conn_lock(db_conn):
+                cur = db_conn.cursor()
+                cur.execute("SELECT MAX(timestamp) FROM message_history")
+                latest_timestamp = cur.fetchone()[0]
 
         if latest_timestamp != self._last_known_update:
             self._last_known_update = latest_timestamp
@@ -1971,7 +2162,29 @@ class AgentSystemManager:
 
         self._tls.current_user_id = user_id
         self._tls.db_conn         = self._ensure_user_db(user_id)
+        self._tls.db_generation   = getattr(self, "_db_generation", 0)
 
+
+    @contextlib.contextmanager
+    def _user_scope(self, user_id: Optional[str]):
+        # A user_id argument applies to one call only. Leaving it as the thread's current user
+        # would make the next request served by a reused thread (web servers, thread pools)
+        # read and write this user's history.
+        if user_id is None:
+            yield
+            return
+        if not hasattr(self, "_tls"):
+            self._tls = threading.local()
+        previous_user = getattr(self._tls, "current_user_id", None)
+        self.set_current_user(user_id)
+        try:
+            yield
+        finally:
+            if previous_user is not None:
+                self.set_current_user(previous_user)
+            else:
+                self._tls.current_user_id = None
+                self._tls.db_conn = None
 
     def ensure_user(self, user_id: Optional[str] = None) -> None:
         if user_id:
@@ -1988,8 +2201,13 @@ class AgentSystemManager:
         if not hasattr(self, "_tls"):
             self._tls = threading.local()
         conn = getattr(self._tls, "db_conn", None)
-        if conn is not None:
+        if conn is not None and getattr(self._tls, "db_generation", None) == getattr(self, "_db_generation", 0):
             return conn
+        current_user = getattr(self._tls, "current_user_id", None)
+        if current_user is not None:
+            # The pool was reset by another thread since this thread connected.
+            self.set_current_user(current_user)
+            return self._tls.db_conn
 
         self.ensure_user()
         return self._tls.db_conn
@@ -2053,24 +2271,32 @@ class AgentSystemManager:
                     VALUES (?, ?, ?, ?, ?, ?)
                 """
 
-            cur = conn.cursor()
-            try:
-                cur.execute("BEGIN IMMEDIATE")
-                if not self._history_mode_is_shared():
-                    cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
-                    next_num = cur.fetchone()[0]
-                    insert_params = (next_num, role, content_str, type, model, timestamp)
-                cur.execute(insert_sql, insert_params)
-                conn.commit()
-                return next_num
-            except Exception:
-                conn.rollback()
-                raise
+            with self._conn_lock(conn):
+                cur = conn.cursor()
+                try:
+                    cur.execute("BEGIN IMMEDIATE")
+                    if not self._history_mode_is_shared():
+                        cur.execute("SELECT COALESCE(MAX(msg_number), 0) + 1 FROM message_history")
+                        next_num = cur.fetchone()[0]
+                        insert_params = (next_num, role, content_str, type, model, timestamp)
+                    cur.execute(insert_sql, insert_params)
+                    conn.commit()
+                    return next_num
+                except Exception:
+                    conn.rollback()
+                    raise
 
 
-    def add_message(self, role: str, content: Union[str, dict], msg_type: str = "developer") -> None:
+    @_scoped_to_user_id
+    def add_message(
+        self,
+        role: str,
+        content: Union[str, dict],
+        msg_type: str = "developer",
+        user_id: Optional[str] = None
+    ) -> int:
         db_conn = self._get_user_db()
-        self._save_message(db_conn, role, content, msg_type)
+        return self._save_message(db_conn, role, content, msg_type)
 
     def _save_component_output(
         self,
@@ -2082,12 +2308,14 @@ class AgentSystemManager:
         if isinstance(component, Automation):
             return
 
-        model_info = getattr(component, "_last_used_model", None)
-        if model_info:
-            del component._last_used_model
-            model_str = f"{model_info['provider']}:{model_info['model']}"
-        else:
-            model_str = None
+        # The model that answered travels with the output (not on the shared component instance),
+        # so concurrent users and parallel automation steps each record their own.
+        model_str = None
+        if isinstance(component, Agent) and isinstance(output_value, list) and output_value:
+            first = output_value[0] if isinstance(output_value[0], dict) else {}
+            provider_response = (first.get("metadata") or {}).get("provider_response") or {}
+            if provider_response.get("provider") and provider_response.get("model"):
+                model_str = f"{provider_response['provider']}:{provider_response['model']}"
 
         if output_value is None:
             return
@@ -2113,14 +2341,15 @@ class AgentSystemManager:
             return
 
         try:
+            in_toks, out_toks, cost = self._usage_from_metadata(meta)
             entry = {
                 "user":   self._active_user_id(),
                 "type":   component_type,
                 "id":     model_str or save_role,
-                "in_toks":  meta.get("input_tokens", 0),
-                "out_toks": meta.get("output_tokens", 0),
+                "in_toks":  in_toks,
+                "out_toks": out_toks,
                 "seconds": meta.get("seconds", 0),
-                "cost":    meta.get("usd_cost", 0.0)
+                "cost":    cost
             }
             self._log_if_enabled(entry)
         except Exception as e:
@@ -2164,9 +2393,12 @@ class AgentSystemManager:
 
         if isinstance(obj, str) and os.path.isfile(obj):
             ext = os.path.splitext(obj)[1] or ".bin"
+            if ext.lower() == ".pkl":
+                # Only objects pickled by MAS itself may be unpickled later; copied files never are.
+                ext = ".bin"
             new_path = os.path.join(files_dir, f"{uuid.uuid4()}{ext}")
             shutil.copy2(obj, new_path)
-            self._file_cache[new_path] = obj
+            # Not cached: loading the reference reads the copy's bytes, not the source path.
             return f"file:{new_path}"
 
         if isinstance(obj, (bytes, bytearray)):
@@ -2197,11 +2429,22 @@ class AgentSystemManager:
             return [self._load_files_in_dict(item) for item in value]
 
         if isinstance(value, str) and value.startswith("file:"):
-            return self._load_file(value[5:])
+            file_path = value[5:]
+            if self._is_managed_file_path(file_path):
+                return self._load_file(file_path)
+            # Any other "file:" string is untrusted text (user input, LLM output), never a path to read.
+            logger.warning(f"[Manager] Ignoring 'file:' reference outside files_folder: {file_path}")
+            return value
 
         return value
-       
+
+    def _is_managed_file_path(self, file_path: str) -> bool:
+        return is_path_inside(self.files_folder, file_path)
+
     def _load_file(self, file_path: str) -> Any:
+        if not self._is_managed_file_path(file_path):
+            raise ValueError(f"Refusing to load a file outside files_folder: {file_path}")
+
         if file_path in self._file_cache:
             return self._file_cache[file_path]
 
@@ -2216,11 +2459,12 @@ class AgentSystemManager:
 
             self._file_cache[file_path] = obj
             return obj
-        except:
-            #logger.warning(f"[Manager] File not found while loading from history: {file_path}")
-            return f"Error: Archivo '{os.path.basename(file_path)}' no encontrado en el historial."
+        except Exception as e:
+            logger.warning(f"[Manager] Could not load file referenced in history: {file_path} ({e})")
+            return f"Error: file '{os.path.basename(file_path)}' referenced in the history could not be loaded."
         
 
+    @_scoped_to_user_id
     def add_blocks(
         self,
         content,
@@ -2229,7 +2473,7 @@ class AgentSystemManager:
         msg_type: str = "user",
         user_id: Union[str, None] = None
     ) -> int:
-        self.ensure_user(user_id)
+        self.ensure_user()
         conn = self._get_user_db()
         msg_number = self._save_message(conn, role, content, msg_type)
         return msg_number
@@ -2273,61 +2517,62 @@ class AgentSystemManager:
                 sequence = self._shared_history_sequence(db_path) or 0
                 read_conn, should_close = self._open_history_db_for_read(db_path)
                 try:
-                    cur = read_conn.cursor()
-                    where = ""
-                    params = ()
-                    if uid is not None:
-                        where = "WHERE user_id = ?"
-                        params = (str(uid),)
+                    with self._conn_lock(read_conn):
+                        cur = read_conn.cursor()
+                        where = ""
+                        params = ()
+                        if uid is not None:
+                            where = "WHERE user_id = ?"
+                            params = (str(uid),)
 
-                    try:
-                        if include_model:
-                            cur.execute(
-                                "SELECT id, role, content, msg_number, type, model, timestamp, user_id "
-                                f"FROM message_history {where}",
-                                params,
-                            )
+                        try:
+                            if include_model:
+                                cur.execute(
+                                    "SELECT id, role, content, msg_number, type, model, timestamp, user_id "
+                                    f"FROM message_history {where}",
+                                    params,
+                                )
+                            else:
+                                cur.execute(
+                                    "SELECT id, role, content, msg_number, type, timestamp, user_id "
+                                    f"FROM message_history {where}",
+                                    params,
+                                )
+                        except sqlite3.OperationalError:
+                            if include_model:
+                                cur.execute(
+                                    "SELECT id, role, content, msg_number, type, model, timestamp "
+                                    "FROM message_history"
+                                )
+                                fetched = [
+                                    (row_id, role, content, msg_number, msg_type, model, timestamp, uid)
+                                    for row_id, role, content, msg_number, msg_type, model, timestamp
+                                    in cur.fetchall()
+                                ]
+                            else:
+                                cur.execute(
+                                    "SELECT id, role, content, msg_number, type, timestamp "
+                                    "FROM message_history"
+                                )
+                                fetched = [
+                                    (row_id, role, content, msg_number, msg_type, timestamp, uid)
+                                    for row_id, role, content, msg_number, msg_type, timestamp
+                                    in cur.fetchall()
+                                ]
                         else:
-                            cur.execute(
-                                "SELECT id, role, content, msg_number, type, timestamp, user_id "
-                                f"FROM message_history {where}",
-                                params,
-                            )
-                    except sqlite3.OperationalError:
-                        if include_model:
-                            cur.execute(
-                                "SELECT id, role, content, msg_number, type, model, timestamp "
-                                "FROM message_history"
-                            )
-                            fetched = [
-                                (row_id, role, content, msg_number, msg_type, model, timestamp, uid)
-                                for row_id, role, content, msg_number, msg_type, model, timestamp
-                                in cur.fetchall()
-                            ]
-                        else:
-                            cur.execute(
-                                "SELECT id, role, content, msg_number, type, timestamp "
-                                "FROM message_history"
-                            )
-                            fetched = [
-                                (row_id, role, content, msg_number, msg_type, timestamp, uid)
-                                for row_id, role, content, msg_number, msg_type, timestamp
-                                in cur.fetchall()
-                            ]
-                    else:
-                        fetched = cur.fetchall()
+                            fetched = cur.fetchall()
 
-                    for row in fetched:
-                        row_id = row[0]
-                        if include_model:
-                            _, role, content, msg_number, msg_type, model, timestamp, row_user_id = row
-                            payload = (role, content, msg_number, msg_type, model, timestamp)
-                        else:
-                            _, role, content, msg_number, msg_type, timestamp, row_user_id = row
-                            payload = (role, content, msg_number, msg_type, timestamp)
-                        if include_user_id:
-                            payload = payload + (row_user_id,)
-                        rows_with_order.append((int(msg_number or 0), sequence, int(row_id or 0), payload))
+                        for row in fetched:
+                            row_id = row[0]
+                            if include_model:
+                                _, role, content, msg_number, msg_type, model, timestamp, row_user_id = row
+                                payload = (role, content, msg_number, msg_type, model, timestamp)
+                            else:
+                                _, role, content, msg_number, msg_type, timestamp, row_user_id = row
+                                payload = (role, content, msg_number, msg_type, timestamp)
+                            if include_user_id:
+                                payload = payload + (row_user_id,)
+                            rows_with_order.append((int(msg_number or 0), sequence, int(row_id or 0), payload))
                 finally:
                     if should_close:
                         read_conn.close()
@@ -2335,18 +2580,17 @@ class AgentSystemManager:
             rows_with_order.sort(key=lambda item: (item[0], item[1], item[2]))
             return [payload for _, _, _, payload in rows_with_order]
 
-        cur = conn.cursor()
+        with self._conn_lock(conn):
+            cur = conn.cursor()
+            if include_model:
+                cur.execute("SELECT role, content, msg_number, type, model, timestamp FROM message_history ORDER BY msg_number ASC")
+            else:
+                cur.execute("SELECT role, content, msg_number, type, timestamp FROM message_history ORDER BY msg_number ASC")
+            return cur.fetchall()
 
-        if include_model:
-            cur.execute("SELECT role, content, msg_number, type, model, timestamp FROM message_history ORDER BY msg_number ASC")
-        else:
-            cur.execute("SELECT role, content, msg_number, type, timestamp FROM message_history ORDER BY msg_number ASC")
-        return cur.fetchall()
-
+    @_scoped_to_user_id
     def show_history(self, user_id: Optional[str] = None, message_char_limit: int = 2000):
-        if user_id is not None:
-            self.set_current_user(user_id)
-        elif self._uid() is None:
+        if self._uid() is None:
             logger.info("=== Message History: no active user selected ===")
             logger.info("Pass a user_id to show_history(user_id) or call set_current_user(user_id) first.")
             logger.info("============================================\n")
@@ -2363,10 +2607,9 @@ class AgentSystemManager:
             logger.info(f"{role_str}: {content}")
         logger.info("============================================\n")
 
+    @_scoped_to_user_id
     def get_messages(self, user_id: Optional[str] = None) -> List[Dict[str, str]]:
-        if user_id is not None:
-            self.set_current_user(user_id)
-        elif self._uid() is None:
+        if self._uid() is None:
             return []
 
         conn = self._get_user_db()
@@ -2419,9 +2662,10 @@ class AgentSystemManager:
             return rows[-1][1] if rows else None
 
         conn = self._get_user_db()
-        cur = conn.cursor()
-        cur.execute("SELECT content FROM message_history ORDER BY id DESC LIMIT 1")
-        row = cur.fetchone()
+        with self._conn_lock(conn):
+            cur = conn.cursor()
+            cur.execute("SELECT content FROM message_history ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
         return row[0] if row else None
     
     def _extract_metadata_from_blocks(self, content):
@@ -2448,6 +2692,22 @@ class AgentSystemManager:
                             pass
         return {}
     
+    def _usage_from_metadata(self, metadata: Dict[str, Any]):
+        # Token counts are copied into the block metadata only with return_token_count=True, but
+        # every agent message keeps the provider's usage report: fall back to it so usage logs and
+        # stats are right either way.
+        in_toks = metadata.get("input_tokens")
+        out_toks = metadata.get("output_tokens")
+        cost = metadata.get("usd_cost")
+        provider_response = metadata.get("provider_response") or {}
+        usage = provider_response.get("usage") or {}
+        if in_toks is None and out_toks is None and usage:
+            in_toks = usage.get("input_tokens", 0) or 0
+            out_toks = usage.get("output_tokens", 0) or 0
+            if cost is None and provider_response.get("provider") and provider_response.get("model"):
+                cost = self.cost_model_call(provider_response["provider"], provider_response["model"], in_toks, out_toks)
+        return in_toks or 0, out_toks or 0, cost or 0.0
+
     def get_usage_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
         messages = self.get_messages(user_id)
         models = {}
@@ -2458,13 +2718,13 @@ class AgentSystemManager:
             src   = msg["source"]
             content = msg["message"]
             metadata = self._extract_metadata_from_blocks(content)
-            cost     = metadata.get("usd_cost", 0.0)
+            in_toks, out_toks, cost = self._usage_from_metadata(metadata)
 
             if mtype == "agent":
                 key = msg.get("model") or "unknown"
                 m = models.setdefault(key, {"input_tokens": 0, "output_tokens": 0, "usd_cost": 0.0})
-                m["input_tokens"]  += metadata.get("input_tokens", 0)
-                m["output_tokens"] += metadata.get("output_tokens", 0)
+                m["input_tokens"]  += in_toks
+                m["output_tokens"] += out_toks
                 m["usd_cost"]      += cost
 
             elif mtype == "tool":
@@ -2552,13 +2812,22 @@ class AgentSystemManager:
         model_params: Optional[Dict[str, Any]] = None,
         include_timestamp: Optional[bool] = None,
         description: str = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        max_context_messages: Optional[int] = None
     ):
         if name is None:
             name = self._generate_agent_name()
     
         if name in self.agents:
             raise ValueError(f"[Manager] Agent '{name}' already exists.")
+
+        inherited_settings = {
+            setting for setting, value in (
+                ("models", models), ("timeout", timeout), ("include_timestamp", include_timestamp),
+                ("max_context_messages", max_context_messages),
+            )
+            if value is None
+        }
 
         if models is None:
             models = copy.deepcopy(self.default_models)
@@ -2601,10 +2870,14 @@ class AgentSystemManager:
             model_params=model_params,
             include_timestamp=include_timestamp if include_timestamp is not None else self.include_timestamp,
             description=description,
-            timeout=final_timeout
+            timeout=final_timeout,
+            max_context_messages=self._validate_max_context_messages(
+                max_context_messages if max_context_messages is not None else getattr(self, "max_context_messages", None)
+            ),
         )
 
         agent.manager = self
+        agent._inherited_settings = inherited_settings
         self.agents[name] = agent
         self._component_order.append(name)
 
@@ -2796,24 +3069,23 @@ class AgentSystemManager:
                 logger.debug("[Manager] Saved developer input")
 
         if component_name is None:
+            imported = getattr(self, "_imported_component_names", set())
             if not self.automations or len(self.automations) < 1:
                 if verbose:
                     logger.info("[Manager] Using default automation.")
                 default_automation_name = "default_automation"
-                default_automation_sequence = list(self._component_order)
+                # Imported library components only run when a sequence names them.
+                default_automation_sequence = [name for name in self._component_order if name not in imported]
                 if default_automation_name not in self.automations:
                     self.create_automation(name=default_automation_name, sequence=default_automation_sequence)
                 comp = self._get_component(default_automation_name)
-            elif len(self.automations) == 1:
-                automation_name = list(self.automations.keys())[0]
-                if verbose:
-                    logger.info(f"[Manager] Using single existing automation: {automation_name}")
-                comp = self._get_component(automation_name)
             else:
-                latest_automation_name = list(self.automations.keys())[-1]
+                # Prefer the latest automation defined by this system over imported ones.
+                own_automations = [name for name in self.automations if name not in imported]
+                automation_name = (own_automations or list(self.automations))[-1]
                 if verbose:
-                    logger.info(f"[Manager] Using the latest automation: {latest_automation_name}")
-                comp = self._get_component(latest_automation_name)
+                    logger.info(f"[Manager] Using automation: {automation_name}")
+                comp = self._get_component(automation_name)
         else:
             comp = self._get_component(component_name)
             if not comp:
@@ -2856,17 +3128,18 @@ class AgentSystemManager:
                     target_index=target_index,
                     target_custom=target_custom
                 )
-            if on_update:
-                self._invoke_callback(on_update, self.get_messages(user_id), self, on_update_params)
 
         self._save_component_output(db_conn, comp, output_dict, verbose=verbose)
 
-        if self._usage_logging_enabled:
-            self._refresh_cost_summary()
+        # Automations call on_update after each step; a single component calls it once its own
+        # output is in the history, so the callback sees what the component produced.
+        if on_update and not isinstance(comp, Automation):
+            self._invoke_callback(on_update, self.get_messages(user_id), self, on_update_params)
 
         return output_dict
 
 
+    @_scoped_to_user_id
     def run(
         self,
         input: Optional[Any] = None,
@@ -2954,7 +3227,6 @@ class AgentSystemManager:
 
     def save_file(self, obj: Any, user_id = None) -> str:
         uid = str(user_id) if user_id is not None else str(self._active_user_id() or "unknown")
-        self.ensure_user(uid)
         return self._store_file(obj, uid)
 
 
@@ -2976,9 +3248,18 @@ class AgentSystemManager:
 
         general_params = system_definition.get("general_parameters", {})
 
-        self.base_directory = general_params.get("base_directory", self.base_directory)
-        self.general_system_description = general_params.get("general_system_description", "This is a multi-agent system.")
-        self.functions = general_params.get("functions", "fns.py")
+        self._json_general_parameters = set(general_params)
+        explicit = getattr(self, "_explicit_args", {})
+
+        def setting(key, default, json_key=None):
+            # Explicit constructor argument > general_parameters > library default.
+            if key in explicit:
+                return explicit[key]
+            return general_params.get(json_key or key, default)
+
+        self.base_directory = os.path.abspath(setting("base_directory", self.base_directory))
+        self.general_system_description = setting("general_system_description", "This is a multi-agent system.")
+        self.functions = setting("functions", "fns.py")
         self._configure_variables(general_params.get("variables", []))
 
         if isinstance(self.functions, str):
@@ -2988,15 +3269,16 @@ class AgentSystemManager:
         else:
             self.functions = []
 
-        self.default_models = general_params.get("default_models", self.default_models)
-        if "model_failure_policy" in general_params:
+        self.default_models = copy.deepcopy(setting("default_models", self.default_models))
+        if "model_failure_policy" not in explicit and "model_failure_policy" in general_params:
             self._configure_model_failure_policy(general_params.get("model_failure_policy"))
         self._register_model_infos(self.default_models)
-        self.on_update = self._resolve_callable(general_params.get("on_update"))
-        self.on_complete = self._resolve_callable(general_params.get("on_complete"))
-        self.include_timestamp = general_params.get("include_timestamp", False)
-        self._usage_logging_enabled  = general_params.get("usage_logging", self._usage_logging_enabled)
-        self.timezone = general_params.get("timezone", 'UTC')
+        self.on_update = self._resolve_callable(setting("on_update", None))
+        self.on_complete = self._resolve_callable(setting("on_complete", None))
+        self.include_timestamp = bool(setting("include_timestamp", False))
+        self.max_context_messages = self._validate_max_context_messages(setting("max_context_messages", None))
+        self._usage_logging_enabled = bool(setting("usage_logging", self._usage_logging_enabled))
+        self.timezone = setting("timezone", "UTC")
 
         history_storage = general_params.get("history_storage", {})
         if history_storage is None:
@@ -3004,31 +3286,33 @@ class AgentSystemManager:
         if not isinstance(history_storage, dict):
             raise ValueError("general_parameters.history_storage must be a JSON object.")
 
-        history_period = history_storage.get(
-            "period",
-            history_storage.get(
-                "period_seconds",
-                general_params.get(
-                    "history_period",
-                    general_params.get("history_period_seconds", self.history_period),
-                ),
-            ),
-        )
+        def history_setting(key, nested_keys, flat_keys, default):
+            if key in explicit:
+                return explicit[key]
+            for nested in nested_keys:
+                if nested in history_storage:
+                    return history_storage[nested]
+            for flat in flat_keys:
+                if flat in general_params:
+                    return general_params[flat]
+            return default
+
         self._configure_history_storage(
-            mode=history_storage.get("mode", general_params.get("history_mode", self.history_mode)),
-            rotation=history_storage.get(
-                "rotation",
-                general_params.get("history_rotation", self.history_rotation),
+            mode=history_setting("history_mode", ["mode"], ["history_mode"], self.history_mode),
+            rotation=history_setting("history_rotation", ["rotation"], ["history_rotation"], self.history_rotation),
+            max_messages=history_setting(
+                "history_max_messages", ["max_messages"], ["history_max_messages"], self.history_max_messages
             ),
-            max_messages=history_storage.get(
-                "max_messages",
-                general_params.get("history_max_messages", self.history_max_messages),
+            period=history_setting(
+                "history_period",
+                ["period", "period_seconds"],
+                ["history_period", "history_period_seconds"],
+                self.history_period,
             ),
-            period=history_period,
         )
 
-        admin_from_cfg = general_params.get("admin_user_id", None)
-        self.admin_user_id = str(admin_from_cfg) if admin_from_cfg is not None else getattr(self, "admin_user_id", None)
+        admin_user_id = setting("admin_user_id", getattr(self, "admin_user_id", None))
+        self.admin_user_id = str(admin_user_id) if admin_user_id is not None else None
 
         history_folder = general_params.get("history_folder")
         if history_folder:
@@ -3048,21 +3332,14 @@ class AgentSystemManager:
         else:
             self.files_folder = os.path.join(self.base_directory, "files")
 
-        
-        imports = general_params.get("imports")
+        # Imports from the config and from the constructor are combined.
+        json_imports = self._normalize_imports(general_params.get("imports"))
+        ctor_imports = self._normalize_imports(explicit.get("imports"))
+        self.imports = json_imports + [item for item in ctor_imports if item not in json_imports]
 
-        if not imports:
-            self.imports = []
-        elif isinstance(imports, str):
-            self.imports = [imports]
-        elif isinstance(imports, list):
-            self.imports = imports
-        else:
-            raise ValueError(f"Imports must be list or string")
-        
-        self._resolve_api_keys_path(general_params.get("api_keys_path"))
+        self._resolve_api_keys_path(setting("api_keys_path", None))
 
-        self.costs_path = general_params.get("costs_path")
+        self.costs_path = setting("costs_path", None)
         self._load_costs()
 
         if self.timeout is None:
@@ -3078,6 +3355,24 @@ class AgentSystemManager:
                 self.link(input_component, output_component)
             except ValueError as e:
                 logger.error(f"Warning: Could not create link from '{input_component}' to '{output_component}'. Error: {e}")
+
+    @staticmethod
+    def _validate_max_context_messages(value) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("max_context_messages must be a positive integer or None (no limit).")
+        return value
+
+    @staticmethod
+    def _normalize_imports(imports) -> List[str]:
+        if not imports:
+            return []
+        if isinstance(imports, str):
+            return [imports]
+        if isinstance(imports, list):
+            return list(imports)
+        raise ValueError("Imports must be list or string")
 
     def _configure_variables(self, variables: Any) -> None:
         if variables in (None, ""):
@@ -3258,10 +3553,11 @@ class AgentSystemManager:
             if isinstance(key, str) and key.startswith(prefix)
         }
 
+    @_scoped_to_user_id
     def set_variable(self, key: str, value: Any, user_id: Optional[str] = None) -> int:
         key = self._validate_variable_key(key)
         value = self._validate_variable_value(key, value)
-        self.ensure_user(user_id)
+        self.ensure_user()
         conn = self._get_user_db()
         return self._save_message(
             conn,
@@ -3378,7 +3674,7 @@ class AgentSystemManager:
             reserved = {
                 "system", "system_prompt", "required_outputs", "models",
                 "provider", "model", "default_output", "timeout",
-                "positive_filter", "negative_filter", "include_timestamp"
+                "positive_filter", "negative_filter", "include_timestamp", "max_context_messages"
             }
             for param_name, param_value in overrides.items():
                 if param_name in reserved:
@@ -3409,6 +3705,10 @@ class AgentSystemManager:
                 "include_timestamp": copy.deepcopy(overrides.get(
                     "include_timestamp",
                     self.resolve_runtime_value(component.include_timestamp, uid, name)
+                )),
+                "max_context_messages": copy.deepcopy(overrides.get(
+                    "max_context_messages",
+                    self.resolve_runtime_value(getattr(component, "max_context_messages", None), uid, name)
                 )),
             })
         else:
@@ -3474,6 +3774,7 @@ class AgentSystemManager:
                 positive_filter=component.get("positive_filter"),
                 negative_filter=component.get("negative_filter"),
                 include_timestamp=component.get("include_timestamp"),
+                max_context_messages=component.get("max_context_messages"),
                 model_params=component.get("model_params"),
                 description=description,
                 timeout=component.get("timeout")
@@ -3585,18 +3886,7 @@ class AgentSystemManager:
         return getattr(module, function_name)
     
     def _load_local_py_if_exists(self, filename_no_ext: str) -> str:
-        py_file_name = f"{filename_no_ext}.py"
-
-        try:
-            file_text = resources.read_text("mas.lib", py_file_name)
-        except FileNotFoundError:
-            return None
-
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
-        tmp_file.write(file_text.encode("utf-8"))
-        tmp_file.flush()
-        tmp_file.close()
-        return tmp_file.name
+        return _packaged_lib_file(f"{filename_no_ext}.py")
         
     def _resolve_automation_sequence(self, sequence):
         resolved_sequence = []
@@ -3639,11 +3929,9 @@ class AgentSystemManager:
                     if "condition" not in step and "end_condition" not in step:
                         raise ValueError("While must have either 'condition' or 'end_condition'.")
 
-                    if "condition" in step:
-                        step["condition"] = self._resolve_condition(step["condition"])
-                    step["run_first_pass"] = step.get("run_first_pass", True)
-                    step["start_condition"] = self._resolve_condition(step.get("start_condition", step.get("condition", step["run_first_pass"])))
-                    step["end_condition"] = self._resolve_condition(step.get("end_condition", step.get("condition")))
+                    for key in ("condition", "start_condition", "end_condition"):
+                        if key in step:
+                            step[key] = self._resolve_condition(step[key])
                     step["body"] = self._resolve_automation_sequence(step.get("body", []))
                     
                 elif control_flow_type == "for":
@@ -3675,12 +3963,39 @@ class AgentSystemManager:
 
         return resolved_sequence
 
+    def _iter_string_steps(self, sequence):
+        for step in sequence or []:
+            if isinstance(step, str):
+                yield step
+            elif isinstance(step, dict):
+                for key in ("if_true", "if_false", "body"):
+                    yield from self._iter_string_steps(step.get(key))
+                for case in step.get("cases") or []:
+                    if isinstance(case, dict):
+                        yield from self._iter_string_steps(case.get("body"))
+
+    def _validate_automation_steps(self) -> None:
+        # A typo in a step name must fail when the system loads, not silently skip the step.
+        problems = []
+        for automation in self.automations.values():
+            for step in self._iter_string_steps(automation.sequence):
+                if "$" in step:
+                    continue  # resolved from runtime variables when the step runs
+                comp_name = automation._parse_automation_step_string(step)[0]
+                if not self._component_exists(comp_name):
+                    problems.append(f"automation '{automation.name}', step '{step}': unknown component '{comp_name}'")
+        if problems:
+            raise ValueError("Automation steps refer to components that do not exist:\n  " + "\n  ".join(problems))
+
     def _resolve_condition(self, condition):
         if isinstance(condition, bool):
             return condition
         elif isinstance(condition, str):
-            if ":" in condition and condition[0] != ":":
-                return self._get_function_from_string(condition)
+            # Conditions are evaluated from their string form when the step runs; a referenced
+            # function is looked up now only so a missing one fails when the system loads.
+            parsed = self.parser.parse_input_string(condition)
+            if parsed["is_function"] and parsed["function_name"]:
+                self._get_function_from_string(parsed["function_name"])
             return condition
         elif isinstance(condition, dict):
             return condition
@@ -3689,10 +4004,8 @@ class AgentSystemManager:
         else:
             raise ValueError(f"Unsupported condition type: {condition}")
     
+    @_scoped_to_user_id
     def clear_message_history(self, user_id: Optional[str] = None):
-        if user_id is not None:
-            self.set_current_user(user_id)
-
         if not self._uid():
             return
 
@@ -3701,29 +4014,43 @@ class AgentSystemManager:
             with self._shared_history_lock:
                 for db_path in self._list_shared_history_db_paths():
                     conn = self._connect_history_db(db_path, self._shared_history_db_key(db_path))
-                    cur = conn.cursor()
-                    cur.execute("DELETE FROM message_history WHERE user_id = ?", (uid,))
-                    cur.execute("SELECT COUNT(*) FROM message_history")
-                    remaining = int(cur.fetchone()[0] or 0)
-                    if remaining == 0:
-                        cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
-                        cur.execute(
-                            "INSERT OR REPLACE INTO history_metadata (key, value) VALUES ('created_at', ?)",
-                            (self._history_now_iso(),),
-                        )
-                    conn.commit()
+                    with self._conn_lock(conn):
+                        cur = conn.cursor()
+                        cur.execute("DELETE FROM message_history WHERE user_id = ?", (uid,))
+                        cur.execute("SELECT COUNT(*) FROM message_history")
+                        remaining = int(cur.fetchone()[0] or 0)
+                        if remaining == 0:
+                            cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
+                            cur.execute(
+                                "INSERT OR REPLACE INTO history_metadata (key, value) VALUES ('created_at', ?)",
+                                (self._history_now_iso(),),
+                            )
+                        conn.commit()
+            self._delete_user_files(uid)
             return
 
         conn = self._get_user_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM message_history")
-        conn.commit()
+        with self._conn_lock(conn):
+            cur = conn.cursor()
+            cur.execute("DELETE FROM message_history")
+            conn.commit()
+        self._delete_user_files(self._uid())
+
+    def _delete_user_files(self, user_id: str) -> None:
+        # Files a user sent or produced are part of their history: clearing it must not leave them on disk.
+        files_dir = os.path.join(self.files_folder, self._safe_user_id(user_id))
+        shutil.rmtree(files_dir, ignore_errors=True)
+        prefix = os.path.normcase(os.path.abspath(files_dir)) + os.sep
+        for cached_path in list(self._file_cache):
+            if os.path.normcase(os.path.abspath(cached_path)).startswith(prefix):
+                self._file_cache.pop(cached_path, None)
 
     def clear_global_history(self) -> int:
         self._close_all_db_conns()
         os.makedirs(self.history_folder, exist_ok=True)
 
         cleared = 0
+        cleared_users = set()
         for fname in os.listdir(self.history_folder):
             if not fname.endswith(".sqlite"):
                 continue
@@ -3732,6 +4059,11 @@ class AgentSystemManager:
                 conn = sqlite3.connect(db_path, check_same_thread=False)
                 cur = conn.cursor()
                 self._migrate_history_schema(conn)
+                if self._shared_history_sequence(db_path) is not None:
+                    cur.execute("SELECT DISTINCT user_id FROM message_history")
+                    cleared_users.update(str(row[0]) for row in cur.fetchall() if row[0])
+                else:
+                    cleared_users.add(fname[: -len(".sqlite")])
                 cur.execute("DELETE FROM message_history")
                 cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
                 cur.execute(
@@ -3743,24 +4075,46 @@ class AgentSystemManager:
                 cleared += 1
             except Exception:
                 logger.exception(f"Error clearing history for DB: {db_path}")
-        #logger.info(f"[Manager] Cleared history in {cleared} sqlite DB(s).")
+
+        # The files those histories referenced go too: only each cleared user's own folder, never
+        # the whole files_folder, which may be shared with other content (or be the project itself).
+        for user_id in cleared_users:
+            self._delete_user_files(user_id)
         return cleared
+
+    def _is_wipeable_folder(self, path: str) -> bool:
+        # A folder setting such as "." or ".." must never make a reset delete the project itself
+        # (or a filesystem root).
+        try:
+            target = os.path.normcase(os.path.realpath(path))
+            base = os.path.normcase(os.path.realpath(self.base_directory))
+        except (TypeError, ValueError, OSError):
+            return False
+        if os.path.dirname(target) == target:
+            return False
+        try:
+            return os.path.commonpath([target, base]) != target
+        except ValueError:
+            return True  # on another drive, so not the project or one of its parents
+
+    def _wipe_folder(self, path: str, label: str) -> None:
+        if not self._is_wipeable_folder(path):
+            logger.error(
+                f"[Manager] Not deleting the {label} folder {path}: it is the project directory, one of "
+                "its parents or a filesystem root. Point it at a dedicated folder."
+            )
+            return
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            logger.exception(f"Failed to remove {label} folder.")
 
     def reset_system(self) -> None:
         self._close_all_db_conns()
-        try:
-            shutil.rmtree(self.history_folder, ignore_errors=True)
-        except Exception:
-            logger.exception("Failed to remove history folder.")
-        try:
-            shutil.rmtree(self.files_folder, ignore_errors=True)
-        except Exception:
-            logger.exception("Failed to remove files folder.")
-        try:
-            if hasattr(self, "logs_folder") and self.logs_folder:
-                shutil.rmtree(self.logs_folder, ignore_errors=True)
-        except Exception:
-            logger.exception("Failed to remove logs folder.")
+        self._wipe_folder(self.history_folder, "history")
+        self._wipe_folder(self.files_folder, "files")
+        if hasattr(self, "logs_folder") and self.logs_folder:
+            self._wipe_folder(self.logs_folder, "logs")
 
         os.makedirs(self.history_folder, exist_ok=True)
         os.makedirs(self.files_folder, exist_ok=True)
@@ -3772,7 +4126,7 @@ class AgentSystemManager:
                 self._lines_since_refresh = 0
         if hasattr(self, "_db_pool"):
             self._db_pool.clear()
-        self._file_cache = {}
+        self._file_cache = _BoundedFileCache()
         logger.info("[Manager] System reset completed (history/, files/, logs/ wiped).")
 
 
@@ -3956,8 +4310,9 @@ class AgentSystemManager:
             return source, blocks
 
     def _to_blocks(self, value, user_id=None, detail="auto"):
-        self.ensure_user(user_id)
-        user_id = user_id or self._uid()
+        if user_id is None:
+            self.ensure_user()
+            user_id = self._uid()
 
         if isinstance(value, list) and value and all(self._is_block(b) for b in value):
             return [
@@ -4145,6 +4500,7 @@ class AgentSystemManager:
         else:
             return bot_instance
 
+    @_scoped_to_user_id
     def stt(self, file_path, provider=None, model=None, user_id=None):
         if provider:
             provider = provider.lower()
@@ -4377,11 +4733,11 @@ class AgentSystemManager:
         return self._save_tts_file(audio_bytes)
 
     def _save_tts_file(self, audio_bytes: bytes) -> str:
-        tts_folder = os.path.join(self.files_folder, "tts")
-        os.makedirs(tts_folder, exist_ok=True)
+        # Kept with the user's other files, so clearing that user's history removes them too.
         uid = str(self._active_user_id() or self._uid() or "unknown")
-        filename = f"{uid}_{uuid.uuid4().hex}.mp3"
-        file_path = os.path.join(tts_folder, filename)
+        tts_folder = os.path.join(self.files_folder, self._safe_user_id(uid), "tts")
+        os.makedirs(tts_folder, exist_ok=True)
+        file_path = os.path.join(tts_folder, f"{uuid.uuid4().hex}.mp3")
         with open(file_path, "wb") as f:
             f.write(audio_bytes)
         return file_path
@@ -4394,5 +4750,8 @@ class AgentSystemManager:
                 except Exception:
                     pass
             self._db_pool.clear()
+        if hasattr(self, "_conn_locks"):
+            self._conn_locks.clear()
+        self._db_generation = getattr(self, "_db_generation", 0) + 1
         if hasattr(self, "_tls") and getattr(self._tls, "db_conn", None) is not None:
             self._tls.db_conn = None

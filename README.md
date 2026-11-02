@@ -57,6 +57,25 @@ Installing `mas` from GitHub is easy and straightforward.
 pip install --upgrade git+https://github.com/mneuronico/multi-agent-system-library
 ```
 
+### Optional: Scaffold a Project with `mas start`
+
+The `mas` command can create the starter files for you:
+
+```bash
+mas start                     # asks for a provider, model and optional API key
+mas start -d ./my_mas_project # create the project in another directory
+mas start -c path/to/config.json
+mas start -c "A system that summarizes the YouTube videos the user sends"
+```
+
+Without `-c`, it creates `config.json`, `.env`, `fns.py` and `main.py`. With `-c path/to/config.json` it copies that file to `config.json`; with `-c "a description"` an LLM generates `config.json` and `fns.py` (see [Fast Track](#fast-track-build-a-system-from-plain-text)) and `mas start` writes a `.env` for the final system.
+
+`mas start` never overwrites existing files. Files that already exist are kept and listed as kept, so running it inside an existing project only adds what is missing (for example a `main.py` after generating a system from a description). `-c path/to/config.json` stops without copying if `config.json` exists, and `-c "a description"` stops before asking anything if `config.json` or `fns.py` exist.
+
+Generating from a description needs the bootstrap provider's API key, which is typed at a prompt. Without an interactive terminal (stdin is not a TTY, as in CI or a pipe) `mas start -c "..."` aborts with an error instead of waiting for input. API keys are typed without being shown on screen.
+
+`mas start`, `mas run` and `mas dashboard` exit with status `0` on success and `1` when they fail (for example a missing `config.json`, a directory that cannot be created, or a dashboard port that is already in use); a command-line usage error exits with `2`.
+
 ## Step 1: Create a Minimal JSON Configuration
 
 Let’s create a minimal configuration to get started with a single agent.
@@ -397,16 +416,25 @@ mas dashboard -d ./my_mas_project --port 8777 --auto-port
 mas dashboard -d ./my_mas_project --no-browser
 ```
 
-The dashboard looks for `config.json` in the selected directory. If it finds a MAS project, it loads the configuration through `AgentSystemManager`, reads the configured history folder, and serves a local browser UI. It does not call any model provider or run your automation.
+The dashboard looks for `config.json` in the selected directory and serves a local browser UI. It only reads files: `config.json`, the JSON files listed in `general_parameters.imports` (from the project or the packaged standard library), and the SQLite history files in the configured history folder (re-read on every refresh). It does not build an `AgentSystemManager`, does not import or run `fns.py`, `std.py` or any other function file, does not load `.env` or API keys, does not create `history/` or `files/` folders, and does not call any model provider or run your automation. Because function files are not imported, the component cards show function names as written in the config, and errors that only appear when the manager loads (such as a missing function) are not reported; imports that cannot be read are reported at the top of the page.
 
 Available options:
 
-- `--directory`, `-d`: Project directory. Defaults to the current directory.
-- `--host`: Local server host. Defaults to `127.0.0.1`.
-- `--port`: Local server port. Defaults to `8765`.
+- `--directory`, `-d`: Project directory. Defaults to the current directory. The command fails (exit code `1`) if it does not exist.
+- `--host`: Server host. Defaults to `127.0.0.1`. See "Access and security" below before using anything other than a loopback address.
+- `--port`: Server port. Defaults to `8765`. If the port is already in use, the command fails with exit code `1` and says so.
 - `--auto-port`: Use the requested port if it is free, otherwise choose a free port.
 - `--no-browser`: Start the server without opening a browser automatically.
 - `--history-limit`: Maximum number of messages to load per user history. Defaults to `200`.
+- `--token`: Access token the dashboard requires. Defaults to the `MAS_DASHBOARD_TOKEN` environment variable.
+
+#### Access and security
+
+The dashboard shows the whole configuration and every user's message history, so it is locked down:
+
+- **Host header check.** On a loopback address (`127.0.0.1`, `localhost`, `::1`, the default) the server only answers requests whose `Host` header is `localhost`, `127.0.0.1` or `[::1]` with the dashboard's port, and returns `403` otherwise. This stops other web pages from reading the dashboard through DNS rebinding. On a specific non-loopback address only that address and port are accepted.
+- **Access token on the network.** With a non-loopback `--host` (for example `0.0.0.0` or a LAN address) a token is always required. If you do not pass `--token` (or set `MAS_DASHBOARD_TOKEN`), a random one is generated and the printed URL includes it (`http://<host>:<port>/?token=...`). Open that exact URL; requests without the token get `401`. Anyone with the URL can read the dashboard, so share it only with people who may see all histories. A token can also be required on a loopback address by passing `--token`.
+- **One server per port.** A port that another program (or another dashboard) is using makes `mas dashboard` fail clearly, also on Windows.
 
 The dashboard has four views:
 
@@ -435,8 +463,15 @@ The manager will:
     * a full **components** list
     * any helper python functions (`fns.py`)
 4.  Persist everything under your `base_directory`.
-5.  Delete the temporary bootstrap file and continue as if you had written the
+5.  Delete its temporary files and continue as if you had written the
     JSON yourself.
+
+Safety rules:
+
+* The text is only treated as a description when it contains spaces and does not look like a file path. A missing path such as `"configs/prod"` or `"config.json"` raises `FileNotFoundError` instead of generating a new system.
+* Bootstrapping never overwrites anything: if `config.json` or `fns.py` already exist in `base_directory`, it raises `FileExistsError` before calling any model. Load the generated system with `config="config.json"` from then on.
+* The bootstrap agent keeps its own history in a temporary folder, so existing `history/` and `files/` folders are never touched.
+* `fns.py` is code written by a model and it runs when the system loads. Review it before using the system with real users.
 
 ```python
 from mas import AgentSystemManager
@@ -462,6 +497,8 @@ from mas import AgentSystemManager as ASM
 
 ASM("I want a system that gets a youtube video from a link sent by user, gets the transcript from that video, and summarizes it. Use google's gemini-2.0-flash model.").run("www.youtube.com/watch?v=some-video")
 ```
+
+This one-liner only works the first time: later runs raise `FileExistsError` because `config.json` already exists. Use `ASM("config.json")` after that.
 
 
 After the first run you’ll find:
@@ -584,6 +621,8 @@ Here are the primary block types the system uses:
 
     Component parameters can be overridden with variable keys shaped like `component_name:parameter_name`. For example, `{"type":"variable","key":"assistant:temperature","value":0}` updates the agent's model params for subsequent runs, and `assistant:provider` / `assistant:model` can redirect the model used by that component. Python code can read or write these values with `manager.get_variable(key, user_id=None)` and `manager.set_variable(key, value, user_id=None)`.
 
+    An agent's output is model-generated, so it is treated as data. An agent may emit variable blocks only for variables declared in `general_parameters.variables` (for example, a router agent setting `mode`). Component parameter overrides (`component:parameter`) and any other block shape returned by a model (images or documents with local paths, unknown block types) are stored as plain text content, so a prompt injection cannot rewrite a component's prompt, models or `base_url`. Set those overrides from Python, tools or processes. A JSON array returned by a model becomes one block per item (objects as text blocks with that object as content).
+
 #### Automatic Conversion to Blocks (`_to_blocks`)
 
 You don't need to worry about creating these structures yourself. When you call `manager.run(input=...)` or `manager.add_blocks(content=...)`, the library automatically converts your data into the appropriate block format based on these rules:
@@ -595,6 +634,8 @@ You don't need to worry about creating these structures yourself. When you call 
     - Otherwise, it's treated as plain text and becomes a `text` block.
 4.  **Image `bytes` or `bytearray`**: If the byte header is recognized as an image, the bytes are saved to a file in the `files/` directory and wrapped in an `image` block. Unknown byte payloads are not guessed as media; put them inside a dictionary or an explicit block if you want MAS to persist them as file references.
 5.  **A `dict`**: The dictionary is placed inside a `text` block as structured content. If it contains non-JSON values such as bytes or custom class instances, those values are saved under `files/` and replaced with `file:/...` references.
+
+When tools and processes read their inputs, `file:` references are loaded back only if they point inside `files_folder`. Any other string that starts with `file:` (for example, text typed by a user or written by a model) is passed through unchanged and never read from disk.
 
 #### Consuming Data from Blocks
 
@@ -674,23 +715,26 @@ manager = AgentSystemManager(
 
 The `AgentSystemManager` manages your system’s components, user histories, and general settings.
 
--   **`config`**: Path to a JSON file or a plain-English description (triggers automatic bootstrap of system).
--   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`.
+When you pass both a `config` file and constructor arguments, an argument you pass explicitly always wins over the same setting in `general_parameters`, which in turn wins over the library default. `imports` from both places are combined.
+
+-   **`config`**: Path to a JSON file or a plain-English description (triggers automatic bootstrap of system, see "Fast Track" for the safety rules). A missing path raises `FileNotFoundError`.
+-   **`base_directory`**: Specifies the directory where user history databases (`history` subdirectory) and pickled object files (`files` subdirectory) are stored. Also the location of `fns.py`. Defaults to the current working directory at the moment the manager is created.
 -   **`history_folder`**: Path for storing per-user SQLite databases. Defaults to `<base_directory>/history`.
 -   **`history_mode`**: History storage mode. Defaults to `per_user`, which creates one SQLite database per `user_id`. Set to `shared` (aliases: `global`, `all_users`) to store all users together in `shared_history_000001.sqlite`, `shared_history_000002.sqlite`, etc., with a `user_id` column on each message row.
 -   **`history_rotation`**: Shared-history rotation strategy. Defaults to `message_count`; use `time_period` to rotate by elapsed time, or `both` to rotate on either threshold.
 -   **`history_max_messages`**: Maximum messages per shared history file when count rotation is active. Defaults to `1000`.
 -   **`history_period`**: Period for time-based shared history rotation. Accepts values like `1w`, `7 days`, or seconds. Defaults to one week.
 -   **`files_folder`**: Path for storing serialized object files. Defaults to `<base_directory>/files`.
--   **`api_keys_path`**: Path to a `.env` or `json` file containing API keys. Keys from this file are given priority over system environment variables, making it easy to manage keys for different environments.
+-   **`api_keys_path`**: Path to a `.env` or `json` file containing API keys. Keys from this file are given priority over system environment variables by `manager.get_key()`, making it easy to manage keys for different environments. Keys belong to the manager that loaded them, so several managers in one process can use different `.env` files. `.env` values are also exported to `os.environ` for your own code, but never replace a variable the process already has.
 -   **`costs_path`**: Path to a `.json` file containing model and tool costs. If provided, the system will calculate and store the USD cost for agent and tool executions when `return_token_count` is set to `True`.
--   **`general_system_description`**: A description appended to the system prompt of each agent.
+-   **`general_system_description`**: A description appended to the system prompt of each agent. Defaults to `"This is a multi-agent system."`.
 -   **`functions`**: The name of a Python file, or list of Python files, where function definitions must be located. Files must either exist in the base directory or be referenced as an absolute path. If not defined, this defaults to `fns.py` inside the `base_directory`.
 -   **`default_models`**: A list of models to use when executing agents, for agents that don't define specific models. Each element of the list should be a dictionary with two fields, `provider` (like 'groq' or 'openai') and `model` (the specific model name). These models will be tried in order, and failure of a model will trigger a call to the next one in the chain.
 -   **`imports`**: List of component import specifications. Each entry can be either `"<your_json>.json"` to import all components from that file, or `"<your_json>.json?[comp1, comp2]"` to import specific components from that file.
 -   **`on_update`**: Function to be executed each time an individual component is finished running. It can accept `messages`, `manager`, and optionally a third `params` argument when the caller provides callback parameters. Useful for updating an external database or sending incremental bot messages during an automation.
 -   **`on_complete`**: Function to be executed when `manager.run()` reaches completion. This is equivalent to `on_update` when calling `manager.run()` on an individual component (if both are defined, both can run), but it is different for automations because it runs at the end of the automation. It follows the same callback signature flexibility as `on_update`.
 -   **`include_timestamp`**: Whether the agents receive the `timestamp` for each message in the conversation history. False by default. This is overriden by the `include_timestamp` parameter associated with each agent, if specified. 
+-   **`max_context_messages`**: Default for every agent's `max_context_messages`: how many history messages an agent reads when no explicit input selection is given. Defaults to `None` (the whole history).
 -   **`timezone`**: String defining what timezone should the `timestamp` information be saved in. Defaults to `UTC`.
 -   **`log_level`**: Logging level for the library. Defaults to `logging.DEBUG`.
 -   **`admin_user_id`**: A specific user ID (e.g., your Telegram chat ID) granted access to administrative commands.
@@ -755,13 +799,15 @@ manager.set_current_user("user_id_from_request")
 
 Calling this method associates the current thread with the specified user's database. All subsequent calls to methods like `run()`, `get_messages()`, or `show_history()` from the same thread will automatically use that user's history.
 
+Passing `user_id` to a method instead (`run(..., user_id=...)`, `get_messages(user_id)`, `read(user_id=...)`, `add_blocks(..., user_id=...)`, `show_history(user_id)`, `clear_message_history(user_id)`, `set_variable(..., user_id=...)`, `stt(..., user_id=...)`) applies to that call only: the thread's current user is the same before and after the call. Only `set_current_user()` changes it.
+
 #### Automatic User Management
 
 If you call a method that requires a user context (like `run()`) without first setting a user for the current thread, the manager will automatically create a new user with a unique UUID and set it for that thread.
 
-Because the user context is thread-local, you **cannot** set the user once and expect it to apply to all future operations across your application. You **must** call `set_current_user(user_id)` at the beginning of every task that needs to be associated with a specific user (e.g., at the start of each web request handler or when processing a new bot message).
+Because the user context is thread-local, you **cannot** set the user once and expect it to apply to all future operations across your application. In servers and bots, pass `user_id` to every call (or call `set_current_user(user_id)` at the start of every request handler).
 
-Failure to do so will result in a new, anonymous user (with an empty history) being created for each new thread, which is likely not the desired behavior.
+An anonymous user created this way stays the thread's current user, so a simple script or chat loop that never passes a `user_id` keeps one conversation. In a server whose worker threads are reused, that also means requests without a `user_id` share that anonymous history: always pass the real user id there.
 
 
 ### Creating Components
@@ -827,7 +873,8 @@ agent_name = manager.create_agent(
     -   `process`: selects messages from all roles from the process type.
     -   Exact role names (e.g., `myagent`)
 -   **`include_timestamp`**:  Whether this agent should receive `timestamp` information for each message. Defaults to whatever was defined for the manager if not specified, which itself defaults to False.
--   **`model_params`**: Dictionary including params for advanced LLM configuration. Supported params right now are `temperature`, `max_tokens` and `top_p`. Not defining these will use default configuration for each provider.
+-   **`model_params`**: Dictionary including params for advanced LLM configuration. Supported params right now are `temperature`, `max_tokens` and `top_p` (plus `base_url` for `nvidia`). Not defining these will use default configuration for each provider. `max_tokens` is sent to OpenAI as `max_completion_tokens`, which reasoning models such as `gpt-5` require. Any other key is not sent to the provider, and MAS logs a warning naming it. A response cut off by the token limit counts as a failed attempt (MAS tries the next model instead of repairing incomplete JSON); raise `max_tokens` if you see "Response truncated" in the logs. A truncated response does not count against the model's health, so it does not put the model in cooldown for other requests.
+-   **`max_context_messages`**: Maximum number of history messages (after filters) this agent reads when no explicit input selection is given. Defaults to the manager's `max_context_messages`, which defaults to `None` (the whole history). Without a limit every call sends the full conversation, so cost and latency grow with each message; set a limit for long-running conversations. When the cut would leave this agent's own reply first, that reply is left out too, so the conversation sent to the model starts with a user turn (some providers, such as Anthropic, require it).
 -   **`description`**: Optional description of the component, solely to be read by the developer.
 
 
@@ -891,6 +938,8 @@ tool_name = manager.create_tool(
 -   **`outputs`**:  A dictionary describing the output parameters of the `function` using descriptions and names.
 -   **`function`**: A callable (function) that performs the task of the tool. This function receives as many arguments as needed, which must be defined in the same order as the dictionary that will be used as input for this tool (the dictionary from the latest message is used by default, but more complex inputs can be defined as explained below). This function can also optionally receive the `manager` as its first argument, in which case `"manager"` should be the first parameter in the function definition, followed by all parameters in the input dictionary.
 -  **`default_output`**: Output to use if there's an error during the function call, or an exception has been raised by the function.
+
+Models often write booleans and null as text, so input values `"true"`, `"false"`, `"null"` and `"none"` (any case) are converted to `True`, `False` and `None` before the call. Parameters annotated as `str` (`def my_tool(name: str)`) receive the text verbatim, and an empty string is always passed as an empty string.
 -   **`description`**: Optional description of the component, solely to be read by the developer.
 
 Tools can be included in the component list of the config JSON file just like agents:
@@ -1098,8 +1147,12 @@ A while loop enables repeated execution of a set of steps until a specified cond
 **Parameters:**
 
 - **`start_condition`**: A conditional (boolean, string, or dict) that determines whether to run the first iteration. If omitted, the first iteration will run by default.
-- **`end_condition`**: A conditional (boolean, string, or dict) that is evaluated before each iteration. When it evaluates to `true`, the loop stops.
+- **`end_condition`**: A conditional (boolean, string, or dict) that is evaluated after each iteration. When it evaluates to `true`, the loop stops.
+- **`condition`**: Alternative to `start_condition`/`end_condition`, with the usual meaning of a while loop: the body runs while `condition` is true, checked before every iteration including the first. If `start_condition` or `end_condition` is also given, `condition` is used as the default for whichever of them is missing.
+- **`max_iterations`**: Safety limit on the number of iterations. Defaults to `100`; when reached, the automation raises an error instead of calling models forever. Set it to `null` to remove the limit.
 - **`body`**: A list of steps to execute on each iteration of the loop.
+
+Conditions can call a function: `"fn:my_check"` calls `my_check(data)` with the latest message's data, and `"fn:my_check:<input spec>"` (for example `"fn:check_if_query_is_valid:second_loop_agent?[query]"`) passes the messages selected by the input spec instead. The function must return a boolean. A condition that names a function that does not exist makes the system fail when it loads.
 
 **Example:**
 
@@ -1281,6 +1334,8 @@ When importing a component directly in an automation step, the string must be re
 
 Component names must be unique across all imports and local components. Duplicate names will throw an error.
 
+Imported agents follow the importing system: when neither the agent nor the imported file's `general_parameters` sets them, an imported agent uses your `default_models`, `timeout`, `include_timestamp` and `general_system_description`. Relative function paths in an imported file are resolved against your `base_directory`.
+
 In all of these cases, the `.json` file extension is optional. The system will try to find a `.json` file with the specified name regardless of whether the extension was included in the string.
 
 ### The `mas` Standard Library
@@ -1304,6 +1359,25 @@ You may also import it as `std.py`. In general, any `.json` file you try to impo
     }
 }
 ```
+
+The standard library contains these components. The packages they need are not installed with `mas`; install the ones you use.
+
+| Component | Type | Returns | Needs |
+| --- | --- | --- | --- |
+| `google_places_search` | tool | `search_response` | `PLACES_API_KEY` |
+| `youtube_search` | tool | `video_list` (each video has `title`, `description`, `url`, and `transcript`, which is `null` when there is none) | `YOUTUBE_API_KEY`, `google-api-python-client`, `youtube-transcript-api` (0.x or 1.x) |
+| `calendar_search` | tool | `event_list` | `CALENDAR_API_KEY`, `google-api-python-client` |
+| `create_mercadopago_payment_url` | tool | `payment_url` | `MERCADOPAGO_ACCESS_TOKEN`, `mercadopago` |
+| `weather_search` | tool | `temperature`, `condition`, `wind_speed`, `location_name` | `WEATHER_API_KEY` (weatherapi.com) |
+| `current_date` | process | `current_date` | nothing |
+| `markdown_to_pdf` | process | a text block with `pdf_file_path` and a `document` block | `markdown`, the `wkhtmltopdf` program |
+| `get_google_doc` | process | `doc_text` | `GOOGLE_DRIVE_API`, `GOOGLE_DOC_ID` |
+
+How they behave:
+
+- **Failures are errors, not data.** When a service cannot be reached or rejects the request, the function raises. A tool then logs the error and returns its `default_output`, which in the standard library always says `Error: ...` (for example `weather_search` returns `{"condition": "Error: the weather could not be retrieved.", ...}`); a process logs the error and returns an empty result. Error messages and logs never include the API keys. Requests to weatherapi.com, Google Places, Google Docs, Google Calendar and the YouTube search API time out after 30 seconds (MercadoPago and transcript downloads use their libraries' own settings), and `weather_search` uses HTTPS.
+- **Dates use your timezone.** `current_date` returns the current date and time in `general_parameters.timezone` (UTC by default), for example `2026-10-31T09:30:00-03:00`. `calendar_search` treats both dates as whole days in that timezone and includes `end_date`, so `start_date` equal to `end_date` searches that one day.
+- **`markdown_to_pdf`** reads the latest message, which must contain JSON with `markdown` and `title`. It finds `wkhtmltopdf` through the `WKHTMLTOPDF_PATH` key (in `.env` or the environment) or on `PATH`. Raw HTML in the markdown is shown as text, and the PDF is rendered without JavaScript or access to local files. The file is saved in the files folder of the current user (`files/<user_id>/<title>.pdf`, with the title reduced to letters, digits, spaces, dots, dashes and underscores, and never overwriting an existing file). It returns two blocks: a text block `{"response": "PDF created: <name>.pdf", "pdf_file_path": "<path>"}` and a `document` block pointing at the file, which the Telegram and WhatsApp bots send as a file.
 
 ### Linking Components
 
@@ -1437,8 +1511,8 @@ output = manager.run(
 print(output)
 ```
 -   **`input`**: Optional value to store before running the component. By default it is saved as a user message using MAS blocks. Strings are wrapped as `{"response": input}` so agents and bot replies can use the same shape; dictionaries are stored as structured text-block content. Pass `role="internal"` or another custom role if you want to save developer-provided context instead of user input.
--   **`component_name`**: The name of the component to run. If not specified it uses the latest created automation, or creates a linear automation if one does not exist using all components available in their order of creation.
--   **`user_id`**: The ID of the user whose database should be used. If not specified, the current user is used, or created if not set.
+-   **`component_name`**: The name of the component to run. If not specified it uses the latest automation defined by your system (imported automations are only used when you have none of your own), or creates a linear automation if none exists, using your system's components (not imported ones) in their order of creation.
+-   **`user_id`**: The ID of the user whose database should be used, for this call only. If not specified, the current user is used, or an anonymous one is created if not set.
 -   **`role`**: Role to use when saving the input. Defaults to `"user"` for all input types and can be overridden by the developer, for example with `"internal"` for developer-provided context.
 -   **`verbose`**: Boolean to enable verbose mode.
 -   **`target_input`**: The name of a component or user to use as input. This parameter can contain `mas input syntax` which will be parsed by the parser, equivalent to just calling `target_custom` (more details below).
@@ -1594,11 +1668,15 @@ If you need to clear the message history for a user, the `manager` offers a simp
 manager.clear_message_history(user_id) # if not provided, it will use the current user_id
 ```
 
+Clearing a user's history also deletes the files stored for that user (`files/<user>/`, including generated TTS audio), since nothing references them anymore. `clear_global_history()` does the same for every user whose history it clears; anything else in `files_folder` is left alone. `reset_system()` wipes the history, files and logs folders, but never one that is the project directory (for example `files_folder: "."`), one of its parents or a filesystem root: it logs an error and keeps that folder.
+
 ### Adding Messages: `add_message`
 
 ```python
-manager.add_message(role: str, content: Union[str, dict], msg_type: str = "developer") -> None
+manager.add_message(role: str, content: Union[str, dict], msg_type: str = "developer", user_id: Optional[str] = None) -> int
 ```
+
+It returns the new message number. Like other methods, `user_id` applies to this call only; without it the current user is used.
 
 The add_message method allows the developer to directly insert a message into the conversation history without triggering any component execution. This is useful for manual updates, debugging, or simulating interactions.
 
@@ -1830,7 +1908,7 @@ The MAS library includes built-in text-to-speech support via the manager’s `tt
   - **instruction:** An optional parameter for OpenAI to control the tone or style of the generated speech.
 
 - **Output:**  
-  The generated audio (in MP3 format) is saved in the `files` directory, in a special subfolder named `tts`, with a filename that combines the current user ID and a random hash. The method returns the full path to the saved audio file.
+  The generated audio (in MP3 format) is saved in the current user's folder inside the `files` directory (`files/<user>/tts/<random>.mp3`). The method returns the full path to the saved audio file.
 
 ### Tracking Costs with `costs.json`
 
@@ -1868,8 +1946,8 @@ For production environments or detailed analysis, the MAS library provides a per
 **Enabling Logging:**
 To enable this feature, set `usage_logging=True` when initializing the `AgentSystemManager`. This will create a `logs/` directory in your `base_directory` containing two files:
 
-*   **`usage.log`**: A raw, line-by-line JSON log of every model call, tool call, and STT transcription, including tokens, costs (only for runs where `return_token_count=True`), and timestamps.
-*   **`summary.log`**: An aggregated JSON summary of costs and usage across different time spans (hour, day, week, etc.). This file is updated periodically.
+*   **`usage.log`**: A raw, line-by-line JSON log of every model call, tool call, and STT transcription, including tokens, costs, and timestamps. Token counts come from each provider's usage report, so they are logged whether or not `return_token_count=True` is used; costs use `costs.json` (`0.0` for models it does not list).
+*   **`summary.log`**: An aggregated JSON summary of costs and usage across different time spans (hour, day, week, etc.). It is refreshed every 100 log entries and whenever `get_cost_report()` is called.
 
 **Reporting with `get_cost_report`:**
 You can programmatically access the aggregated data using the `get_cost_report` method.
@@ -1883,7 +1961,7 @@ manager.get_cost_report(span="lifetime", user=None, model_or_tool=None) -> dict
 *   **`user`** (Optional): Filter the report for a specific user ID.
 *   **`model_or_tool`** (Optional): Filter for a specific model (`"openai:gpt-4o"`) or tool (`"my_tool"`).
 
-This method returns a dictionary with the same structure as `summary.log`, allowing for detailed, real-time cost analysis.
+This method returns a dictionary with the same structure as `summary.log`, allowing for detailed, real-time cost analysis. It raises an error if the manager was created without `usage_logging=True`.
 
 
 ### Retrieving Usage Statistics: `get_usage_stats`
@@ -1945,11 +2023,11 @@ MAS includes bot adapters for Telegram and WhatsApp Cloud API. Both adapters sha
 4. `manager.run(...)` executes the configured component or automation.
 5. The last result, or your callback result, is converted back into platform messages.
 
-Install the optional dependencies for the channel you use:
+Install the optional dependencies for the channel you use (always from GitHub: the `mas` package on PyPI is a different project):
 
 ```bash
-pip install "mas[telegram]"
-pip install "mas[whatsapp]"
+pip install "mas[telegram] @ git+https://github.com/mneuronico/multi-agent-system-library"
+pip install "mas[whatsapp] @ git+https://github.com/mneuronico/multi-agent-system-library"
 ```
 
 #### Telegram Startup
@@ -1976,11 +2054,23 @@ manager.start_telegram_bot(
     ensure_delivery=False,
     delivery_timeout=5.0,
     max_allowed_message_delay=120.0,
+    error_msg="Sorry, something went wrong while processing your message. Please try again later.",
+    allowed_user_ids=None,
+    media_dirs=None,
+    max_media_bytes=20 * 1024 * 1024,
+    media_too_large_msg="Sorry, that file is too large for me to process (the limit is {limit_mb} MB).",
+    store_original_payload=False,
+    dedup_ttl=3600.0,
+    send_queue_timeout=120.0,
+    maintenance_timeout=60.0,
+    concurrent_updates=True,
     start_polling=True,
 )
 ```
 
 `telegram_token` can be passed directly or stored in the manager API keys as `telegram_token`. If `start_polling=True`, polling starts immediately and blocks the current thread. If `start_polling=False`, the method returns a `TelegramBot` object so you can call direct actions or wire your own webhook server.
+
+`concurrent_updates` (Telegram only) controls how many incoming updates are processed at the same time. With the default `True`, up to 256 updates run concurrently, so one user's slow run does not hold up other users; each user's own messages are still processed one at a time, in order (see [Operational Behavior](#operational-behavior)). Pass an integer to choose another limit, or `False` to process every update one by one, as versions before this one did. Runs execute in the event loop's default thread pool, so the number of runs that are actually executing at once is also bounded by that pool's size.
 
 ```python
 manager = AgentSystemManager(config="config.json")
@@ -2006,6 +2096,9 @@ manager.start_whatsapp_bot(
     whatsapp_token=None,
     phone_number_id=None,
     webhook_verify_token=None,
+    app_secret=None,
+    verify_signature=True,
+    api_version="v23.0",
     component_name=None,
     verbose=False,
     on_update=None,
@@ -2018,6 +2111,15 @@ manager.start_whatsapp_bot(
     ensure_delivery=False,
     delivery_timeout=5.0,
     max_allowed_message_delay=120.0,
+    error_msg="Sorry, something went wrong while processing your message. Please try again later.",
+    allowed_user_ids=None,
+    media_dirs=None,
+    max_media_bytes=20 * 1024 * 1024,
+    media_too_large_msg="Sorry, that file is too large for me to process (the limit is {limit_mb} MB).",
+    store_original_payload=False,
+    dedup_ttl=3600.0,
+    send_queue_timeout=120.0,
+    maintenance_timeout=60.0,
     host="0.0.0.0",
     port=5000,
     base_path="/webhook",
@@ -2027,7 +2129,11 @@ manager.start_whatsapp_bot(
 
 WhatsApp credentials can be passed directly or stored in the manager API keys as `whatsapp_token`, `whatsapp_phone_number_id`, and either `webhook_verify_token` or `whatsapp_verify_token`.
 
+`api_version` is the Graph API version used for every Cloud API call (sending, uploading and downloading media). It defaults to `v23.0`; pass another one (`"v24.0"` or `"24.0"`), or store it as `whatsapp_api_version` / `WHATSAPP_API_VERSION`, when Meta retires it. Meta keeps each Graph API version available for about two years. Versions before this one always used `v18.0`.
+
 If `run_server=True`, MAS starts a Flask server. Meta webhook verification is handled on `GET base_path`, and message webhooks are handled on `POST base_path`.
+
+Every `POST` must carry a valid `X-Hub-Signature-256` header, computed by Meta with your app secret (App Dashboard -> App settings -> Basic). Pass it as `app_secret` or store it as `whatsapp_app_secret` / `WHATSAPP_APP_SECRET`; unsigned or wrongly signed requests get a `403`. Without this check anyone who finds the webhook URL can send messages as any user, including your `admin_user_id`, so the server refuses to start when `verify_signature=True` (the default) and no app secret is available. Pass `verify_signature=False` only for local testing.
 
 If `run_server=False`, the method returns a `WhatsappBot` object:
 
@@ -2035,24 +2141,60 @@ If `run_server=False`, the method returns a `WhatsappBot` object:
 bot = manager.start_whatsapp_bot(run_server=False)
 
 challenge, status = bot.handle_webhook_verification(request.args)
+
+if not bot.verify_webhook_signature(request.get_data(), request.headers.get("X-Hub-Signature-256")):
+    return "Forbidden", 403
 await bot.process_webhook_update(request_json)
 ```
 
-`process_webhook_update` expects the normal WhatsApp webhook body containing `entry -> changes -> value -> messages`.
+When you run your own server, checking the signature is your responsibility: `verify_webhook_signature` needs the raw request body, before any JSON parsing.
+
+`process_webhook_update` expects the normal WhatsApp webhook body containing `entry -> changes -> value -> messages`. When one webhook carries several messages, each is processed on its own: an error in one message does not drop the others, and messages from different users are processed concurrently.
 
 #### Shared Bot Parameters
 
 - `component_name`: component or automation to run for each incoming message. If omitted, MAS uses the default `manager.run()` component resolution.
 - `on_update`: optional callback called when the run emits an update.
 - `on_complete`: optional callback called when the run finishes. If omitted, MAS sends the last generated message to the user.
-- `speech_to_text`: optional callable used for audio transcription. If omitted, MAS calls `manager.stt(...)`.
+- `speech_to_text`: optional callable used for audio transcription. It receives `{"manager": manager, "file_path": path, "user_id": user_id}` and returns the transcript (pass that `user_id` to any manager call you make, for example `manager.stt(path, user_id=user_id)`); it may also be an `async` function. A plain function runs on the bot's event loop and blocks other users while it runs, so prefer an `async` function for slow transcription. If omitted, MAS calls `manager.stt(...)` in a worker thread.
 - `whisper_provider` and `whisper_model`: provider/model used by automatic STT. If no provider is set, `manager.stt()` chooses `groq` when available, otherwise `openai`.
 - `custom_commands`: a command definition or list of definitions.
 - `return_token_count`: passes `return_token_count=True` into the run.
-- `ensure_delivery`: when a callback returns a response, wait for the async send operation to finish before continuing.
-- `delivery_timeout`: max seconds to wait when `ensure_delivery=True`.
-- `max_allowed_message_delay`: incoming messages older than this many seconds are ignored. Set a larger value if your deployment queues webhooks.
-- `verbose`: enables bot logging.
+- `ensure_delivery`: when a callback returns a response, the run waits until that message has been sent before it continues. Either way, a user's messages are always sent in the order they were produced (see [Operational Behavior](#operational-behavior)).
+- `delivery_timeout`: max seconds the run waits for each message when `ensure_delivery=True`. A message that takes longer stays queued and is still sent in order.
+- `max_allowed_message_delay`: incoming messages that are already older than this many seconds when they reach MAS are dropped (logged as a warning). The age is taken from the platform timestamp when the message arrives, so time a message spends waiting behind the same user's earlier messages does not count. Set a larger value if your deployment queues webhooks, or `None` to accept messages of any age.
+- `error_msg`: text sent to the user when processing their message fails (the run raises, a tool or callback fails, a media download fails, a custom `speech_to_text` raises, ...). The error itself is logged with its traceback. Defaults to `"Sorry, something went wrong while processing your message. Please try again later."`; pass `None` to send nothing.
+- `allowed_user_ids`: optional list of user ids allowed to use the bot. See [Restricting Who Can Use The Bot](#restricting-who-can-use-the-bot).
+- `media_dirs`: extra folders the bot may send local files from. By default outgoing media can only come from the manager's `files_folder` (or be a URL or a platform file id). See [Direct Bot Actions](#direct-bot-actions).
+- `max_media_bytes`: largest incoming file (image, audio, video, document, sticker) the bot downloads, in bytes. Defaults to 20 MB, the most Telegram's Bot API lets bots download; `None` removes the bot's own limit. Larger files are not downloaded and the user receives `media_too_large_msg`.
+- `media_too_large_msg`: text sent when an incoming file is over the limit. `{limit_mb}` is replaced with the limit in MB. Pass `None` to send nothing.
+- `store_original_payload`: when `True`, the raw platform payload is also stored in each user message's metadata. Off by default because it holds names, usernames and phone numbers. See [User Message Metadata](#user-message-metadata).
+- `dedup_ttl`: seconds during which a repeated delivery of the same platform message (same Telegram chat and message id, or same WhatsApp `wamid`) is ignored. Defaults to `3600`; `None` or `0` turns duplicate detection off. See [Operational Behavior](#operational-behavior).
+- `send_queue_timeout`: max seconds a user's next message waits for the replies to their previous one to be sent. Defaults to `120`; `None` waits indefinitely.
+- `maintenance_timeout`: max seconds `/clear_all_users` and `/reset_system` wait for other users' messages in progress to finish. Defaults to `60`; `None` waits indefinitely. See [Commands](#commands).
+- `verbose`: logs the bot's activity (instance creation, polling start, each message sent, ignored or duplicate updates) and passes `verbose=True` to `manager.run`. Bot logs go through the library logger, like the rest of MAS, so they appear on its console handler and follow `AgentSystemManager(log_level=...)`. Warnings and errors (dropped or refused messages, failed sends, refused files) are logged whether or not `verbose` is set.
+
+#### Restricting Who Can Use The Bot
+
+By default anyone who finds the bot can talk to it, and every message they send runs your system (and spends your API credits). Pass `allowed_user_ids` to accept only some users:
+
+```python
+manager.start_telegram_bot(allowed_user_ids=[123456789, 987654321])
+manager.start_whatsapp_bot(allowed_user_ids=["5491112345678", "14155550123"])
+```
+
+- Telegram ids are the sender's numeric user id (`update.message.from_user.id`). In a private chat it is also the chat id. In a group, each member is checked by their own id; to accept everyone in a group, list the group's (negative) chat id instead.
+- WhatsApp ids are the sender's phone number in international format, digits only, exactly as WhatsApp sends it in the `from` field (for example `"5491112345678"`). A leading `+` in your list is ignored; spaces or dashes are not removed. Some countries' numbers arrive in a different form than people usually write them (Argentine mobile numbers include a `9` after `54`), so check the `from` value in your logs if a user is rejected.
+- Ids are compared as strings, so `123456789` and `"123456789"` are the same.
+- The manager's `admin_user_id` is always allowed. It is compared with the sender too, so the admin can use admin commands from a group, and listing a group never makes its members admins.
+- Messages from anyone else are ignored, including commands: no reply is sent and no model is called. Each ignored message is logged at `INFO` level with the sender id.
+- `allowed_user_ids=None` (the default) accepts everyone. An empty list accepts only the `admin_user_id`.
+
+##### Telegram Groups
+
+In a Telegram group the bot keeps one shared history for the whole group: history, saved files, `/clear` and the `user_id` passed to callbacks are keyed by the group's chat id, so the model sees the group as a single conversation. Permissions are checked per person: `allowed_user_ids` and the admin check use the sender's id (`from_user.id`), which callbacks receive as `params["sender_id"]` and which is stored in the message metadata as `sender_id`. Any allowed member can run `/clear`, which clears the group's shared history.
+
+Telegram clients send commands in groups as `/command@YourBotName`. The bot strips its own `@name`, so `/clear@YourBotName` works like `/clear`, and ignores commands addressed to another bot (`/clear@OtherBot`). With Telegram's default privacy mode the bot only receives commands and replies to its own messages in groups; turn privacy mode off in BotFather if it should see every message. Telegram's anonymous group admins are reported with a placeholder sender id, so they are not recognized as `admin_user_id`.
 
 #### Incoming Message Conversion
 
@@ -2064,7 +2206,7 @@ Text messages become one text block:
 ]
 ```
 
-Images, videos, documents, and stickers are downloaded and saved through `manager.save_file(...)`. Captions become a preceding text block.
+Images, videos, documents, and stickers are downloaded and saved through `manager.save_file(...)`. Downloads are streamed to a temporary file instead of being held in memory, and stop as soon as they pass `max_media_bytes` (default 20 MB): the user then receives `media_too_large_msg` and the message is not run. Telegram files over 20 MB are refused the same way, because Telegram's Bot API does not let bots download them. The saved file keeps a matching extension (detected from its content, otherwise taken from the original file name or MIME type, otherwise `.bin`). Captions become a preceding text block.
 
 ```json
 [
@@ -2128,17 +2270,24 @@ MAS attaches transport metadata to the first generated block for every incoming 
     "user_message": {
       "channel": "TelegramBot",
       "user_id": "123456",
+      "sender_id": "123456",
+      "message_id": "42",
+      "chat_type": "private",
       "message_type": "text",
       "timestamp": "2026-05-05T12:00:00+00:00",
       "is_voice_note": false,
-      "media_info": {},
-      "original_payload": {}
+      "media_info": {}
     }
   }
 }
 ```
 
-This metadata is persisted in message history. Use it when later components need to inspect where the message came from. In callbacks, MAS also passes the raw platform payload separately in `params["original_payload"]`.
+This metadata is persisted in message history. Use it when later components need to inspect where the message came from.
+
+- `user_id` is the chat the history belongs to (Telegram chat id, WhatsApp phone number); `sender_id` is who wrote the message, which differs from `user_id` only in Telegram groups.
+- `message_id` is the platform's message id (Telegram `message_id`, WhatsApp `wamid`), useful for reactions and replies. `chat_type` is Telegram only (`private`, `group`, `supergroup`).
+- `media_info` describes an attached file (file ids, MIME type, size, file name), or a WhatsApp reaction.
+- The raw platform payload, which contains names, usernames and phone numbers, is not stored. Pass `store_original_payload=True` to store it under `original_payload` as earlier versions did. Callbacks always receive it, without storing it, in `params["original_payload"]`.
 
 #### Bot Callbacks
 
@@ -2154,7 +2303,8 @@ def on_complete(messages, manager, params):
 
 `params` contains:
 
-- `user_id`: Telegram chat id or WhatsApp sender id as a string.
+- `user_id`: Telegram chat id or WhatsApp sender id as a string. This is the id the history is stored under.
+- `sender_id`: id of the person who wrote the message. The same as `user_id` except in Telegram groups (see [Telegram Groups](#telegram-groups)).
 - `original_payload`: raw Telegram `Update` object for Telegram, or the raw WhatsApp message dictionary for WhatsApp.
 - `event_loop`: the bot event loop. Use it to schedule async direct bot actions from a normal synchronous callback.
 
@@ -2165,11 +2315,13 @@ Callback return values control what is sent:
 - `list` of blocks: send each block as a platform message.
 - any other value: convert it with `manager._to_blocks(...)` and send it.
 
-If no `on_complete` callback is provided, MAS sends the latest generated message. It prefers a text block with a `"response"` field. If no `"response"` field exists, it sends the first text block converted to plain text or JSON.
+If no `on_complete` callback is provided, MAS sends every block of the latest message in the history, in order, each as its own platform message. A text block is sent as its `"response"` field when that field is a string; otherwise its content is sent as plain text, or as JSON when it is a dict or list. Image, audio, video, document and sticker blocks are sent as media. Other block types are skipped.
+
+Texts longer than the platform limit (4096 characters on both Telegram and WhatsApp) are split into several messages, at paragraph breaks when possible, then at line breaks, then between words. Media captions are limited to 1024 characters: a longer caption is cut at a natural boundary and the rest follows as text right after the media.
 
 For Telegram, callback output is sent as a reply to the incoming message when using the built-in `_send_blocks` path. For WhatsApp, callback output is sent as a normal outbound message unless you use direct actions with `reply_to_message_id`.
 
-For callback-returned media blocks, `video`, `document`, and `sticker` blocks may use `path`, `url`, `link`, `media_id`, `id`, or `file_id`. Telegram `image` and `audio` blocks are sent from saved `file:`/local paths in the built-in block sender; use direct `send_image(...)` or `send_audio(...)` if you need to send a URL or platform id for those media types.
+Callback-returned media blocks (`image`, `audio`, `video`, `document`, `sticker`) may use `path`, `url`, `link`, `media_id`, `id`, or `file_id` in `content`, on both platforms; local paths must be inside `files_folder` or `media_dirs` (see [Direct Bot Actions](#direct-bot-actions)). A `caption` in `content` (or in the block's `metadata`) is sent with the media, except for stickers, and for audio on WhatsApp, which takes no caption. On Telegram, an `audio` block is sent as an audio file unless it is marked as a voice note with `"is_voice_note": true` in `content` (or `metadata`), in which case it is sent as a voice message. Audio the user sent as a voice note keeps that flag.
 
 #### Direct Bot Actions
 
@@ -2188,13 +2340,19 @@ await bot.remove_reaction(user_id, message_id)
 
 All direct send methods accept `reply_to_message_id=None` and arbitrary `**kwargs`. For Telegram, extra kwargs are forwarded to the underlying Telegram bot method. For WhatsApp, extra kwargs are merged into the Cloud API JSON payload.
 
+Direct actions raise when the platform rejects the request, on both platforms: Telegram raises `telegram.error.TelegramError` subclasses, WhatsApp raises `mas.bots.WhatsappAPIError` (with `status_code` and Meta's `error_code`). The built-in reply path catches these, logs the block type and the error (never the message content) and goes on with the next block.
+
+`send_text` splits texts over 4096 characters into several messages, in order; `reply_to_message_id` applies to the first one, and the result of the last one is returned. A caption over 1024 characters is cut and the rest is sent as text after the media.
+
 Media arguments can be:
 
-- a local filesystem path such as `"/tmp/photo.jpg"`;
-- a MAS file reference such as `"file:/tmp/photo.jpg"`;
+- a local filesystem path such as `"/path/to/files/photo.jpg"`;
+- a MAS file reference such as `"file:/path/to/files/photo.jpg"`;
 - a public `http://` or `https://` URL;
 - a platform media/file id;
 - a dictionary containing one of `path`, `url`, `link`, `media_id`, `id`, or `file_id`.
+
+Local files can only be sent from the manager's `files_folder` (where MAS saves incoming media, TTS output and files from `manager.save_file`) or from a folder listed in the bot's `media_dirs`. Blocks can be produced by tools or by the model, so without this rule a block pointing at, say, your `.env` file would upload it to the chat. A path anywhere else (including one that escapes through `..` or a symlink) raises `PermissionError` and is logged as a warning, and nothing is uploaded. To send files from another folder, add it to `media_dirs` (`manager.start_telegram_bot(media_dirs=["/srv/brochures"])`) or copy the file in with `manager.save_file(path, user_id)` first. URLs and platform ids are not affected. The admin `/logs` command sends the log files directly and does not need `media_dirs`.
 
 Local WhatsApp media is uploaded first, then sent by uploaded media id. WhatsApp URLs are sent as `link`. Any other non-path value is treated as a WhatsApp media `id`.
 
@@ -2307,11 +2465,17 @@ Built-in commands:
 - `/clear`: clears the current user's message history.
 - `/help`: lists commands.
 
-Admin-only commands are registered when `manager.admin_user_id` is set:
+Admin-only commands are registered when `manager.admin_user_id` is set. Only the admin may run them (checked against the sender, also in groups); anyone else gets `Unauthorized.`:
 
 - `/clear_all_users`: clears every user's history.
 - `/reset_system`: deletes histories, saved files, and logs.
 - `/logs`: sends `usage.log` and `summary.log` when usage logging is enabled.
+
+`/clear_all_users` and `/reset_system` close the history databases and delete folders, so they do not run while other users' messages are being processed. From the moment the admin sends one, new messages from other users wait; the command then waits up to `maintenance_timeout` seconds (default 60) for the messages already in progress to finish, runs, and lets the waiting messages continue. If messages are still in progress when the timeout passes, nothing is cleared or deleted and the admin is told how many messages were still running, so they can try again. Only messages handled by the same bot object are waited for: if other code (another bot, a web server) uses the same manager, stop it first. These commands run one at a time: a second one (for example the admin in a group and in a private chat) waits for the first instead of counting it as a message in progress. Custom commands do not get this protection.
+
+Unknown commands get `unknown_command_msg` on both platforms (pass `None` to stay silent). In Telegram groups, `/command@YourBotName` is accepted and commands for other bots are ignored (see [Telegram Groups](#telegram-groups)).
+
+Command names, built-in or custom, must be `/` followed by 1 to 32 letters, digits or underscores, for example `/my_status` (this is Telegram's rule; MAS applies it to both platforms so the same commands work everywhere). Names are case-insensitive. An invalid custom command name, such as `/my-cmd`, raises `ValueError` when the bot is created, on both platforms.
 
 Custom commands:
 
@@ -2336,9 +2500,17 @@ manager.start_telegram_bot(custom_commands=custom_commands)
 
 #### Operational Behavior
 
-MAS processes one message per user at a time. If another message from the same user arrives while a run is still active, the new message is ignored. This avoids overlapping writes and mixed histories.
+MAS processes one message per user at a time. If another message from the same user arrives while a run is still active, it waits and is processed when the earlier one finishes; several waiting messages are processed in the order they arrived. This avoids overlapping writes and mixed histories without losing messages. Different users do not wait for each other.
 
-Messages older than `max_allowed_message_delay` seconds are ignored. This protects polling and webhook deployments from replaying old updates.
+Each user's outgoing messages go through a send queue and are delivered one at a time, in the order they were produced: progress messages from `on_update`, the final answer, error replies and command replies, whether or not `ensure_delivery` is set. A message counts as finished only once its replies have been sent, so the user's next message is not processed before that (waiting at most `send_queue_timeout` seconds; replies still pending after that keep their order).
+
+Platforms sometimes deliver the same message twice: WhatsApp retries webhooks that were not acknowledged in time, and Telegram can redeliver updates. MAS remembers the ids of messages it has seen (Telegram chat and message id, WhatsApp `wamid`) for `dedup_ttl` seconds and ignores repeats, so a repeated delivery is not run or answered twice. The memory is per process and holds at most 10 000 ids: it does not survive a restart and is not shared between processes or serverless instances (for example several Lambda containers), so deployments that need stronger guarantees must also deduplicate upstream (MAWS deployments do: see "Repeated deliveries" in `maws/README.md`).
+
+Messages that are already older than `max_allowed_message_delay` seconds when they arrive are dropped and logged as a warning. This protects polling and webhook deployments from replaying old updates, for example the backlog Telegram delivers after a restart. A message that arrived in time is never dropped for waiting behind the same user's earlier messages.
+
+If processing a message fails, the error is logged with its traceback (`logger.exception`) and the user receives `error_msg`, unless it is `None`. One failing message never stops the bot from processing the next ones. A message whose file is over `max_media_bytes` is not processed; the user receives `media_too_large_msg` instead.
+
+The bot does not log message text or platform payloads: failed sends log the block type and the platform's error, and errors reported by python-telegram-bot log only the `update_id`. Exceptions raised by your own components or callbacks are logged as they are.
 
 The bot classes are async internally. Direct actions such as `send_sticker` and `react_to_message` must be awaited from async code, or scheduled with `asyncio.run_coroutine_threadsafe(..., params["event_loop"])` inside synchronous callbacks.
 
@@ -2648,7 +2820,9 @@ The compact forms keep their usual meaning, and timeline selectors let you expre
 
 ## Error Handling
 
-The library is designed for robust operation, handling various errors gracefully. If an agent fails to produce a response, it will return a `default_output`. If the tool or process fails, the system will return the `default_output`, or an empty dict if no `default_output` was specified. Errors in configuration files or function references are logged for debugging.
+The library is designed for robust operation, handling various errors gracefully. If an agent fails to produce a response, it will return a `default_output`. If the tool or process fails, the system will return the `default_output`, or an empty dict if no `default_output` was specified. These fallbacks are always logged, whether or not `verbose` is set: each failed model attempt at warning level, an agent whose models all failed at error level (the details are in the message metadata under `provider_errors`), and tool or process errors at error level.
+
+An automation step that names a component that does not exist is an error, not a skipped step: systems loaded from a config fail when they load, and automations created in Python fail when that step runs.
 
 ## Design Patterns and Recommendations
 
@@ -2888,6 +3062,8 @@ maws update
 
 After `maws update` finishes, if you chose to create a WhatsApp bot, in your Meta App, set the webhook URL to <ApiUrl> and the verify token to WHATSAPP_VERIFY_TOKEN (follow instructions in console).
 
+Webhook authentication is mandatory. For Telegram, `maws start` generates `TELEGRAM_WEBHOOK_SECRET_TOKEN` in `.env.prod`. For WhatsApp, add `WHATSAPP_APP_SECRET` (Meta App Dashboard > App settings > Basic > App secret) to `.env.prod` before `maws update`, or the deploy stops with instructions. See [Webhook authentication](#webhook-authentication).
+
 That’s it — send a message to your bot. Conversation history is automatically persisted to S3.
 
 ---
@@ -2900,9 +3076,13 @@ Inside your chosen folder:
 params.json     # AWS deploy settings (project, region, stack & buckets, etc.)
 config.json     # Minimal MAS config with a simple agent (edit as you like)
 fns.py          # Where your tools/processes live
-.env.prod       # Provider keys & bot tokens (stored in AWS SSM at deploy time)
-.samignore      # SAM build ignores
+.env.prod       # Provider keys, bot tokens & webhook secrets (stored in AWS SSM at deploy time)
+.gitignore      # Keeps .env*, history/ and build output out of git
 ```
+
+At deploy time MAWS copies only your project code into `.maws_package/` and deploys that folder. `.env*`, `api_keys.json`, `history/`, `files/`, SQLite files and deploy files are never packaged into the Lambda zip; secrets reach Lambda only through SSM.
+
+`maws update` never writes files in your project folder. It generates `template.yaml` in `.maws_build/` and writes `lambda_function.py` / `requirements.txt` into `.maws_package/` only. If you have your own `lambda_function.py` or `requirements.txt` in the project folder, it is deployed unchanged (files that older maws versions generated there are recognised and replaced in the package). Project-folder `template.yaml` / `samconfig.toml` files are not used; customise the stack through `params.json`.
 
 On AWS, the stack includes:
 
@@ -2911,6 +3091,7 @@ On AWS, the stack includes:
 * **SSM Parameter Store (SecureString)** to hold your `.env` securely
 * **(Optional)** DynamoDB table for **user locks** (prevents concurrent processing by multiple invocations)
 * **(Optional)** SQS FIFO queue and DLQ for durable, ordered bot work
+* A CloudWatch **log group** with 30-day retention and SQS queues for failed work (FIFO DLQ, or the async-failures queue in the default mode)
 
 ---
 
@@ -2918,12 +3099,12 @@ On AWS, the stack includes:
 
 * Loads secrets from **SSM** (`ENV_PARAMETER_NAME`) into `os.environ` on cold start.
 * Optionally **syncs “token files”** (API tokens, etc.) from **S3** into `/tmp` and exposes their paths via env vars.
-* Optionally verifies Telegram POSTs with `X-Telegram-Bot-Api-Secret-Token` and WhatsApp POSTs with `X-Hub-Signature-256`.
-* Optionally syncs user media/files to S3 when `persist_files_s3=true`.
+* Verifies Telegram POSTs with `X-Telegram-Bot-Api-Secret-Token` and WhatsApp POSTs with `X-Hub-Signature-256` (mandatory unless `webhook_security.allow_unauthenticated` is set).
+* Optionally syncs user media/files to S3 when `persist_files_s3=true`; files deleted during a job (for example by `/clear`) are deleted from S3 too.
 * On each webhook:
 
   1. Normalizes provider payloads into one job per processable message.
-  2. Either self-invokes immediately (`busy_policy="drop"`, default) or enqueues to SQS FIFO (`busy_policy="fifo"`).
+  2. Either self-invokes immediately, once per chat with that chat's messages in order (`busy_policy="drop"`, default), or enqueues to SQS FIFO (`busy_policy="fifo"`). If that hand-off fails, the webhook answers `5xx` so Telegram/WhatsApp retry.
   3. **(Optional)** acquires a **DynamoDB distributed lock** for that user, or one global lock in shared-history mode.
   4. Downloads history from S3 and **imports** it into the MAS manager.
   5. Feeds the update to **TelegramBot**/**WhatsappBot** (webhook mode).
@@ -2935,9 +3116,10 @@ You don’t have to wire any of this — the CLI’s deploy scripts generate all
 
 ## Prerequisites
 
-* AWS account with credentials (maws start will install aws, sam and run aws config if necessary)
-* For Telegram: `TELEGRAM_TOKEN`
-  For WhatsApp Cloud API: `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN`
+* AWS account with credentials, AWS CLI, SAM CLI and `jq` (`maws start --install-deps --run-config` can install them and run `aws configure`; both are opt-in)
+* For Telegram: `TELEGRAM_TOKEN` (`TELEGRAM_WEBHOOK_SECRET_TOKEN` is generated by `maws start`)
+  For WhatsApp Cloud API: `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`
+* Locally, the Python version of the Lambda runtime (default `python3.12`, see `infra.runtime`) so `sam build` can build the package
 
 ---
 
@@ -2961,14 +3143,17 @@ maws start \
   [--allow-windows]
 ```
 
-* Creates `params.json`, `config.json`, `fns.py`, `.env.prod`, `.samignore`.
+* Creates `params.json`, `config.json`, `fns.py`, `.env.prod`, `.gitignore`.
 * Asks for default **LLM provider/model** and **bot type**.
-* Optionally installs system deps (AWS CLI, SAM) and runs `aws configure`.
+* Telegram: writes a random `TELEGRAM_WEBHOOK_SECRET_TOKEN` to `.env.prod`. WhatsApp: writes an empty `WHATSAPP_APP_SECRET=` line for you to fill in.
+* Writes unguessable S3 bucket names into the new `params.json` (`<project>-history-<random>`, `<project>-deploy-<random>`).
+* Re-running it in an existing project keeps `params.json`: its `project`/`region`/`bot` are used as defaults and are only replaced with `--overwrite` (which keeps every other key). It never treats an unreadable `params.json` as empty: it stops with the JSON error.
+* `--install-deps` (off by default) installs curl/unzip/jq with `sudo apt-get` and the latest AWS CLI / SAM CLI installers with `sudo`, without checksum verification. `--run-config` (off by default) runs `aws configure`, and only if `aws sts get-caller-identity` fails.
 
 **Tip (non-interactive):**
 
 ```bash
-maws start --project my-bot --region us-east-1 --bot telegram --no-install-deps --no-run-config
+maws start --project my-bot --region us-east-1 --bot telegram
 ```
 
 ---
@@ -2985,11 +3170,16 @@ maws update \
   [--quiet] \
   [--allow-windows] \
   [--project <name>] [--region <region>] [--bot telegram|whatsapp] \
-  [--set key=value ...]        # override values in params.json on the fly
+  [--set key=value ...]        # override params on the fly; dotted keys: --set infra.tracing=false
 ```
 
-* Uses `params.json` (and overrides) to deploy.
-* Persists `.env.prod` to **SSM** as a secure parameter automatically.
+* Uses `params.json` (and overrides) to deploy. A `params.json` that is not valid JSON stops the command with the parser error (exit code 2).
+* `--set` values stay text unless they are exact JSON literals: `true`/`false`/`null`, `120`, `1.5`, `"text"` or a JSON object/array. So `--set requirements_ref=1.10` keeps `"1.10"` and a phone id like `0123456` keeps its leading zero; `NaN`/`Infinity` are rejected.
+* Stops before uploading or deploying anything if the webhook secret is missing from `.env.prod` (or, for Telegram, has characters other than `A-Z a-z 0-9 _ -`).
+* Persists `.env.prod` to **SSM** as a secure parameter automatically, as a new parameter version that the deployed function is pinned to (a failed deploy leaves the running function on its old secrets). `.env.prod` is read, never executed as shell code.
+* Refuses deployment/history buckets owned by another AWS account.
+* Warns when `requirements_ref` is not set (the Lambda then gets whatever is on the default branch at deploy time; pin a commit SHA or an existing tag). `requirements_source` must be `git` (default) or `local`.
+* Telegram: calls `setWebhook` on every deploy and exits non-zero with Telegram's error description if it is rejected.
 * Prints the **ApiUrl** output on success (use it to set your WhatsApp webhook if necessary).
 
 ---
@@ -3017,6 +3207,7 @@ Prompts for:
 * `project`, `region`, `bot`
 * `stack_name`, `history_bucket`, `deployment_bucket`
 * `env_param_name` (SSM), `api_path` (API Gateway route), verbosity & token sync prefs
+* WhatsApp signature verification (default on) and the Lambda Python runtime (`infra.runtime`, default `python3.12`)
 
 ---
 
@@ -3050,14 +3241,17 @@ maws remove \
   [--region <region>] \
   [-y|--yes] \
   [--keep-deploy-bucket] \
-  [--wait] \
+  [--no-wait] \
   [-c|--config params.json] \
   [--dir <path>]
 ```
 
-* Empties the **history bucket** and deletes the **CloudFormation stack**.
-* Optionally deletes the **deployment bucket** (`--keep-deploy-bucket` to preserve artifacts).
-* `--wait` blocks until the stack is fully deleted.
+* First checks (read-only) that the stack exists in the chosen region; otherwise nothing is deleted and it exits with `1` (bucket names are global, so emptying them for a stack in another region would destroy a live deployment's data).
+* Empties the **history bucket** (only if it is a resource of that stack) and deletes the **CloudFormation stack**.
+* Waits until the stack is fully deleted, then deletes the **SSM SecureString** that holds your `.env.prod` secrets (listed in the deletion plan) and this stack's deployment artifacts (`s3://<deployment_bucket>/<stack>/`), and the **deployment bucket** only if nothing else is left in it, since it may be shared (`--keep-deploy-bucket` keeps the artifacts).
+* If `delete-stack` or the wait fails, the SSM parameter and artifacts are kept (the stack's function still needs its secrets), the error is printed and the exit code is `1`; any failed step makes it exit `1` without printing `[OK] Done`.
+* `--no-wait` only starts the stack deletion and keeps the SSM parameter and artifacts; it prints the `aws` commands to delete them once the stack is gone. (`--wait` is accepted and is the default.)
+* Stack and bucket names come from `params.json` only when it belongs to the project being removed. If `--project` names a different project than `params.json`, its names are ignored and the defaults (`<project>-stack`, `<project>-history-bucket`, `<project>-deployment-bucket`) are used; the deletion plan says so. The region still falls back to `params.json`, so pass `--region` when the other project lives elsewhere.
 
 ---
 
@@ -3115,7 +3309,32 @@ Return codes mirror the CLI behavior (`0` on success, non-zero on error where ap
 
 Optional production params include `busy_policy` (`drop` by default, `fifo` for SQS FIFO), `persist_files_s3`, `files_s3_prefix`, `history_mode`, `history_rotation`, `history_max_messages`, `history_period`, `webhook_security`, `runtime.manager_kwargs`, `runtime.bot_kwargs`, `failure_handling`, `infra`, `requirements_source`, and `requirements_ref`.
 
-Security uses only provider-supported mechanisms: Telegram webhook secret tokens and WhatsApp `X-Hub-Signature-256` verification. These are opt-in so existing projects do not break, but production bots should enable the relevant provider mechanism.
+`infra.runtime` sets the Lambda runtime (default `python3.12`); `sam build` needs that Python version installed locally. The deploy tries to upgrade pip/setuptools/wheel first and only warns if it cannot (for example on an externally managed system Python, PEP 668).
+
+In FIFO mode, a job whose user lock is still held fails its SQS invocation and is redelivered after the visibility timeout instead of being dropped. Locks expire 15 seconds after the worker invocation's deadline, before SQS redelivers a crashed worker's message. FIFO deploys get a dead-letter queue by default (`failure_handling.worker_dlq`, `failure_handling.max_receive_count`, default 3).
+
+In the default `drop` mode, a worker that finds the user busy waits up to `runtime.busy_wait_seconds` (default 30 s, never more than half of the remaining invocation time) before dropping the update, so WhatsApp batches and Telegram albums / split long messages are no longer lost. It still drops when the lock stays held longer than that (long model runs, a crashed worker's lock, any other chat in `history_mode: "shared"`), or at once with `busy_wait_seconds: 0`. Every drop is logged at WARNING and counted in the CloudWatch metric `MAWS/DroppedMessages`; processing errors are counted in `MAWS/FailedMessages`. Async invocations that still fail after Lambda's two retries go to the `<stack>-async-failures` SQS queue (`failure_handling.async_failure_queue`, default on). See "Busy-message policy" and "Failure handling" in `maws/README.md` for inspecting and redriving failed work.
+
+Each message is processed once. Workers record processed messages in the stack's locks table for `runtime.dedup_retention_days` days (default 8) and skip repeated deliveries (a webhook the provider retries, an async invocation Lambda delivers twice, an SQS redelivery), counting them in `MAWS/DuplicateMessages`. A message whose worker crashed while processing it can still be processed again. See "Repeated deliveries" in `maws/README.md`.
+
+Logs go to the stack-managed log group `/aws/lambda/<stack>-maws` with `infra.log_retention_days` retention (default 30 days; `0` keeps them forever); changing it on an existing stack is a normal `maws update`. `infra.s3_lifecycle_days` expires only `history/`, the files prefix and `failed-events/` (never the token files under `secrets/`), and with `infra.s3_versioning` noncurrent versions expire after `infra.s3_noncurrent_version_days` (default 30).
+
+Booleans in `params.json` accept `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`); an explicit `false` is always honoured, and any other value stops the deploy with an error.
+
+#### Webhook authentication
+
+Security uses only provider-supported mechanisms, and it is **mandatory**:
+
+* **Telegram**: `TELEGRAM_WEBHOOK_SECRET_TOKEN` in `.env.prod` (generated by `maws start`; 1-256 characters from `A-Z a-z 0-9 _ -`, e.g. `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`). It is sent to Telegram `setWebhook`, and MAWS rejects POSTs without the matching `X-Telegram-Bot-Api-Secret-Token` header.
+* **WhatsApp**: `WHATSAPP_APP_SECRET` in `.env.prod` (Meta App Dashboard > App settings > Basic > App secret). MAWS verifies `X-Hub-Signature-256`; `webhook_security.whatsapp_verify_signature` defaults to `true`.
+
+`maws update` refuses to deploy without them. Keep `.env.prod` as plain `KEY=value` lines (no quotes, no `export`), because Lambda reads it that way. The explicit opt-out, for experiments only, is:
+
+```json
+{ "webhook_security": { "allow_unauthenticated": true } }
+```
+
+It deploys without verification (a missing secret is allowed, and `whatsapp_verify_signature: false` is honored) and prints a loud warning. Upgrading an existing project: add the secret to `.env.prod` and run `maws update`.
 
 ### Lambda environment variables (read by runtime)
 
@@ -3125,7 +3344,9 @@ Security uses only provider-supported mechanisms: Telegram webhook secret tokens
 * `SYNC_TOKENS_S3` – `"1"/"0"` (default on)
 * `TOKENS_S3_PREFIX` – S3 prefix for token files (default `secrets`)
 * `LOCKS_TABLE_NAME` – DynamoDB table name (optional; enables user locks)
-* `LOCK_TTL_SECONDS` – seconds for the lock TTL (default `180`)
+* `LOCK_TTL_SECONDS` – lock lifetime when no Lambda context is available (deploys set `lambda_timeout + 15`; inside Lambda a lock expires 15 s after the invocation deadline)
+* `WHATSAPP_VERIFY_SIGNATURE` – verify WhatsApp `X-Hub-Signature-256` (default `true`)
+* `MAWS_ALLOW_UNAUTHENTICATED_WEBHOOKS` – explicit opt-out of webhook authentication (default `false`)
 * `SPECIAL_TOKEN_FILES_JSON` – JSON list of filenames to fetch to `/tmp` (optional)
 * `TOKEN_ENV_MAP_JSON` – JSON map `{ "file.ext": "ENV_VAR_NAME" }`; MAWS sets `ENV_VAR_NAME=/tmp/file.ext`
 * `VERBOSE` – extra logs (`true/false`)
@@ -3147,25 +3368,30 @@ NVIDIA_API_KEY=
 
 # Telegram (if using Telegram)
 TELEGRAM_TOKEN=
-TELEGRAM_WEBHOOK_SECRET_TOKEN=
+TELEGRAM_WEBHOOK_SECRET_TOKEN=   # required; generated by maws start
 
 # WhatsApp Cloud API (if using WhatsApp)
 WHATSAPP_TOKEN=
 WHATSAPP_PHONE_NUMBER_ID=
 WHATSAPP_VERIFY_TOKEN=
-WHATSAPP_APP_SECRET=
+WHATSAPP_APP_SECRET=             # required; Meta App Dashboard > App settings > Basic
 ```
 
+> The `# ...` notes above are for this README only: in `.env.prod`, put comments on their own lines. Lambda reads each line as `KEY=value` verbatim (no quotes, no `export`, no inline comments).
+
 > MAWS loads this env securely from **SSM** at runtime (`ENV_PARAMETER_NAME`).
-> To rotate secrets, update `.env.prod` locally and redeploy (`maws update`), or write the SSM parameter directly.
+> To rotate secrets, update `.env.prod` locally and redeploy (`maws update`). The function reads the SSM parameter version it was deployed with, so a value written to SSM directly only takes effect after the next `maws update`.
 
 ---
 
 ## Troubleshooting
 
 * **Windows**: Prefer **WSL**. If you must run natively, add `--allow-windows`, but this won't necessarily play nice with the Lambda environment.
-* **Missing AWS/SAM/jq**: Re-run `maws start` on Linux/WSL, or install manually.
-* **Telegram webhook not set**: Use the `setWebhook` call shown above with your **ApiUrl** (although it should be set automatically).
+* **Missing AWS/SAM/jq**: Install them manually, or run `maws start --install-deps` on Linux/WSL.
+* **"Deployment bucket ... is not owned by account"**: the bucket name exists in another AWS account. For a new project set `deployment_bucket` / `history_bucket` in `params.json` to unique names; never change `history_bucket` of a deployed project.
+* **Telegram webhook not set**: `maws update` sets it on every deploy and prints Telegram's error if it is rejected (usually a wrong `TELEGRAM_TOKEN`); fix `.env.prod` and re-run `maws update`.
+* **Deploy stops with "has no TELEGRAM_WEBHOOK_SECRET_TOKEN" / "has no WHATSAPP_APP_SECRET"**: webhook authentication is mandatory; see [Webhook authentication](#webhook-authentication).
+* **`sam build` cannot find Python 3.12**: install it, or set `"infra": {"runtime": "python3.X"}` in `params.json` to the version of your local `python3`.
 * **WhatsApp verification fails**: Ensure your **webhook URL** is exactly the printed **ApiUrl** and **WHATSAPP\_VERIFY\_TOKEN** matches the Meta dashboard value.
 * **403 / 401 from LLM provider**: Double-check your provider API key is present (SSM) and the model name in `config.json` is valid.
 * **No messages saved**: Verify the **history bucket** exists (`maws describe`) and Lambda has write permissions (the provided stack template handles this automatically).

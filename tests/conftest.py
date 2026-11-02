@@ -56,6 +56,7 @@ def _install_dotenv_stub() -> None:
 
     dotenv = types.ModuleType("dotenv")
     dotenv.load_dotenv = lambda *args, **kwargs: None
+    dotenv.dotenv_values = lambda *args, **kwargs: {}
     sys.modules["dotenv"] = dotenv
 
 
@@ -104,6 +105,9 @@ def _install_telegram_stub() -> None:
             return self
 
         def request(self, request):
+            return self
+
+        def concurrent_updates(self, value):
             return self
 
         def build(self):

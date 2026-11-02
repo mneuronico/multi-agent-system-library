@@ -6,7 +6,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to Ubuntu 26.04, where setup-python has no Python 3.9,
+    # and the package still supports 3.9 (requires-python >= 3.9).
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
