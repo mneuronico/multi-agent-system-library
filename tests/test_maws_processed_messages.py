@@ -261,6 +261,36 @@ def test_a_message_another_worker_is_processing_is_skipped_without_waiting_for_t
     assert metrics == [("DuplicateMessages", 1)]  # a repeat, not a dropped message
 
 
+def _one_message(body, **fields):
+    message = {"from": "user-a", "type": "text", "text": {"body": body}, **fields}
+    return {"entry": [{"id": "entry-1", "changes": [{"value": {"messages": [message]}}]}]}
+
+
+def test_a_message_without_an_id_is_processed_every_time_it_arrives(workspace_tmp_path):
+    runtime, processed, metrics = _runtime(workspace_tmp_path)
+
+    for _ in range(2):
+        [job] = runtime._normalize_whatsapp_jobs(_one_message("sí"))
+        _work(runtime, {"maws_job": job})
+
+    assert processed == ["sí", "sí"]  # the same answer twice is not a repeat when nothing identifies it
+    assert metrics == []
+    assert not [key for key in runtime.dynamodb.items if key.startswith("maws-event#")]
+
+
+def test_a_message_id_reused_with_a_new_timestamp_is_a_new_message(workspace_tmp_path):
+    runtime, processed, metrics = _runtime(workspace_tmp_path)
+    [first] = runtime._normalize_whatsapp_jobs(_one_message("hola", id="bridge", timestamp="1800000000"))
+    [second] = runtime._normalize_whatsapp_jobs(_one_message("sí", id="bridge", timestamp="1800000060"))
+
+    for job in (first, second, first):
+        _work(runtime, {"maws_job": job})
+
+    assert processed == ["hola", "sí"]
+    assert metrics == [("DuplicateMessages", 1)]  # the repeated delivery of the first one
+    assert runtime.dynamodb.items["maws-event#whatsapp#user-a#bridge@1800000000"]["status"]["S"] == "processed"
+
+
 def test_the_claim_of_a_worker_that_crashed_expires_so_the_retry_processes_the_message(workspace_tmp_path):
     runtime, processed, _ = _runtime(workspace_tmp_path)
     runtime.dynamodb.hold("maws-event#whatsapp#user-a#wamid.1", NOW - 1, status="processing")

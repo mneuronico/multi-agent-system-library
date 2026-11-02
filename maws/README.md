@@ -261,7 +261,7 @@ Lock expiry is enforced by the conditional write (`expiresAt < now`), not by Dyn
 
 The same message can reach a worker more than once: the provider retries a whole webhook when one chat's hand-off failed after another chat's succeeded (or when the webhook did not answer in time), Lambda occasionally delivers an asynchronous invocation twice, and SQS redelivers a message whose worker failed after processing it. MAWS processes each message once:
 
-* Before taking the user lock, the worker **claims** each message in the locks table with the same conditional write as the lock. The key is `maws-event#<provider>#<chat id>#<event id>`, where the event id is Telegram's `update_id` or WhatsApp's `wamid`.
+* Before taking the user lock, the worker **claims** each message in the locks table with the same conditional write as the lock. The key is `maws-event#<provider>#<chat id>#<id>`, where the id is Telegram's `update_id`, or WhatsApp's `wamid` plus the message `timestamp` (so a sender that reuses one id for several messages, such as a bridge, does not lose them). A message without an id is processed every time it arrives: a repeated delivery of it cannot be told apart from a new message with the same text.
 * Once the bot has processed the message, the claim becomes a **processed** record that is kept for `runtime.dedup_retention_days` days (`MAWS_DEDUP_RETENTION_DAYS`, default 8; WhatsApp retries a webhook for up to 7 days). It is written before the history is saved, because the replies have already been sent.
 * A delivery of a message that has a claim or a record is skipped at once, without waiting for the user lock. It is logged (`[maws][dedup] Skipping ...`) and counted in `MAWS/DuplicateMessages`, not in `MAWS/DroppedMessages`.
 

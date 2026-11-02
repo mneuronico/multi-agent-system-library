@@ -1030,9 +1030,17 @@ class MawsRuntime:
         return bool(getattr(self, "lock_table", "") and self._dedup_retention_seconds() > 0 and self.dynamodb)
 
     def _dedup_key_for(self, job: dict) -> str:
+        """Key of the job's processed-message record, or "" when nothing identifies the message.
+
+        Without a provider id a repeated delivery cannot be told apart from a new message with the
+        same content, so such a message is processed every time rather than risk skipping a real one.
+        """
+        # Jobs queued before dedup_id existed carry the provider's id (or a hash) in event_id.
+        dedup_id = str(job["dedup_id"] if "dedup_id" in job else job.get("event_id") or "")
+        if not dedup_id:
+            return ""
         provider = str(job.get("provider") or getattr(self, "bot_type", "whatsapp"))
-        event_id = str(job.get("event_id") or _stable_hash(job.get("payload"))[:24])
-        return f"{DEDUP_KEY_PREFIX}{provider}#{job.get('chat_id') or ''}#{event_id}"
+        return f"{DEDUP_KEY_PREFIX}{provider}#{job.get('chat_id') or ''}#{dedup_id}"
 
     def _held_claim_tokens(self) -> Dict[str, str]:
         tokens = getattr(self, "_claim_tokens", None)
@@ -1072,8 +1080,13 @@ class MawsRuntime:
         duplicates: List[dict] = []
         try:
             for job in jobs:
-                # History appends are deduplicated by their event id inside the history itself.
-                if self._is_history_append_job(job) or self._try_claim_job(job, context):
+                # History appends are deduplicated by their event id inside the history itself, and
+                # a message nothing identifies is always processed (see _dedup_key_for).
+                if (
+                    self._is_history_append_job(job)
+                    or not self._dedup_key_for(job)
+                    or self._try_claim_job(job, context)
+                ):
                     claimed.append(job)
                 else:
                     duplicates.append(job)
@@ -1219,23 +1232,34 @@ class MawsRuntime:
             return ""
 
     def _telegram_event_id(self, update: dict) -> str:
+        """Telegram's id for the update, or "" when it has none."""
         if update.get("update_id") is not None:
             return str(update["update_id"])
         message = update.get("message") or {}
         if message.get("message_id") is not None:
             return str(message["message_id"])
-        return _stable_hash(update)[:24]
+        return ""
 
-    def _whatsapp_message_event_id(self, msg: dict) -> str:
-        return str(msg.get("id") or _stable_hash(msg)[:24])
+    @staticmethod
+    def _whatsapp_message_dedup_id(msg: dict) -> str:
+        """What identifies a WhatsApp message across repeated deliveries ("" without a message id).
 
-    def _job(self, *, provider: str, chat_id: str, event_id: str, payload: dict) -> dict:
+        Meta repeats a delivery with the same id and timestamp. The timestamp also keeps a sender
+        that reuses one id for several messages (a bridge, for instance) from having them skipped.
+        """
+        message_id = str(msg.get("id") or "")
+        timestamp = str(msg.get("timestamp") or "")
+        return f"{message_id}@{timestamp}" if message_id and timestamp else message_id
+
+    def _job(self, *, provider: str, chat_id: str, event_id: str, payload: dict, dedup_id: str = "") -> dict:
         return {
             "maws_job_version": 1,
             "provider": provider,
             "bot_type": getattr(self, "bot_type", provider),
             "chat_id": str(chat_id or ""),
             "event_id": str(event_id or _stable_hash(payload)[:24]),
+            # Identifies the message across repeated deliveries; "" when the provider gave no id.
+            "dedup_id": str(dedup_id or ""),
             "payload": payload,
         }
 
@@ -1243,10 +1267,12 @@ class MawsRuntime:
         chat_id = self._extract_telegram_chat_id(update)
         if not chat_id:
             return []
+        event_id = self._telegram_event_id(update)
         return [self._job(
             provider="telegram",
             chat_id=chat_id,
-            event_id=self._telegram_event_id(update),
+            event_id=event_id,
+            dedup_id=event_id,
             payload=update,
         )]
 
@@ -1271,7 +1297,8 @@ class MawsRuntime:
                     jobs.append(self._job(
                         provider="whatsapp",
                         chat_id=chat_id,
-                        event_id=self._whatsapp_message_event_id(msg),
+                        event_id=str(msg.get("id") or ""),
+                        dedup_id=self._whatsapp_message_dedup_id(msg),
                         payload=payload,
                     ))
         return jobs

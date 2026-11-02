@@ -99,7 +99,7 @@ Behaviour changes for Telegram and WhatsApp:
 - Bots split texts over 4096 characters and captions over 1024. Duplicate deliveries are ignored for an hour, and each user's replies are sent in order.
 - maws:
   - Drop mode waits up to `runtime.busy_wait_seconds` (default 30 s) for a busy user before dropping the update; `0` restores the immediate drop.
-  - Each message is processed once. Workers record processed messages in the locks table for `runtime.dedup_retention_days` days (default 8; `0` turns it off) and skip repeated deliveries. No new AWS resources or permissions; see "Repeated deliveries" in `maws/README.md`.
+  - Each message is processed once. Workers record processed messages in the locks table for `runtime.dedup_retention_days` days (default 8; `0` turns it off) and skip repeated deliveries. A message is identified by Telegram's `update_id`, or by WhatsApp's message id and timestamp; one without an id is always processed. No new AWS resources or permissions; see "Repeated deliveries" in `maws/README.md`.
   - CloudWatch metrics `MAWS/DroppedMessages`, `MAWS/FailedMessages` and `MAWS/DuplicateMessages`.
   - `infra.log_retention_days` and `infra.s3_noncurrent_version_days`.
 - `add_message(..., user_id=...)`.
