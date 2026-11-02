@@ -620,6 +620,80 @@ def test_requirements_written_by_older_maws_for_a_local_wheel_are_still_generate
     assert f"{wheel}[maws,telegram,whatsapp,env]" in bootstrap.package_file("requirements.txt").splitlines()
 
 
+OLD_LOCAL_REQUIREMENTS = "./vendor/mas-0.3.5-py3-none-any.whl\nboto3\npandas\nrequests\n"
+NEW_LOCAL_PARAMS = {
+    "requirements_source": "local",
+    "requirements_ref": "./vendor/mas-0.4.0-py3-none-any.whl",
+    "extra_requirements": ["pandas<2.4", "numpy<2.3"],
+}
+
+
+@pytest.mark.parametrize(
+    ("legacy_requirements", "params", "expected", "stale"),
+    [
+        pytest.param(
+            OLD_LOCAL_REQUIREMENTS,
+            NEW_LOCAL_PARAMS,
+            ["./vendor/mas-0.4.0-py3-none-any.whl[maws,telegram,whatsapp,env]", "pandas<2.4", "numpy<2.3"],
+            ["./vendor/mas-0.3.5-py3-none-any.whl", "pandas"],
+            id="local-wheel",
+        ),
+        pytest.param(
+            OLD_LOCAL_REQUIREMENTS.replace("\n", "\r\n"),
+            NEW_LOCAL_PARAMS,
+            ["./vendor/mas-0.4.0-py3-none-any.whl[maws,telegram,whatsapp,env]"],
+            ["./vendor/mas-0.3.5-py3-none-any.whl"],
+            id="local-wheel-crlf",
+        ),
+        pytest.param(
+            "boto3\nmas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git@v0.3.4\n"
+            "pandas\nrequests\n",
+            {"requirements_ref": "v0.4.0"},
+            ["mas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git@v0.4.0"],
+            ["pandas"],
+            id="git",
+        ),
+    ],
+)
+def test_requirements_written_by_older_maws_follow_params_after_they_change(
+    bootstrap, legacy_requirements, params, expected, stale
+):
+    (bootstrap.project / "requirements.txt").write_bytes(legacy_requirements.encode("utf-8"))
+
+    code, out = bootstrap.run(_telegram(**params), TG_ENV)
+
+    assert code == 0, out
+    assert "Using your requirements.txt" not in out
+    assert "was written by an older maws" in out
+    requirements = bootstrap.package_file("requirements.txt").splitlines()
+    for line in expected:
+        assert line in requirements
+    for line in stale:
+        assert line not in requirements
+    assert (bootstrap.project / "requirements.txt").read_bytes() == legacy_requirements.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "custom",
+    [
+        pytest.param("# pinned by hand\n" + OLD_LOCAL_REQUIREMENTS, id="comment"),
+        pytest.param(
+            "boto3\nrequests\nmas[maws,telegram,whatsapp,env] @ git+https://github.com/mneuronico/multi-agent-system-library.git@v0.4.0\n"
+            "pandas\n",
+            id="unsorted",
+        ),
+    ],
+)
+def test_hand_written_requirements_with_the_old_lines_are_deployed_unchanged(bootstrap, custom):
+    (bootstrap.project / "requirements.txt").write_text(custom, encoding="utf-8")
+
+    code, out = bootstrap.run(_telegram(**NEW_LOCAL_PARAMS), TG_ENV)
+
+    assert code == 0, out
+    assert "Using your requirements.txt" in out
+    assert bootstrap.package_file("requirements.txt") == custom
+
+
 def test_env_prod_is_read_not_sourced(bootstrap):
     marker = bootstrap.project / "pwned"
     env_prod = (

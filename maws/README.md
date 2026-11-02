@@ -73,7 +73,7 @@ lambda_handler = build_lambda_handler(BOT_TYPE)
 
 That's it. `maws` wires everything to MAS, handles webhook GET/POST, background processing via self-invocation, history import/export, locks, and more.
 
-With `maws update` you do not need this file: the deploy writes it (and `requirements.txt`) into the staged package `.maws_package/` only. If your project folder has its own `lambda_function.py` or `requirements.txt`, it is deployed unchanged; files that older maws versions generated in the project folder are recognised and replaced in the package (never in your folder). `template.yaml` is generated in `.maws_build/` on every deploy; no `samconfig.toml` is written. Project-folder `template.yaml` / `samconfig.toml` files are never read or overwritten by maws.
+With `maws update` you do not need this file: the deploy writes it (and `requirements.txt`) into the staged package `.maws_package/` only. If your project folder has its own `lambda_function.py` or `requirements.txt`, it is deployed unchanged; files that older maws versions generated in the project folder are recognised and replaced in the package (never in your folder). A `requirements.txt` from maws 0.3.x is recognised by its shape (`requests`, `boto3` and a `mas` line, sorted, no comments) even after you change `requirements_ref` or `extra_requirements`; if you wrote a file with that shape yourself, add a comment line to it and it is deployed unchanged. `template.yaml` is generated in `.maws_build/` on every deploy; no `samconfig.toml` is written. Project-folder `template.yaml` / `samconfig.toml` files are never read or overwritten by maws.
 
 ---
 
