@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- maws with `history_mode: "shared"` downloaded and uploaded every shared-history file for every message. A deployment with 15 files moved about 53 MB each way per message, and every rotation added another file. Now a warm container keeps the files in `/tmp`, downloads only those whose S3 ETag changed since it last synced them, and uploads only those the job changed, usually just the open one. A cold start still downloads them all.
+- Opening a history file no longer writes to it. The schema check set `PRAGMA user_version` every time a file was opened, so merely reading a closed shared-history file changed it.
+
+### Changed
+
+- With `history_mode: "shared"`, `infra.s3_lifecycle_days` no longer expires `history/`. Closed shared-history files are no longer rewritten, so the rule would delete history that MAS still reads. Files and failed events still expire.
+
 ## [0.4.0] - 2026-11-02
 
 Changes since 0.3.5 (`00ea15b`) from a production-readiness review. Several defaults and behaviours changed on purpose because the old ones were unsafe or surprising, so read **Upgrading** before you deploy.

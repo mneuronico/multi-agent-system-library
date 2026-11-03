@@ -458,6 +458,12 @@ if [[ -n "${S3_LIFECYCLE_DAYS}" ]]; then
       echo "[WARN] files_s3_prefix equals tokens_s3_prefix (${rule_prefix}); not expiring it so token files are kept."
       continue
     fi
+    # Every shared-history file holds many users' history and MAS reads all of them, but a file
+    # is never written again once it is closed: expiring it would delete live history.
+    if [[ "${rule_id}" == "ExpireHistory" && "${HISTORY_MODE}" == "shared" ]]; then
+      echo "[INFO] history_mode=shared: history/ does not expire; infra.s3_lifecycle_days applies to files and failed events only."
+      continue
+    fi
     LIFECYCLE_RULES+="          - Id: ${rule_id}
             Status: Enabled
             Prefix: ${rule_prefix}/

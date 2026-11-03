@@ -710,43 +710,93 @@ class MawsRuntime:
         if hasattr(manager, "_tls"):
             manager._tls.db_conn = None
 
-    def _iter_s3_keys(self, prefix: str) -> List[str]:
-        keys: List[str] = []
+    def _iter_s3_objects(self, prefix: str) -> List[dict]:
         if hasattr(self.s3, "get_paginator"):
+            objects: List[dict] = []
             paginator = self.s3.get_paginator("list_objects_v2")
             for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
-                keys.extend(obj["Key"] for obj in page.get("Contents", []))
-            return keys
+                objects.extend(page.get("Contents", []))
+            return objects
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=prefix)
-        return [obj["Key"] for obj in response.get("Contents", [])]
+        return list(response.get("Contents", []))
+
+    def _iter_s3_keys(self, prefix: str) -> List[str]:
+        return [obj["Key"] for obj in self._iter_s3_objects(prefix)]
+
+    def _shared_history_synced_files(self) -> Dict[str, tuple]:
+        """Local shared-history files known to match S3: file name -> (S3 ETag, size, mtime_ns)."""
+        synced = getattr(self, "_shared_history_synced", None)
+        if synced is None:
+            synced = {}
+            self._shared_history_synced = synced
+        return synced
+
+    @staticmethod
+    def _local_file_state(path) -> Optional[tuple]:
+        try:
+            stat = os.stat(path)
+        except FileNotFoundError:
+            return None
+        return (stat.st_size, stat.st_mtime_ns)
 
     def _sync_shared_history_from_s3(self):
+        """
+        Make the local shared-history files match S3, downloading only the ones that differ.
+
+        MAS reads every shared file to build a user's history, so all of them must be local, but
+        a warm container keeps them in /tmp between jobs. A file is reused when S3 still has the
+        ETag this container last downloaded or uploaded and the local copy has not changed since;
+        any other file is downloaded again, and local files that S3 does not have are removed.
+        """
         history_dir = Path(getattr(self, "TMP_DIR", "/tmp")) / "history"
+        history_dir.mkdir(parents=True, exist_ok=True)
         self._close_manager_history_connections()
-        for path in history_dir.glob("shared_history_*.sqlite*"):
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        synced = self._shared_history_synced_files()
 
         prefix = f"{getattr(self, 'shared_history_prefix', 'history/shared').strip('/')}/"
         try:
-            keys = [k for k in self._iter_s3_keys(prefix) if k.endswith(".sqlite")]
+            remote = {
+                os.path.basename(obj["Key"]): obj
+                for obj in self._iter_s3_objects(prefix)
+                if obj["Key"].endswith(".sqlite")
+            }
         except botocore.exceptions.ClientError as e:
             if e.response.get("Error", {}).get("Code") in ("404", "NoSuchBucket", "NoSuchKey", "NotFound"):
-                keys = []
+                remote = {}
             else:
                 raise
 
-        for key in keys:
-            local_path = history_dir / os.path.basename(key)
-            self.s3.download_file(self.bucket_name, key, str(local_path))
-            print(f"[maws] s3://{self.bucket_name}/{key} -> {local_path}")
+        for path in history_dir.glob("shared_history_*.sqlite"):
+            if path.name not in remote:
+                self._discard_local_history(str(path))
+                synced.pop(path.name, None)
+
+        downloaded = 0
+        for name, obj in sorted(remote.items()):
+            local_path = history_dir / name
+            etag = obj.get("ETag")
+            known = synced.pop(name, None)
+            # Connections are closed, so a leftover -wal or -shm means an interrupted job: download again.
+            leftover = any(os.path.exists(f"{local_path}{s}") for s in ("-wal", "-shm", "-journal"))
+            if known and etag and known[0] == etag and known[1:] == self._local_file_state(local_path) and not leftover:
+                synced[name] = known
+                continue
+            self._discard_local_history(str(local_path))
+            self.s3.download_file(self.bucket_name, obj["Key"], str(local_path))
+            state = self._local_file_state(local_path)
+            if etag and state:
+                synced[name] = (etag,) + state
+            downloaded += 1
+            print(f"[maws] s3://{self.bucket_name}/{obj['Key']} -> {local_path}")
+        print(f"[maws] shared history: downloaded {downloaded} of {len(remote)} files")
 
     def _upload_shared_history_to_s3(self):
+        """Upload the shared-history files that changed during the job; the others are already in S3."""
         manager = getattr(self, "manager", None)
         if manager is None:
             return
+        synced = self._shared_history_synced_files()
+        uploaded = 0
         for db_path in manager._list_shared_history_db_paths():
             pool_key = manager._shared_history_db_key(db_path)
             conn = getattr(manager, "_db_pool", {}).get(pool_key)
@@ -757,10 +807,22 @@ class MawsRuntime:
                     print(f"[maws][WARN] Could not checkpoint shared history before upload: {e}")
             if not os.path.exists(db_path):
                 continue
-            key = f"{getattr(self, 'shared_history_prefix', 'history/shared').strip('/')}/{os.path.basename(db_path)}"
+            name = os.path.basename(db_path)
+            # New rows, a rotation's closed_at or a deletion all change the file's size or mtime.
+            known = synced.pop(name, None)
+            if known and known[1:] == self._local_file_state(db_path):
+                synced[name] = known
+                continue
+            key = f"{getattr(self, 'shared_history_prefix', 'history/shared').strip('/')}/{name}"
             with open(db_path, "rb") as fp:
-                self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=fp.read())
+                response = self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=fp.read())
+            etag = response.get("ETag") if isinstance(response, dict) else None
+            state = self._local_file_state(db_path)
+            if etag and state:
+                synced[name] = (etag,) + state
+            uploaded += 1
             print(f"[maws] uploaded {db_path} -> s3://{self.bucket_name}/{key}")
+        print(f"[maws] shared history: uploaded {uploaded} files")
 
     def _local_user_files_dir(self, chat_id: str) -> Path:
         return Path(getattr(self, "TMP_DIR", "/tmp")) / "files" / _safe_key_part(chat_id)
