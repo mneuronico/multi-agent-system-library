@@ -822,6 +822,21 @@ def test_lifecycle_only_expires_user_data_and_noncurrent_versions(bootstrap):
     assert "ExpireMawsObjects" not in template
 
 
+def test_lifecycle_never_expires_shared_history(bootstrap):
+    params = _telegram(history_mode="shared", infra={"s3_lifecycle_days": 90}, files_s3_prefix="media")
+
+    code, out = bootstrap.run(params, TG_ENV)
+
+    assert code == 0, out
+    assert "history/ does not expire" in out
+    template = bootstrap.template()
+    rules = template[template.index("LifecycleConfiguration:"):template.index("  DemoBotLogs:")]
+    assert "Prefix: history/" not in rules
+    assert "Prefix: media/" in rules
+    assert "Prefix: failed-events/" in rules
+    assert rules.count("ExpirationInDays: 90") == 2
+
+
 def test_versioning_without_lifecycle_still_expires_noncurrent_versions(bootstrap):
     code, out = bootstrap.run(_telegram(infra={"s3_versioning": True, "s3_noncurrent_version_days": 7}), TG_ENV)
 

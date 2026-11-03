@@ -3317,7 +3317,7 @@ In the default `drop` mode, a worker that finds the user busy waits up to `runti
 
 Each message is processed once. Workers record processed messages in the stack's locks table for `runtime.dedup_retention_days` days (default 8) and skip repeated deliveries (a webhook the provider retries, an async invocation Lambda delivers twice, an SQS redelivery), counting them in `MAWS/DuplicateMessages`. A message whose worker crashed while processing it can still be processed again. See "Repeated deliveries" in `maws/README.md`.
 
-Logs go to the stack-managed log group `/aws/lambda/<stack>-maws` with `infra.log_retention_days` retention (default 30 days; `0` keeps them forever); changing it on an existing stack is a normal `maws update`. `infra.s3_lifecycle_days` expires only `history/`, the files prefix and `failed-events/` (never the token files under `secrets/`), and with `infra.s3_versioning` noncurrent versions expire after `infra.s3_noncurrent_version_days` (default 30).
+Logs go to the stack-managed log group `/aws/lambda/<stack>-maws` with `infra.log_retention_days` retention (default 30 days; `0` keeps them forever); changing it on an existing stack is a normal `maws update`. `infra.s3_lifecycle_days` expires only `history/` (not with `history_mode: "shared"`), the files prefix and `failed-events/` (never the token files under `secrets/`), and with `infra.s3_versioning` noncurrent versions expire after `infra.s3_noncurrent_version_days` (default 30).
 
 Booleans in `params.json` accept `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`); an explicit `false` is always honoured, and any other value stops the deploy with an error.
 

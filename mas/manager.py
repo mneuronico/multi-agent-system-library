@@ -2118,7 +2118,11 @@ class AgentSystemManager:
                 (first_timestamp or self._history_now_iso(),),
             )
 
-        cur.execute("PRAGMA user_version = 1")
+        # Setting user_version is a write even when the value does not change, and this runs every
+        # time a history file is opened: reading a file must not modify it (maws uploads changed files).
+        cur.execute("PRAGMA user_version")
+        if cur.fetchone()[0] != 1:
+            cur.execute("PRAGMA user_version = 1")
         conn.commit()
 
     def has_new_updates(self) -> bool:

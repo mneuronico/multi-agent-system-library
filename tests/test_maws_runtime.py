@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -573,6 +574,152 @@ def test_shared_history_sync_uses_shared_prefix_and_global_group(workspace_tmp_p
     )
     MawsRuntime._upload_shared_history_to_s3(runtime)
     assert runtime.s3.puts[("history-bucket", "history/shared/shared_history_000001.sqlite")] == b"db-two"
+
+
+class _EtagS3(_FakeS3):
+    """_FakeS3 whose objects carry ETags, listed and returned by put_object as S3 does."""
+
+    def __init__(self, objects=None):
+        super().__init__(objects)
+        self.downloads = []
+
+    @staticmethod
+    def _etag(data):
+        return '"%s"' % hashlib.md5(data).hexdigest()
+
+    def list_objects_v2(self, Bucket, Prefix):
+        return {"Contents": [
+            {"Key": key, "ETag": self._etag(data)}
+            for (bucket, key), data in self.objects.items()
+            if bucket == Bucket and key.startswith(Prefix)
+        ]}
+
+    def download_file(self, bucket, key, local_path):
+        self.downloads.append(key)
+        super().download_file(bucket, key, local_path)
+
+    def put_object(self, Bucket, Key, Body):
+        super().put_object(Bucket, Key, Body)
+        self.objects[(Bucket, Key)] = Body
+        return {"ETag": self._etag(Body)}
+
+
+def _shared_history_runtime(tmp_path, files=None, manager=None):
+    runtime = object.__new__(MawsRuntime)
+    runtime.bucket_name = "history-bucket"
+    runtime.TMP_DIR = str(tmp_path)
+    runtime.shared_history_prefix = "history/shared"
+    runtime.history_mode = "shared"
+    runtime.s3 = _EtagS3({
+        ("history-bucket", f"history/shared/{name}"): data for name, data in (files or {}).items()
+    })
+    history = tmp_path / "history"
+    runtime.manager = manager or types.SimpleNamespace(
+        _db_pool={},
+        _list_shared_history_db_paths=lambda: sorted(str(p) for p in history.glob("shared_history_*.sqlite")),
+        _shared_history_db_key=lambda path: f"shared:{path}",
+    )
+    return runtime, history
+
+
+def test_warm_container_downloads_only_shared_history_files_that_changed_in_s3(workspace_tmp_path):
+    runtime, history = _shared_history_runtime(workspace_tmp_path, {
+        "shared_history_000001.sqlite": b"closed",
+        "shared_history_000002.sqlite": b"open",
+    })
+
+    MawsRuntime._sync_shared_history_from_s3(runtime)
+    assert sorted(runtime.s3.downloads) == [
+        "history/shared/shared_history_000001.sqlite",
+        "history/shared/shared_history_000002.sqlite",
+    ]
+
+    runtime.s3.downloads.clear()
+    MawsRuntime._sync_shared_history_from_s3(runtime)
+    assert runtime.s3.downloads == []
+
+    # Another container processed a message and uploaded the open file.
+    runtime.s3.objects[("history-bucket", "history/shared/shared_history_000002.sqlite")] = b"open plus one"
+    MawsRuntime._sync_shared_history_from_s3(runtime)
+    assert runtime.s3.downloads == ["history/shared/shared_history_000002.sqlite"]
+    assert (history / "shared_history_000002.sqlite").read_bytes() == b"open plus one"
+
+
+def test_local_shared_history_that_differs_from_s3_is_replaced(workspace_tmp_path):
+    runtime, history = _shared_history_runtime(workspace_tmp_path, {"shared_history_000001.sqlite": b"in s3"})
+    MawsRuntime._sync_shared_history_from_s3(runtime)
+
+    # A job changed the file but never uploaded it, and left a file S3 does not have.
+    (history / "shared_history_000001.sqlite").write_bytes(b"changed and never uploaded")
+    (history / "shared_history_000002.sqlite").write_bytes(b"not in s3")
+    runtime.s3.downloads.clear()
+    MawsRuntime._sync_shared_history_from_s3(runtime)
+
+    assert runtime.s3.downloads == ["history/shared/shared_history_000001.sqlite"]
+    assert (history / "shared_history_000001.sqlite").read_bytes() == b"in s3"
+    assert not (history / "shared_history_000002.sqlite").exists()
+
+    # A leftover -wal means an interrupted job: the file is downloaded again.
+    (history / "shared_history_000001.sqlite-wal").write_bytes(b"frames")
+    runtime.s3.downloads.clear()
+    MawsRuntime._sync_shared_history_from_s3(runtime)
+
+    assert runtime.s3.downloads == ["history/shared/shared_history_000001.sqlite"]
+    assert not (history / "shared_history_000001.sqlite-wal").exists()
+
+
+def test_only_shared_history_files_changed_by_the_job_are_uploaded(workspace_tmp_path):
+    runtime, history = _shared_history_runtime(workspace_tmp_path, {
+        "shared_history_000001.sqlite": b"closed",
+        "shared_history_000002.sqlite": b"open",
+    })
+    MawsRuntime._sync_shared_history_from_s3(runtime)
+
+    (history / "shared_history_000002.sqlite").write_bytes(b"open, now closed")
+    (history / "shared_history_000003.sqlite").write_bytes(b"rotated")
+    MawsRuntime._upload_shared_history_to_s3(runtime)
+
+    assert sorted(key for _, key in runtime.s3.puts) == [
+        "history/shared/shared_history_000002.sqlite",
+        "history/shared/shared_history_000003.sqlite",
+    ]
+
+    # The next job in this container starts from what it uploaded.
+    runtime.s3.downloads.clear()
+    runtime.s3.puts.clear()
+    MawsRuntime._sync_shared_history_from_s3(runtime)
+    MawsRuntime._upload_shared_history_to_s3(runtime)
+    assert runtime.s3.downloads == []
+    assert runtime.s3.puts == {}
+
+
+def test_shared_history_jobs_transfer_only_the_files_they_write(workspace_tmp_path):
+    from mas.manager import AgentSystemManager
+
+    manager = AgentSystemManager(base_directory=str(workspace_tmp_path), history_mode="shared", history_max_messages=3)
+    runtime, history = _shared_history_runtime(workspace_tmp_path, manager=manager)
+    assert history == Path(manager.history_folder)
+
+    def job(*writes):
+        runtime.s3.downloads.clear()
+        runtime.s3.puts.clear()
+        MawsRuntime._sync_shared_history_from_s3(runtime)
+        manager.get_messages("alice")  # MAS reads every shared file to build a user's history
+        for user_id, text in writes:
+            manager.add_blocks({"response": text}, user_id=user_id)
+        MawsRuntime._upload_shared_history_to_s3(runtime)
+        return runtime.s3.downloads, sorted(key.rsplit("/", 1)[-1] for _, key in runtime.s3.puts)
+
+    assert job(("alice", "a1"), ("bob", "b1"), ("alice", "a2")) == ([], ["shared_history_000001.sqlite"])
+    # The fourth message rotates: the first file gets closed_at and the second one is created.
+    assert job(("bob", "b2")) == ([], ["shared_history_000001.sqlite", "shared_history_000002.sqlite"])
+    # Reading the closed file does not change it, so only the open one is uploaded.
+    assert job(("alice", "a3")) == ([], ["shared_history_000002.sqlite"])
+
+    for path in history.glob("shared_history_*.sqlite"):
+        assert runtime.s3.objects[("history-bucket", f"history/shared/{path.name}")] == path.read_bytes()
+    texts = [m["message"][0]["content"]["response"] for m in manager.get_messages("alice")]
+    assert texts == ["a1", "a2", "a3"]
 
 
 def test_sqs_worker_raises_processing_errors_for_retry():
