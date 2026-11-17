@@ -205,7 +205,8 @@ def test_whatsapp_batch_is_handed_off_once_per_chat_in_order():
     assert invocations[1]["maws_job"]["event_id"] == "wamid.2"  # single jobs keep the old payload shape
 
 
-def test_shared_history_batch_is_one_group():
+def test_shared_history_batch_is_handed_off_once_per_chat():
+    # Shared history no longer serializes every user: each chat gets its own worker, as in per_user.
     runtime = _post_runtime()
     runtime.history_mode = "shared"
     invocations = []
@@ -215,7 +216,7 @@ def test_shared_history_batch_is_one_group():
 
     _post(runtime, _whatsapp_batch((1, "user-a"), (2, "user-b")))
 
-    assert [[job["chat_id"] for job in inv["maws_jobs"]] for inv in invocations] == [["user-a", "user-b"]]
+    assert [inv["maws_job"]["chat_id"] for inv in invocations] == ["user-a", "user-b"]
 
 
 def test_worker_processes_a_chat_group_in_order_under_one_lock(workspace_tmp_path):

@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import time
@@ -285,6 +286,22 @@ class MawsWorkerError(RuntimeError):
 
 class _TokenWriteConflict(RuntimeError):
     """Another container changed a token file in S3 since this container read it."""
+
+
+class _SharedHistoryWriteConflict(RuntimeError):
+    """Another container uploaded a shared-history file since this container synced it."""
+
+
+class SharedHistoryUploadError(RuntimeError):
+    """The job's shared-history writes could not be uploaded after every merge attempt."""
+
+
+# Shared history: how many times a job re-downloads the files another worker uploaded first,
+# replays its own writes onto them and uploads again, and how long it waits (with jitter) between
+# attempts. Only the final upload can conflict, so attempts are short.
+SHARED_HISTORY_UPLOAD_ATTEMPTS = 8
+SHARED_HISTORY_RETRY_BASE_SECONDS = 0.1
+SHARED_HISTORY_RETRY_MAX_SECONDS = 2.0
 
 
 # A lock taken inside Lambda expires this long after the invocation's own deadline. It must stay
@@ -766,6 +783,10 @@ class MawsRuntime:
             else:
                 raise
 
+        # ETags S3 had when this container listed it: uploads are conditional on them, so a file
+        # another worker uploaded in between is merged instead of overwritten.
+        self._shared_history_remote = {name: obj.get("ETag") for name, obj in remote.items()}
+
         for path in history_dir.glob("shared_history_*.sqlite"):
             if path.name not in remote:
                 self._discard_local_history(str(path))
@@ -791,11 +812,60 @@ class MawsRuntime:
         print(f"[maws] shared history: downloaded {downloaded} of {len(remote)} files")
 
     def _upload_shared_history_to_s3(self):
-        """Upload the shared-history files that changed during the job; the others are already in S3."""
+        """
+        Upload the shared-history files that changed during the job; the others are already in S3.
+
+        Workers for different users run at the same time, so another one may have uploaded the
+        same file (usually the open one) since this job synced it. Uploads are conditional on the
+        ETag this container synced: on a conflict the job downloads the newer files, replays its
+        own writes onto them (MAS journals them) and tries again. Nothing another worker wrote is
+        overwritten; if every attempt conflicts, SharedHistoryUploadError is raised.
+        """
         manager = getattr(self, "manager", None)
         if manager is None:
             return
+        take_journal = getattr(manager, "take_shared_history_journal", None)
+        journal = take_journal() if callable(take_journal) else None
+        replay = getattr(manager, "replay_shared_history_journal", None)
+
+        attempt = 1
+        while True:
+            try:
+                uploaded = self._upload_changed_shared_history_files()
+            except _SharedHistoryWriteConflict as conflict:
+                if journal is None or not callable(replay):
+                    raise SharedHistoryUploadError(
+                        f"{conflict} changed in S3 and this job's writes were not journaled; "
+                        "not overwriting it."
+                    ) from conflict
+                if attempt >= SHARED_HISTORY_UPLOAD_ATTEMPTS:
+                    raise SharedHistoryUploadError(
+                        f"{conflict} kept changing in S3; gave up after {attempt} attempts. "
+                        "This job's messages are missing from the shared history."
+                    ) from conflict
+                logger.warning(
+                    "[maws][history] %s was uploaded by another worker first; merging this job's "
+                    "writes into it (attempt %d of %d).",
+                    conflict, attempt + 1, SHARED_HISTORY_UPLOAD_ATTEMPTS,
+                )
+                delay = min(
+                    SHARED_HISTORY_RETRY_MAX_SECONDS,
+                    SHARED_HISTORY_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                )
+                if delay > 0:
+                    time.sleep(delay * random.uniform(0.5, 1.0))
+                attempt += 1
+                self._sync_shared_history_from_s3()
+                replay(journal)
+                continue
+            suffix = f" (after {attempt} attempts)" if attempt > 1 else ""
+            print(f"[maws] shared history: uploaded {uploaded} files{suffix}")
+            return
+
+    def _upload_changed_shared_history_files(self) -> int:
+        manager = self.manager
         synced = self._shared_history_synced_files()
+        remote = getattr(self, "_shared_history_remote", None)
         uploaded = 0
         for db_path in manager._list_shared_history_db_paths():
             pool_key = manager._shared_history_db_key(db_path)
@@ -815,14 +885,49 @@ class MawsRuntime:
                 continue
             key = f"{getattr(self, 'shared_history_prefix', 'history/shared').strip('/')}/{name}"
             with open(db_path, "rb") as fp:
-                response = self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=fp.read())
+                body = fp.read()
+            response = self._put_shared_history_object(key, name, body, remote)
             etag = response.get("ETag") if isinstance(response, dict) else None
             state = self._local_file_state(db_path)
             if etag and state:
                 synced[name] = (etag,) + state
+            if remote is not None:
+                remote[name] = etag
             uploaded += 1
             print(f"[maws] uploaded {db_path} -> s3://{self.bucket_name}/{key}")
-        print(f"[maws] shared history: uploaded {uploaded} files")
+        return uploaded
+
+    def _put_shared_history_object(
+        self, key: str, name: str, body: bytes, remote: Optional[Dict[str, Optional[str]]]
+    ):
+        """
+        PUT one shared-history file only if S3 still has the version this container synced:
+        If-Match its ETag, or If-None-Match for a file S3 did not have. Without a listing (remote
+        is None) or an ETag to compare, the upload is unconditional.
+        """
+        conditions = {}
+        if remote is not None:
+            if name not in remote:
+                conditions["IfNoneMatch"] = "*"
+            elif remote[name]:
+                conditions["IfMatch"] = remote[name]
+        try:
+            return self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=body, **conditions)
+        except botocore.exceptions.ClientError as e:
+            code = str(e.response.get("Error", {}).get("Code", ""))
+            if conditions and code in ("PreconditionFailed", "412", "ConditionalRequestConflict", "409"):
+                raise _SharedHistoryWriteConflict(name) from e
+            raise
+        except Exception as e:
+            if conditions and type(e).__name__ == "ParamValidationError":
+                # botocore older than S3 conditional writes (late 2024): plain write.
+                logger.warning(
+                    "[maws][history] This boto3 does not support S3 conditional writes; uploading %s "
+                    "unconditionally. Concurrent workers may overwrite each other's shared history.",
+                    name,
+                )
+                return self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=body)
+            raise
 
     def _local_user_files_dir(self, chat_id: str) -> Path:
         return Path(getattr(self, "TMP_DIR", "/tmp")) / "files" / _safe_key_part(chat_id)
@@ -936,8 +1041,8 @@ class MawsRuntime:
         return int(time.time())
 
     def _lock_id_for(self, user_id: str) -> str:
-        if self._uses_shared_history():
-            return "__maws_shared_history__"
+        # Per user in both history modes. Shared-history uploads are conditional and merged on
+        # conflict (_upload_shared_history_to_s3), so workers for different users can run together.
         return str(user_id)
 
     def _lock_ttl_seconds(self, context=None) -> int:
@@ -1398,8 +1503,8 @@ class MawsRuntime:
         return list(groups.values())
 
     def _queue_group_id_for(self, job: dict) -> str:
-        if getattr(self, "history_mode", "per_user") == "shared":
-            return "maws-shared-history"
+        # One FIFO group per chat in both history modes: a user's messages stay in order, and
+        # different users are processed in parallel.
         return _safe_key_part(job.get("chat_id", "") or "unknown")
 
     def _dedupe_id_for(self, job: dict) -> str:
@@ -1619,11 +1724,6 @@ class MawsRuntime:
             if queued["statusCode"] >= 300:
                 return queued
         else:
-            if getattr(self, "history_mode", "per_user") == "shared":
-                print(
-                    "[maws][history][WARN] Shared history with busy_policy=drop serializes every append "
-                    "behind one global lock; use busy_policy=fifo for bulk sends."
-                )
             try:
                 invocation = self.lambda_client.invoke(
                     FunctionName=context.invoked_function_arn,
@@ -1897,7 +1997,7 @@ class MawsRuntime:
             return {"statusCode": 200, "body": json.dumps("Duplicate update ignored.")}
         jobs = claimed
 
-        # Lock. In shared history mode this becomes a global lock/group.
+        # Lock (per user, in both history modes).
         try:
             if is_history_append:
                 self._wait_for_history_append_lock(chat_id, context)
@@ -1966,6 +2066,10 @@ class MawsRuntime:
     def _import_history_for(self, chat_id: str, s3_key: str, local_db: str):
         if self._uses_shared_history():
             self._sync_shared_history_from_s3()
+            # Record this job's writes, so they can be replayed onto a file another worker uploads first.
+            start_journal = getattr(self.manager, "start_shared_history_journal", None)
+            if callable(start_journal):
+                start_journal()
             return
         self._discard_local_history(local_db)
         try:

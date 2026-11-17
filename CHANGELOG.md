@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- maws with `history_mode: "shared"` no longer processes one message at a time for the whole bot. It used one DynamoDB lock and one SQS FIFO group for every user, because each job uploaded whole shared-history files and two workers would have overwritten each other's rows. Locks and FIFO groups are now per user, as in `per_user` mode. Shared-history uploads are conditional on the S3 ETag the worker synced. On a conflict the job downloads the newer files, replays the rows it wrote and uploads again, so nothing another worker wrote is lost.
+- MAS journals the shared-history writes of each job (`start_shared_history_journal`, `take_shared_history_journal`, `replay_shared_history_journal`). Replaying is idempotent. `clear_message_history` no longer touches shared files that hold none of the user's rows.
+
+### Upgrading
+
+- During the deploy, containers running the previous version still upload unconditionally and could overwrite a row written by a new container. Deploy when traffic is low.
+- The function needs a boto3 with S3 conditional writes (late 2024 or newer). With an older one maws warns and uploads unconditionally, as before but without the global lock.
+- `clear_global_history` is not journaled. Do not run it while workers are processing messages.
+
 ## [0.4.1] - 2026-11-03
 
 ### Fixed

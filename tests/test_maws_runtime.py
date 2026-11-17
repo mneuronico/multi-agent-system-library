@@ -551,7 +551,7 @@ def test_optional_user_file_s3_persistence_round_trips(workspace_tmp_path):
     assert runtime.s3.puts[("history-bucket", "files/user-a/outbound.txt")] == b"outbound"
 
 
-def test_shared_history_sync_uses_shared_prefix_and_global_group(workspace_tmp_path):
+def test_shared_history_sync_uses_shared_prefix_and_per_user_group(workspace_tmp_path):
     runtime = object.__new__(MawsRuntime)
     runtime.bucket_name = "history-bucket"
     runtime.TMP_DIR = str(workspace_tmp_path)
@@ -564,7 +564,7 @@ def test_shared_history_sync_uses_shared_prefix_and_global_group(workspace_tmp_p
     MawsRuntime._sync_shared_history_from_s3(runtime)
     downloaded = workspace_tmp_path / "history" / "shared_history_000001.sqlite"
     assert downloaded.read_bytes() == b"db-one"
-    assert MawsRuntime._queue_group_id_for(runtime, {"chat_id": "user-a"}) == "maws-shared-history"
+    assert MawsRuntime._queue_group_id_for(runtime, {"chat_id": "user-a"}) == "user-a"
 
     downloaded.write_bytes(b"db-two")
     runtime.manager = types.SimpleNamespace(
@@ -598,7 +598,10 @@ class _EtagS3(_FakeS3):
         self.downloads.append(key)
         super().download_file(bucket, key, local_path)
 
-    def put_object(self, Bucket, Key, Body):
+    def put_object(self, Bucket, Key, Body, IfMatch=None, IfNoneMatch=None):
+        current = self.objects.get((Bucket, Key))
+        assert IfNoneMatch is None or current is None
+        assert IfMatch is None or (current is not None and self._etag(current) == IfMatch)
         super().put_object(Bucket, Key, Body)
         self.objects[(Bucket, Key)] = Body
         return {"ETag": self._etag(Body)}
