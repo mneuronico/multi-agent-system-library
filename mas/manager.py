@@ -162,6 +162,8 @@ class AgentSystemManager:
         self._db_write_lock = threading.RLock()
         self._usage_log_lock = threading.Lock()
         self._shared_history_lock = threading.RLock()
+        # Shared-history writes made since start_shared_history_journal() (None: not recording).
+        self._shared_history_journal: Optional[List[tuple]] = None
         self._variable_lock = threading.RLock()
         self._model_health_lock = threading.RLock()
         self._model_health: Dict[str, Dict[str, Any]] = {}
@@ -2025,6 +2027,86 @@ class AgentSystemManager:
                 except Exception:
                     conn.rollback()
                     raise
+            self._record_shared_history_write("insert", {
+                "user_id": str(user_id),
+                "msg_number": msg_number,
+                "role": role,
+                "content": content,
+                "msg_type": msg_type,
+                "model": model,
+                "timestamp": timestamp,
+            })
+
+    # -------------------------
+    # Shared-history write journal
+    # -------------------------
+    # maws keeps the shared-history files in S3 and runs workers for different users at the same
+    # time. Each worker records here what its job wrote. When another worker uploaded the same file
+    # first, maws downloads that newer version and replays the journal onto it instead of
+    # overwriting it. Only the job's own user is written, and that user's jobs never run at the
+    # same time, so the replay never conflicts with what the other worker wrote.
+    def start_shared_history_journal(self) -> None:
+        """Start recording shared-history writes (rows inserted and users cleared)."""
+        with self._shared_history_lock:
+            self._shared_history_journal = []
+
+    def take_shared_history_journal(self) -> Optional[List[tuple]]:
+        """Stop recording and return what was recorded, or None if nothing was being recorded."""
+        with self._shared_history_lock:
+            journal = getattr(self, "_shared_history_journal", None)
+            self._shared_history_journal = None
+            return journal
+
+    def _record_shared_history_write(self, op: str, data: Dict[str, Any]) -> None:
+        with self._shared_history_lock:
+            journal = getattr(self, "_shared_history_journal", None)
+            if journal is not None:
+                journal.append((op, dict(data)))
+
+    def replay_shared_history_journal(self, journal: Optional[List[tuple]]) -> int:
+        """
+        Apply a journal from take_shared_history_journal() to the local shared-history files.
+
+        Idempotent: a row already present (same user, msg_number and timestamp, for instance because
+        the file holding it was uploaded before another one conflicted) is not inserted again.
+        Returns how many operations changed something.
+        """
+        applied = 0
+        with self._shared_history_lock:
+            recording = getattr(self, "_shared_history_journal", None)
+            self._shared_history_journal = None  # replaying must not record the writes again
+            try:
+                for op, data in journal or []:
+                    if op == "insert":
+                        if self._shared_history_row_exists(data["user_id"], data["msg_number"], data["timestamp"]):
+                            continue
+                        self._insert_shared_history_row(**data)
+                        applied += 1
+                    elif op == "clear":
+                        self._delete_shared_user_rows(data["user_id"])
+                        applied += 1
+                    else:
+                        raise ValueError(f"Unknown shared-history journal operation: {op!r}")
+            finally:
+                self._shared_history_journal = recording
+        return applied
+
+    def _shared_history_row_exists(self, user_id: str, msg_number: int, timestamp: Optional[str]) -> bool:
+        for db_path in self._list_shared_history_db_paths():
+            conn, should_close = self._open_history_db_for_read(db_path)
+            try:
+                with self._conn_lock(conn):
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT 1 FROM message_history WHERE user_id = ? AND msg_number = ? AND timestamp IS ? LIMIT 1",
+                        (str(user_id), msg_number, timestamp),
+                    )
+                    if cur.fetchone():
+                        return True
+            finally:
+                if should_close:
+                    conn.close()
+        return False
 
     @_scoped_to_user_id
     def _import_shared_user_history(self, user_id: str, sqlite_bytes: bytes) -> None:
@@ -2285,10 +2367,20 @@ class AgentSystemManager:
                         insert_params = (next_num, role, content_str, type, model, timestamp)
                     cur.execute(insert_sql, insert_params)
                     conn.commit()
-                    return next_num
                 except Exception:
                     conn.rollback()
                     raise
+            if self._history_mode_is_shared():
+                self._record_shared_history_write("insert", {
+                    "user_id": str(uid),
+                    "msg_number": next_num,
+                    "role": role,
+                    "content": content_str,
+                    "msg_type": type,
+                    "model": model,
+                    "timestamp": timestamp,
+                })
+            return next_num
 
 
     @_scoped_to_user_id
@@ -4016,20 +4108,8 @@ class AgentSystemManager:
         if self._history_mode_is_shared():
             uid = str(self._uid())
             with self._shared_history_lock:
-                for db_path in self._list_shared_history_db_paths():
-                    conn = self._connect_history_db(db_path, self._shared_history_db_key(db_path))
-                    with self._conn_lock(conn):
-                        cur = conn.cursor()
-                        cur.execute("DELETE FROM message_history WHERE user_id = ?", (uid,))
-                        cur.execute("SELECT COUNT(*) FROM message_history")
-                        remaining = int(cur.fetchone()[0] or 0)
-                        if remaining == 0:
-                            cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
-                            cur.execute(
-                                "INSERT OR REPLACE INTO history_metadata (key, value) VALUES ('created_at', ?)",
-                                (self._history_now_iso(),),
-                            )
-                        conn.commit()
+                self._delete_shared_user_rows(uid)
+                self._record_shared_history_write("clear", {"user_id": uid})
             self._delete_user_files(uid)
             return
 
@@ -4039,6 +4119,27 @@ class AgentSystemManager:
             cur.execute("DELETE FROM message_history")
             conn.commit()
         self._delete_user_files(self._uid())
+
+    def _delete_shared_user_rows(self, uid: str) -> None:
+        with self._shared_history_lock:
+            for db_path in self._list_shared_history_db_paths():
+                conn = self._connect_history_db(db_path, self._shared_history_db_key(db_path))
+                with self._conn_lock(conn):
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1 FROM message_history WHERE user_id = ? LIMIT 1", (uid,))
+                    if not cur.fetchone():
+                        # Nothing to delete: leave the file untouched so it is not uploaded again.
+                        continue
+                    cur.execute("DELETE FROM message_history WHERE user_id = ?", (uid,))
+                    cur.execute("SELECT COUNT(*) FROM message_history")
+                    remaining = int(cur.fetchone()[0] or 0)
+                    if remaining == 0:
+                        cur.execute("DELETE FROM history_metadata WHERE key = 'closed_at'")
+                        cur.execute(
+                            "INSERT OR REPLACE INTO history_metadata (key, value) VALUES ('created_at', ?)",
+                            (self._history_now_iso(),),
+                        )
+                    conn.commit()
 
     def _delete_user_files(self, user_id: str) -> None:
         # Files a user sent or produced are part of their history: clearing it must not leave them on disk.

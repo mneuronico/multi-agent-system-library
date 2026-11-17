@@ -3105,7 +3105,7 @@ On AWS, the stack includes:
 
   1. Normalizes provider payloads into one job per processable message.
   2. Either self-invokes immediately, once per chat with that chat's messages in order (`busy_policy="drop"`, default), or enqueues to SQS FIFO (`busy_policy="fifo"`). If that hand-off fails, the webhook answers `5xx` so Telegram/WhatsApp retry.
-  3. **(Optional)** acquires a **DynamoDB distributed lock** for that user, or one global lock in shared-history mode.
+  3. **(Optional)** acquires a **DynamoDB distributed lock** for that user (in both history modes).
   4. Downloads history from S3 and **imports** it into the MAS manager.
   5. Feeds the update to **TelegramBot**/**WhatsappBot** (webhook mode).
   6. **Exports** the updated history and optional files back to S3 and releases the lock.
