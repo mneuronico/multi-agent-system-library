@@ -2356,6 +2356,8 @@ Local files can only be sent from the manager's `files_folder` (where MAS saves 
 
 Local WhatsApp media is uploaded first, then sent by uploaded media id. WhatsApp URLs are sent as `link`. Any other non-path value is treated as a WhatsApp media `id`.
 
+Incoming WhatsApp media normally carries a Meta media `id`, which the bot looks up and downloads through the Graph API. If a relay in front of the webhook forwards media from another provider, it can send a direct `link` in its place (`"image": {"link": "https://...", "mime_type": "image/jpeg", "caption": "..."}`). The bot downloads it over HTTPS only, without the WhatsApp access token and within `max_media_bytes`, and does not store the link in the message metadata.
+
 #### Sending Stickers
 
 Direct sticker send:

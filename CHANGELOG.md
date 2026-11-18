@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `WhatsappBot` accepts incoming media that carries a direct `link` instead of a Meta media `id` (`{"type": "image", "image": {"link": "https://...", "mime_type": "image/jpeg", "caption": "..."}}`, and the same for `audio`, `video`, `document` and `sticker`). This is what a relay in front of the webhook can send when it translates another WhatsApp provider's events into Meta's format. Links are downloaded only over HTTPS, without the WhatsApp access token, and with the same `max_media_bytes` limit. The link is not stored in the message metadata. Media with an `id` is downloaded from the Graph API as before.
+
 ## [0.4.2] - 2026-11-17
 
 ### Changed
