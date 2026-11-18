@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Bots take an `outbound` hook (a callable or a `"fn:name"` reference): `outbound(user_id, blocks, original_message)` sees every message the bot sends, including command answers (`/clear`, `/help`, unknown commands), the error message and the "file too large" notice, which `on_update` never saw. Return None when the hook delivered the message itself, or blocks to send through the platform as usual. It runs in a worker thread, and an unknown reference fails when the bot is created. This lets a bot whose number moved to another WhatsApp provider send everything through that provider.
+
+### Fixed
+
+- maws could skip uploading a shared-history file the job had written. It detected changes by size and modification time, and a row written right after a download can keep both: same page count, same coarse timestamp. The merge retry added in 0.4.2 writes right after downloading, so it was the most exposed. MAS now records which shared-history files it wrote (`shared_history_dirty_paths`, `mark_shared_history_synced`), and maws uploads them, and re-downloads them before a merge, whatever their size and time say.
+
 ## [0.4.3] - 2026-11-18
 
 ### Added

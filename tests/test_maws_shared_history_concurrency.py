@@ -316,3 +316,30 @@ def test_old_botocore_without_conditional_writes_uploads_unconditionally(workspa
     _write(manager_a, "alice", "a1")
     MawsRuntime._upload_shared_history_to_s3(a)
     assert s3.puts == ["shared_history_000001.sqlite"]
+
+
+def test_writes_are_uploaded_even_when_size_and_mtime_do_not_change(workspace_tmp_path, monkeypatch):
+    # A row added right after a download can keep the file's page count and land in the same
+    # coarse timestamp tick. Freeze both: the files MAS reports as written must still be uploaded,
+    # on the first attempt and after a merge.
+    monkeypatch.setattr(MawsRuntime, "_local_file_state", staticmethod(lambda path: (1, 1) if os.path.exists(path) else None))
+    s3 = _ConditionalS3()
+    a, manager_a = _worker(workspace_tmp_path, s3, "a")
+    b, manager_b = _worker(workspace_tmp_path, s3, "b")
+
+    _start_job(a, "alice")
+    _write(manager_a, "alice", "a1")
+    MawsRuntime._upload_shared_history_to_s3(a)
+
+    _start_job(a, "alice")
+    _start_job(b, "bob")
+    _write(manager_a, "alice", "a2")
+    _write(manager_b, "bob", "b1")
+    MawsRuntime._upload_shared_history_to_s3(a)
+    MawsRuntime._upload_shared_history_to_s3(b)  # conflicts, re-downloads and replays
+
+    reader = _fresh_view(workspace_tmp_path, s3)
+    assert _texts(reader, "alice") == ["a1", "a2"]
+    assert _texts(reader, "bob") == ["b1"]
+    assert manager_a.shared_history_dirty_paths() == set()
+    assert manager_b.shared_history_dirty_paths() == set()
