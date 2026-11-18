@@ -182,11 +182,15 @@ class Bot(abc.ABC):
         dedup_ttl: Optional[float] = 3600.0,
         send_queue_timeout: Optional[float] = 120.0,
         maintenance_timeout: Optional[float] = 60.0,
+        outbound: Optional[Union[Callable, str]] = None,
     ):
         # Bot logs go through the library logger (mas._shared), like the rest of MAS, so they
         # show up with its handler and follow AgentSystemManager(log_level=...).
         self.logger = logger
         self.manager = manager
+        # Optional hook that sees every message the bot is about to send (replies, command
+        # answers, error and notice messages) and may deliver it through another channel.
+        self.outbound = self._resolve_outbound(outbound)
         self.component_name = component_name
         self.verbose = verbose
         self.on_update_user_callback = on_update or self.manager.on_update
@@ -911,7 +915,7 @@ class Bot(abc.ABC):
                 if current.done():
                     continue
                 try:
-                    await self._send_blocks(key[1], blocks, original_message)
+                    await self._send_outgoing(key[1], blocks, original_message)
                 except Exception as exc:
                     if not current.done():
                         current.set_exception(exc)
@@ -929,6 +933,36 @@ class Bot(abc.ABC):
                 if fut is not None and not fut.done():
                     fut.cancel()
             raise
+
+    def _resolve_outbound(self, outbound: Any) -> Optional[Callable]:
+        if outbound is None:
+            return None
+        try:
+            resolved = self.manager._resolve_callable(outbound)
+        except (ValueError, FileNotFoundError, AttributeError) as exc:
+            raise ValueError(f"Could not resolve the outbound hook {outbound!r}: {exc}") from exc
+        if resolved is None:
+            raise ValueError(
+                f"outbound must be a callable or a function reference such as 'fn:my_sender', got {outbound!r}."
+            )
+        return resolved
+
+    async def _send_outgoing(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]) -> None:
+        """Send ``blocks`` through the ``outbound`` hook, if any, and the platform otherwise.
+
+        The hook is called as ``outbound(user_id, blocks, original_message)`` in a worker thread.
+        Returning None means it delivered the message itself; anything else is sent through the
+        platform as usual (return ``blocks`` unchanged to only observe them). Exceptions it raises
+        count as a failed send.
+        """
+        if self.outbound is not None:
+            result = await asyncio.to_thread(self.outbound, str(user_id), blocks, original_message)
+            if result is None:
+                return
+            blocks = result if result is blocks else self.manager._to_blocks(result, user_id=user_id)
+            if not blocks:
+                return
+        await self._send_blocks(user_id, blocks, original_message)
 
     async def _deliver(self, user_id: str, blocks: List[Dict], original_message: Dict[str, Any]) -> None:
         """Send ``blocks`` in order with the user's other replies and wait until they are out.
@@ -2191,7 +2225,7 @@ class WhatsappBot(Bot):
                 self.logger.error(f"Error sending log file {file_info['filename']} to WhatsApp user {user_id}: {e}")
 
         if sent_count > 0:
-            await self._send_blocks(user_id, self.manager._to_blocks(f"Sent {sent_count} log file(s).", user_id=user_id), original_message)
+            await self._send_outgoing(user_id, self.manager._to_blocks(f"Sent {sent_count} log file(s).", user_id=user_id), original_message)
 
         return sent_count
 
