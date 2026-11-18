@@ -6,6 +6,7 @@ import contextlib
 import contextvars as _contextvars
 import time as _time
 from typing import Iterable, Tuple
+from urllib.parse import urlparse
 
 from ._shared import *
 
@@ -709,7 +710,11 @@ class Bot(abc.ABC):
             metadata["chat_type"] = str(parsed_message["chat_type"])
 
         if parsed_message.get("media_info") is not None:
-            metadata["media_info"] = self._normalize_metadata_value(parsed_message.get("media_info"))
+            media_info = parsed_message.get("media_info")
+            if isinstance(media_info, dict) and "link" in media_info:
+                # A direct media link usually grants access by itself: keep it out of the history.
+                media_info = {k: v for k, v in media_info.items() if k != "link"}
+            metadata["media_info"] = self._normalize_metadata_value(media_info)
 
         if parsed_message.get("metadata") is not None:
             metadata["metadata"] = self._normalize_metadata_value(parsed_message.get("metadata"))
@@ -1906,10 +1911,14 @@ class WhatsappBot(Bot):
                 if msg_type == "audio":
                     is_voice = bool(media_payload.get("voice", False))
 
-            if not media_payload.get("id"):
+            # Meta sends a media id. A relay in front of the webhook (for example one translating
+            # another WhatsApp provider's events) can send a direct link instead.
+            media_link = media_payload.get("link")
+            if not media_payload.get("id") and not media_link:
                 return None
             media_info = {
                 "id": media_payload.get("id"),
+                "link": media_link,
                 "mime_type": media_payload.get("mime_type"),
                 "sha256": media_payload.get("sha256"),
                 "filename": media_payload.get("filename"),
@@ -1946,26 +1955,37 @@ class WhatsappBot(Bot):
 
     async def _download_media_and_save(self, user_id: str, media_info: Any) -> str:
         media_id = media_info.get("id") if isinstance(media_info, dict) else media_info
-        if not media_id:
-            raise ValueError("WhatsApp media id is required to download media.")
         info = media_info if isinstance(media_info, dict) else {}
+        media_link = info.get("link")
+        if not media_id and not media_link:
+            raise ValueError("WhatsApp media id or link is required to download media.")
 
         def do_download():
-            media_url_info = requests.get(
-                f"{self.graph_base_url}/{media_id}",
-                headers=self.headers_auth, timeout=30
-            )
-            media_url_info.raise_for_status()
-            details = media_url_info.json() or {}
-            media_url = details.get("url")
-            if not media_url:
-                raise ValueError("Could not obtain WhatsApp media URL.")
-            self._check_media_size(details.get("file_size"))
+            if media_id:
+                media_url_info = requests.get(
+                    f"{self.graph_base_url}/{media_id}",
+                    headers=self.headers_auth, timeout=30
+                )
+                media_url_info.raise_for_status()
+                details = media_url_info.json() or {}
+                media_url = details.get("url")
+                if not media_url:
+                    raise ValueError("Could not obtain WhatsApp media URL.")
+                self._check_media_size(details.get("file_size"))
+                headers = self.headers_auth
+            else:
+                # A link from a relay is fetched as is: only over HTTPS, and never with the
+                # WhatsApp access token, which must not reach anyone but Meta.
+                if urlparse(str(media_link)).scheme != "https":
+                    raise ValueError("WhatsApp media links must use https.")
+                details = {}
+                media_url = str(media_link)
+                headers = None
 
             temp_path = self._new_temp_file()
             try:
                 # Streamed to disk in chunks, never held in memory as a whole.
-                with requests.get(media_url, headers=self.headers_auth, timeout=30, stream=True) as response:
+                with requests.get(media_url, headers=headers, timeout=30, stream=True) as response:
                     response.raise_for_status()
                     self._check_media_size((getattr(response, "headers", None) or {}).get("Content-Length"))
                     received = 0
