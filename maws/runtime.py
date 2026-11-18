@@ -792,6 +792,7 @@ class MawsRuntime:
                 self._discard_local_history(str(path))
                 synced.pop(path.name, None)
 
+        dirty = self._manager_dirty_shared_history()
         downloaded = 0
         for name, obj in sorted(remote.items()):
             local_path = history_dir / name
@@ -799,7 +800,10 @@ class MawsRuntime:
             known = synced.pop(name, None)
             # Connections are closed, so a leftover -wal or -shm means an interrupted job: download again.
             leftover = any(os.path.exists(f"{local_path}{s}") for s in ("-wal", "-shm", "-journal"))
-            if known and etag and known[0] == etag and known[1:] == self._local_file_state(local_path) and not leftover:
+            # A file MAS wrote and did not upload differs from S3 even if its size and mtime match.
+            written = os.path.abspath(str(local_path)) in dirty
+            if (known and etag and known[0] == etag and known[1:] == self._local_file_state(local_path)
+                    and not leftover and not written):
                 synced[name] = known
                 continue
             self._discard_local_history(str(local_path))
@@ -809,6 +813,8 @@ class MawsRuntime:
                 synced[name] = (etag,) + state
             downloaded += 1
             print(f"[maws] s3://{self.bucket_name}/{obj['Key']} -> {local_path}")
+        # Every local file now matches S3 (or was removed with it).
+        self._mark_manager_shared_history_synced(dirty)
         print(f"[maws] shared history: downloaded {downloaded} of {len(remote)} files")
 
     def _upload_shared_history_to_s3(self):
@@ -866,6 +872,7 @@ class MawsRuntime:
         manager = self.manager
         synced = self._shared_history_synced_files()
         remote = getattr(self, "_shared_history_remote", None)
+        dirty = self._manager_dirty_shared_history()
         uploaded = 0
         for db_path in manager._list_shared_history_db_paths():
             pool_key = manager._shared_history_db_key(db_path)
@@ -878,9 +885,11 @@ class MawsRuntime:
             if not os.path.exists(db_path):
                 continue
             name = os.path.basename(db_path)
-            # New rows, a rotation's closed_at or a deletion all change the file's size or mtime.
+            # MAS reports the files it wrote. Size and mtime alone can miss a write: a row added
+            # right after a download may keep the page count and land in the same timestamp tick.
+            written = os.path.abspath(db_path) in dirty
             known = synced.pop(name, None)
-            if known and known[1:] == self._local_file_state(db_path):
+            if known and known[1:] == self._local_file_state(db_path) and not written:
                 synced[name] = known
                 continue
             key = f"{getattr(self, 'shared_history_prefix', 'history/shared').strip('/')}/{name}"
@@ -893,9 +902,19 @@ class MawsRuntime:
                 synced[name] = (etag,) + state
             if remote is not None:
                 remote[name] = etag
+            self._mark_manager_shared_history_synced([db_path])
             uploaded += 1
             print(f"[maws] uploaded {db_path} -> s3://{self.bucket_name}/{key}")
         return uploaded
+
+    def _manager_dirty_shared_history(self) -> set:
+        getter = getattr(getattr(self, "manager", None), "shared_history_dirty_paths", None)
+        return set(getter()) if callable(getter) else set()
+
+    def _mark_manager_shared_history_synced(self, paths) -> None:
+        marker = getattr(getattr(self, "manager", None), "mark_shared_history_synced", None)
+        if callable(marker) and paths:
+            marker(paths)
 
     def _put_shared_history_object(
         self, key: str, name: str, body: bytes, remote: Optional[Dict[str, Optional[str]]]

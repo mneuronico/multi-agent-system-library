@@ -164,6 +164,8 @@ class AgentSystemManager:
         self._shared_history_lock = threading.RLock()
         # Shared-history writes made since start_shared_history_journal() (None: not recording).
         self._shared_history_journal: Optional[List[tuple]] = None
+        # Shared-history files written since take_shared_history_dirty_paths() was last called.
+        self._shared_history_dirty: set = set()
         self._variable_lock = threading.RLock()
         self._model_health_lock = threading.RLock()
         self._model_health: Dict[str, Dict[str, Any]] = {}
@@ -1761,6 +1763,7 @@ class AgentSystemManager:
         finally:
             if should_close:
                 conn.close()
+        self._mark_shared_history_dirty(db_path)
 
     def _get_shared_history_db_path_for_write(self, timestamp: str) -> str:
         latest_path = self._get_latest_shared_history_db_path()
@@ -2027,6 +2030,7 @@ class AgentSystemManager:
                 except Exception:
                     conn.rollback()
                     raise
+            self._mark_shared_history_dirty(db_path)
             self._record_shared_history_write("insert", {
                 "user_id": str(user_id),
                 "msg_number": msg_number,
@@ -2056,6 +2060,29 @@ class AgentSystemManager:
             journal = getattr(self, "_shared_history_journal", None)
             self._shared_history_journal = None
             return journal
+
+    def _mark_shared_history_dirty(self, db_path: str) -> None:
+        with self._shared_history_lock:
+            if not hasattr(self, "_shared_history_dirty"):
+                self._shared_history_dirty = set()
+            self._shared_history_dirty.add(os.path.abspath(db_path))
+
+    def shared_history_dirty_paths(self) -> set:
+        """Absolute paths of the shared-history files written and not yet marked as synced.
+
+        maws treats these files as changed whatever their size and modification time say: a
+        write right after a download can leave both unchanged (same page count, same coarse
+        timestamp), and the write would otherwise never be uploaded.
+        """
+        with self._shared_history_lock:
+            return set(getattr(self, "_shared_history_dirty", set()))
+
+    def mark_shared_history_synced(self, paths) -> None:
+        """Forget ``paths`` as written: their local copy now matches S3."""
+        with self._shared_history_lock:
+            dirty = getattr(self, "_shared_history_dirty", set())
+            for path in paths:
+                dirty.discard(os.path.abspath(path))
 
     def _record_shared_history_write(self, op: str, data: Dict[str, Any]) -> None:
         with self._shared_history_lock:
@@ -2371,6 +2398,7 @@ class AgentSystemManager:
                     conn.rollback()
                     raise
             if self._history_mode_is_shared():
+                self._mark_shared_history_dirty(db_path)
                 self._record_shared_history_write("insert", {
                     "user_id": str(uid),
                     "msg_number": next_num,
@@ -4140,6 +4168,7 @@ class AgentSystemManager:
                             (self._history_now_iso(),),
                         )
                     conn.commit()
+                self._mark_shared_history_dirty(db_path)
 
     def _delete_user_files(self, user_id: str) -> None:
         # Files a user sent or produced are part of their history: clearing it must not leave them on disk.
